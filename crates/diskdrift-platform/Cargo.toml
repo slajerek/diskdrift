@@ -1,0 +1,16 @@
+[package]
+name = "diskdrift-platform"
+description = "Platform adapters for DiskDrift (macOS first)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+diskdrift-core.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+diskdrift-core = { workspace = true, features = ["testutil"] }

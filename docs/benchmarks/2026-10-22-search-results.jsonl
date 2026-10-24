@@ -1,0 +1,9 @@
+{"currentMs":232.61070899999999,"currentWithHistory":3,"entries":3021564,"gone":22,"historyMs":45.350167,"matches":820,"pairs":29,"pattern":"abc","peakRssMb":53.297152,"scansSearched":1,"step":"find"}
+{"currentMs":236.78233400000002,"currentWithHistory":3,"entries":3021564,"gone":22,"historyMs":42.850958,"matches":820,"pairs":29,"pattern":"abc","peakRssMb":46.563328,"scansSearched":1,"step":"find"}
+{"currentMs":232.56199999999998,"currentWithHistory":3,"entries":3021564,"gone":22,"historyMs":43.244125000000004,"matches":820,"pairs":29,"pattern":"abc","peakRssMb":50.085888,"scansSearched":1,"step":"find"}
+{"currentMs":240.230166,"currentWithHistory":3,"entries":3021564,"gone":22,"historyMs":47.08775,"matches":820,"pairs":29,"pattern":"abc","peakRssMb":54.034432,"scansSearched":1,"step":"find"}
+{"currentMs":235.483833,"currentWithHistory":3,"entries":3021564,"gone":22,"historyMs":43.474584,"matches":820,"pairs":29,"pattern":"abc","peakRssMb":52.559872,"scansSearched":1,"step":"find"}
+{"currentMs":232.820417,"currentWithHistory":0,"entries":3021564,"gone":0,"historyMs":45.740583,"matches":0,"pairs":29,"pattern":"zzzzqqq","peakRssMb":53.608448,"scansSearched":1,"step":"find"}
+{"currentMs":229.962042,"currentWithHistory":6,"entries":3021564,"gone":18,"historyMs":50.100958,"matches":370,"pairs":29,"pattern":"re:^ab[0-9]","peakRssMb":51.134464,"scansSearched":1,"step":"find"}
+{"currentMs":239.700084,"currentWithHistory":0,"entries":3021564,"gone":0,"historyMs":50.045792,"matches":0,"pairs":29,"pattern":"*.x*","peakRssMb":58.032128,"scansSearched":1,"step":"find"}
+{"currentMs":242.139834,"currentWithHistory":6,"entries":3021564,"gone":11349,"historyMs":100.392375,"matches":908543,"pairs":29,"pattern":"e","peakRssMb":142.442496,"scansSearched":1,"step":"find"}

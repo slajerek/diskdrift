@@ -1,0 +1,4 @@
+{"date":"2026-10-23","group":"prune","store":"bench search store, 3M entries x 30 scans (disks_cost build), copy under target/bench-work/prune","op":"remove 10 middle scans in one call","wall_s":7.13,"max_rss_mb":81,"rewritten":1}
+{"date":"2026-10-23","group":"prune","store":"same, fresh copy","op":"remove the same 10 scans one call each","wall_s":71.81,"rewritten":10}
+{"date":"2026-10-23","group":"prune","store":"after the first removal","op":"remove the newest scan (tip moves)","wall_s":0.73,"max_rss_mb":27,"rewritten":1}
+{"date":"2026-10-23","group":"prune","store":"after both removals, 19 scans","op":"compact, nothing to rewrite, checksums of all data files","wall_s":0.43,"max_rss_mb":11}

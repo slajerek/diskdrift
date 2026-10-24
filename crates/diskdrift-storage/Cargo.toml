@@ -1,0 +1,20 @@
+[package]
+name = "diskdrift-storage"
+description = "Snapshot store for DiskDrift: columnar zstd blocks, one file per snapshot, checkpoint + delta history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+diskdrift-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zstd.workspace = true
+crc32fast.workspace = true
+crossbeam-channel.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+diskdrift-core = { workspace = true, features = ["testutil"] }

@@ -1,0 +1,27 @@
+[package]
+name = "diskdrift-bench"
+description = "Scanner and storage-engine benchmarks for DiskDrift (M1). Not shipped."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+diskdrift-core.workspace = true
+diskdrift-platform.workspace = true
+diskdrift-storage.workspace = true
+diskdrift-app.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+libc.workspace = true
+zstd.workspace = true
+crc32fast.workspace = true
+chrono.workspace = true
+crossbeam-channel.workspace = true
+rusqlite = { version = "0.40", features = ["bundled"] }
+heed = "0.22"
+mimalloc = "0.1"
+
+[dev-dependencies]
+diskdrift-core = { workspace = true, features = ["testutil"] }

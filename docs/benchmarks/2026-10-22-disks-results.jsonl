@@ -1,0 +1,7 @@
+{"entries":3000000,"ms":38011.805250000005,"step":"build","storeBytes":119738368,"versions":30}
+{"marker":"{\"format\":\"diskdrift-snapshots\",\"version\":3}","ms":443.651542,"peakRssMb":4.276224,"snapshots":30,"step":"migrate"}
+{"allNamedAfterTheirDisk":true,"newestMs":472.91941599999996,"newestRecords":3021564,"oldestMs":6335.648,"oldestRecords":3014077,"peakRssMb":79.101952,"step":"verify"}
+{"entries":3000000,"peakRssMb":332.808192,"results":[{"case":"sameRoot","commitAndRebaseMs":1282.263916,"deltaItems":30244},{"case":"otherRoot","commitAndRebaseMs":1288.64925,"deltaItems":30244},{"case":"diffAdjacent","withAdapterChanged":10065,"withAdapterMs":665.2,"withoutAdapterChanged":6028421,"withoutAdapterMs":824.469917}],"step":"adapter"}
+{"changed":9838,"ms":607.103584,"peakRssMb":27.262976,"step":"diff"}
+{"allEntries":90537989,"allMs":101933.03316600001,"newestEntries":3021564,"newestHits":820,"newestMs":242.224166,"peakRssMb":122.601472,"query":"abc","snapshots":30,"step":"search"}
+{"allEntries":8745959,"allMs":960.922875,"newestEntries":81,"newestHits":0,"newestMs":0.38629199999999997,"peakRssMb":45.662208,"query":"waznasprawa","snapshots":9,"step":"search"}

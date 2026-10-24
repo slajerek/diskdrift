@@ -1,0 +1,18 @@
+[package]
+name = "diskdrift-tui"
+description = "Full-screen terminal UI for DiskDrift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+diskdrift-app.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+crossbeam-channel.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+diskdrift-core = { workspace = true, features = ["testutil"] }
