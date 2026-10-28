@@ -1,0 +1,258 @@
+name: unstable release
+
+on:
+  push:
+    branches:
+      - devel
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  prepare:
+    name: resolve devel candidate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: devel
+          fetch-depth: 1
+
+      - name: Resolve current devel and merged PR
+        id: resolve
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          candidate_sha="$(gh api \
+            --method GET \
+            --header 'Accept: application/vnd.github+json' \
+            "repos/$REPO/git/ref/heads/devel" \
+            --jq '.object.sha')"
+          if ! [[ "$candidate_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "devel did not resolve to exactly one commit SHA" >&2
+            exit 1
+          fi
+
+          checked_out_sha="$(git rev-parse HEAD)"
+          if [ "$checked_out_sha" != "$candidate_sha" ]; then
+            echo "devel checkout $checked_out_sha does not match API SHA $candidate_sha" >&2
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" = push ] && [ "$PUSH_SHA" != "$candidate_sha" ]; then
+            echo "push SHA $PUSH_SHA is not the current devel SHA $candidate_sha" >&2
+            exit 1
+          fi
+
+          merged_pr="$(gh api \
+            --method GET \
+            --paginate \
+            --slurp \
+            --header 'Accept: application/vnd.github+json' \
+            "repos/$REPO/commits/$candidate_sha/pulls?base=devel" \
+            --jq 'add | any(.[]; .base.ref == "devel" and (.merged_at != null))')"
+          if [ "$merged_pr" != true ]; then
+            echo "devel SHA is not associated with a merged PR targeting devel" >&2
+            exit 1
+          fi
+
+          printf 'candidate_sha=%s\n' "$candidate_sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build / ${{ matrix.os }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      pull-requests: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+
+      - name: Verify candidate checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+
+      - name: Check public tree safety
+        shell: bash
+        run: scripts/check-public-tree.sh .
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release -p diskdrift-cli
+
+      - name: Package native release
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          case "$RUNNER_OS" in
+            macOS)
+              case "$host_target" in
+                aarch64-apple-darwin|x86_64-apple-darwin) ;;
+                *) echo "unsupported macOS host target: $host_target" >&2; exit 1 ;;
+              esac
+              runner=macos
+              binary_path=target/release/diskdrift
+              binary_name="diskdrift-$runner-$host_target"
+              archive_name="$binary_name.tar.gz"
+              ;;
+            Linux)
+              test "$host_target" = x86_64-unknown-linux-gnu
+              runner=linux
+              binary_path=target/release/diskdrift
+              binary_name="diskdrift-$runner-$host_target"
+              archive_name="$binary_name.tar.gz"
+              ;;
+            Windows)
+              test "$host_target" = x86_64-pc-windows-msvc
+              runner=windows
+              binary_path=target/release/diskdrift.exe
+              binary_name="diskdrift-$runner-$host_target.exe"
+              archive_name="${binary_name%.exe}.zip"
+              ;;
+            *)
+              echo "unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+
+          source_sha="$(git rev-parse HEAD)"
+          test "$source_sha" = "$EXPECTED_SHA"
+          rm -rf release
+          mkdir release
+          test -f "$binary_path"
+          release_binary="release/$binary_name"
+          cp "$binary_path" "$release_binary"
+
+          if [ "$RUNNER_OS" = Windows ]; then
+            pwsh -NoProfile -Command "Compress-Archive -LiteralPath 'release/$binary_name' -DestinationPath 'release/$archive_name' -Force"
+          else
+            tar -czf "release/$archive_name" -C release "$binary_name"
+          fi
+
+          rm "$release_binary"
+          test -f "release/$archive_name"
+          if command -v sha256sum >/dev/null 2>&1; then
+            archive_sha="$(sha256sum "release/$archive_name" | awk '{print $1}')"
+          else
+            archive_sha="$(shasum -a 256 "release/$archive_name" | awk '{print $1}')"
+          fi
+          printf '{\n  "schema": 1,\n  "source_sha": "%s",\n  "runner": "%s",\n  "rust_target": "%s",\n  "binary": "%s",\n  "sha256": "%s"\n}\n' \
+            "$source_sha" "$runner" "$host_target" "$binary_name" "$archive_sha" \
+            > "release/manifest-$runner.json"
+
+      - name: Upload native release
+        if: ${{ success() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unstable-build-${{ matrix.os }}
+          path: release/
+          if-no-files-found: error
+
+  publish:
+    name: publish unstable
+    needs: [prepare, build]
+    if: ${{ needs.prepare.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    concurrency:
+      group: unstable-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ needs.prepare.outputs.candidate_sha }}
+
+      - name: Verify candidate checkout
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$EXPECTED_SHA"
+
+      - name: Check public tree safety
+        shell: bash
+        run: scripts/check-public-tree.sh .
+
+      - name: Create fresh candidate directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf candidate
+          mkdir candidate
+
+      - name: Download native releases
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: unstable-build-*
+          path: candidate
+          merge-multiple: true
+
+      - name: Reject unexpected candidate files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t entries < <(find -P candidate -mindepth 1 -maxdepth 1 -print)
+          test "${#entries[@]}" -eq 6
+          for entry in "${entries[@]}"; do
+            [ -f "$entry" ] && [ ! -L "$entry" ] || {
+              echo "candidate contains a non-file entry: ${entry##*/}" >&2
+              exit 1
+            }
+            case "${entry##*/}" in
+              manifest-macos.json|manifest-linux.json|manifest-windows.json|\
+              diskdrift-macos-aarch64-apple-darwin.tar.gz|\
+              diskdrift-macos-x86_64-apple-darwin.tar.gz|\
+              diskdrift-linux-x86_64-unknown-linux-gnu.tar.gz|\
+              diskdrift-windows-x86_64-pc-windows-msvc.zip)
+                ;;
+              *)
+                echo "unexpected candidate file: ${entry##*/}" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+      - name: Publish unstable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/publish-unstable.sh \
+            --repo "${{ github.repository }}" \
+            --sha "${{ needs.prepare.outputs.candidate_sha }}" \
+            --assets-dir "$PWD/candidate"

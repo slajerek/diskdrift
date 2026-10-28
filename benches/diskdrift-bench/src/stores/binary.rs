@@ -14,7 +14,10 @@ use diskdrift_core::paths::compare_paths;
 use diskdrift_core::record::{Record, get_varint, put_varint};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 4] = b"DDS1";
@@ -23,6 +26,27 @@ const TRAILER: usize = 8 + 4 + 4 + 8 + 4;
 const KIND_RECORDS: u8 = 0;
 const KIND_OPS: u8 = 1;
 const KIND_COLUMNAR: u8 = 2;
+
+#[cfg(unix)]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = file.seek_read(buf, offset)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short file read",
+            ));
+        }
+        offset += n as u64;
+        buf = &mut buf[n..];
+    }
+    Ok(())
+}
 
 pub struct BinaryStore {
     dir: PathBuf,
@@ -54,7 +78,13 @@ impl FileWriter {
         let mut out = BufWriter::with_capacity(1 << 20, f);
         out.write_all(MAGIC)?;
         out.write_all(&[kind, 0, 0, 0])?;
-        Ok(FileWriter { out, tmp, offset: 8, index: Vec::new(), total: 0 })
+        Ok(FileWriter {
+            out,
+            tmp,
+            offset: 8,
+            index: Vec::new(),
+            total: 0,
+        })
     }
 
     fn block(&mut self, b: Block) -> io::Result<()> {
@@ -105,7 +135,7 @@ fn read_index(f: &File) -> io::Result<Vec<IndexEntry>> {
         return Err(bad("snapshot file too short"));
     }
     let mut t = [0u8; TRAILER];
-    f.read_exact_at(&mut t, len - TRAILER as u64)?;
+    read_exact_at(f, &mut t, len - TRAILER as u64)?;
     if &t[TRAILER - 4..] != END {
         return Err(bad("snapshot file has no valid trailer"));
     }
@@ -113,7 +143,7 @@ fn read_index(f: &File) -> io::Result<Vec<IndexEntry>> {
     let idx_len = u32::from_le_bytes(t[8..12].try_into().unwrap()) as usize;
     let idx_crc = u32::from_le_bytes(t[12..16].try_into().unwrap());
     let mut idx = vec![0u8; idx_len];
-    f.read_exact_at(&mut idx, idx_off)?;
+    read_exact_at(f, &mut idx, idx_off)?;
     if crc32fast::hash(&idx) != idx_crc {
         return Err(bad("snapshot index checksum mismatch"));
     }
@@ -131,7 +161,14 @@ fn read_index(f: &File) -> io::Result<Vec<IndexEntry>> {
         let crc = u32::from_le_bytes(s[..4].try_into().unwrap());
         s = &s[4..];
         let first_path = blocks::decode_path(&mut s)?;
-        out.push(IndexEntry { offset, comp_len, raw_len, count, crc, first_path });
+        out.push(IndexEntry {
+            offset,
+            comp_len,
+            raw_len,
+            count,
+            crc,
+            first_path,
+        });
     }
     Ok(out)
 }
@@ -155,7 +192,7 @@ impl<T: Send + 'static> Pipelined<T> {
             for e in index {
                 let r = (|| {
                     comp.resize(e.comp_len as usize, 0);
-                    f.read_exact_at(&mut comp, e.offset)?;
+                    read_exact_at(&f, &mut comp, e.offset)?;
                     let raw = blocks::decompress(&comp, e.raw_len, e.crc)?;
                     let mut out = Vec::with_capacity(e.count as usize);
                     decode(&raw, e.count, &mut out)?;
@@ -167,7 +204,11 @@ impl<T: Send + 'static> Pipelined<T> {
                 }
             }
         });
-        Pipelined { rx, cur: Vec::new().into_iter(), failed: false }
+        Pipelined {
+            rx,
+            cur: Vec::new().into_iter(),
+            failed: false,
+        }
     }
 }
 
@@ -200,9 +241,12 @@ fn decode_records(raw: &[u8], count: u32, out: &mut Vec<Record>) -> io::Result<(
 
 fn file_kind(f: &File) -> io::Result<u8> {
     let mut h = [0u8; 8];
-    f.read_exact_at(&mut h, 0)?;
+    read_exact_at(f, &mut h, 0)?;
     if &h[..4] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "not a snapshot file"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a snapshot file",
+        ));
     }
     Ok(h[4])
 }
@@ -210,7 +254,11 @@ fn file_kind(f: &File) -> io::Result<u8> {
 impl BinaryStore {
     pub fn open(dir: &Path, level: i32, columnar: bool) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        Ok(BinaryStore { dir: dir.to_path_buf(), level, columnar })
+        Ok(BinaryStore {
+            dir: dir.to_path_buf(),
+            level,
+            columnar,
+        })
     }
 
     fn data_path(&self, id: u32) -> PathBuf {
@@ -232,7 +280,11 @@ impl BinaryStore {
 }
 
 impl Store for BinaryStore {
-    fn write_full(&mut self, id: u32, records: &mut dyn Iterator<Item = Record>) -> io::Result<u64> {
+    fn write_full(
+        &mut self,
+        id: u32,
+        records: &mut dyn Iterator<Item = Record>,
+    ) -> io::Result<u64> {
         let tmp = self.dir.join(format!("{id:08}.tmp"));
         let result = (|| {
             if self.columnar {
@@ -268,7 +320,12 @@ impl Store for BinaryStore {
         Ok(n)
     }
 
-    fn write_delta(&mut self, id: u32, base: u32, ops: &mut dyn Iterator<Item = DeltaOp>) -> io::Result<u64> {
+    fn write_delta(
+        &mut self,
+        id: u32,
+        base: u32,
+        ops: &mut dyn Iterator<Item = DeltaOp>,
+    ) -> io::Result<u64> {
         let tmp = self.dir.join(format!("{id:08}.tmp"));
         let result = (|| {
             let mut w = FileWriter::create(tmp.clone(), KIND_OPS)?;
@@ -287,7 +344,10 @@ impl Store for BinaryStore {
             let _ = std::fs::remove_file(&tmp);
         }
         let n = result?;
-        self.write_meta(SnapInfo { id, base: Some(base) })?;
+        self.write_meta(SnapInfo {
+            id,
+            base: Some(base),
+        })?;
         Ok(n)
     }
 
@@ -295,7 +355,11 @@ impl Store for BinaryStore {
         let f = File::open(self.data_path(id))?;
         let kind = file_kind(&f)?;
         let index = read_index(&f)?;
-        let decode = if kind == KIND_COLUMNAR { blocks::columnar::decode } else { decode_records };
+        let decode = if kind == KIND_COLUMNAR {
+            blocks::columnar::decode
+        } else {
+            decode_records
+        };
         Ok(Box::new(Pipelined::spawn(f, index, decode)))
     }
 
@@ -315,7 +379,10 @@ impl Store for BinaryStore {
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 let id = v["id"].as_u64().unwrap_or(0) as u32;
                 if self.data_path(id).exists() {
-                    out.push(SnapInfo { id, base: v["base"].as_u64().map(|b| b as u32) });
+                    out.push(SnapInfo {
+                        id,
+                        base: v["base"].as_u64().map(|b| b as u32),
+                    });
                 }
             }
         }
@@ -328,13 +395,15 @@ impl Store for BinaryStore {
         let kind = file_kind(&f)?;
         let index = read_index(&f)?;
         // Last block whose first path is <= prefix: the prefix starts in it (or later).
-        let start = index.partition_point(|e| compare_paths(&e.first_path, prefix) != std::cmp::Ordering::Greater);
+        let start = index.partition_point(|e| {
+            compare_paths(&e.first_path, prefix) != std::cmp::Ordering::Greater
+        });
         let start = start.saturating_sub(1);
         let tail: Vec<IndexEntry> = index[start..].to_vec();
         let ctx = match tail.first() {
             Some(e) => {
                 let mut comp = vec![0u8; e.comp_len as usize];
-                f.read_exact_at(&mut comp, e.offset)?;
+                read_exact_at(&f, &mut comp, e.offset)?;
                 let raw = blocks::decompress(&comp, e.raw_len, e.crc)?;
                 if kind == KIND_COLUMNAR {
                     blocks::columnar::context(&raw)?
@@ -344,8 +413,16 @@ impl Store for BinaryStore {
             }
             None => Vec::new(),
         };
-        let decode = if kind == KIND_COLUMNAR { blocks::columnar::decode } else { decode_records };
+        let decode = if kind == KIND_COLUMNAR {
+            blocks::columnar::decode
+        } else {
+            decode_records
+        };
         let stream: RecordStream<'_> = Box::new(Pipelined::spawn(f, tail, decode));
-        Ok(Box::new(PrefixFilter::with_context(stream, prefix.to_vec(), &ctx)))
+        Ok(Box::new(PrefixFilter::with_context(
+            stream,
+            prefix.to_vec(),
+            &ctx,
+        )))
     }
 }

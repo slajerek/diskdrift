@@ -4,6 +4,7 @@ use crate::config::Effective;
 use diskdrift_diagnostics::access::{self, AccessCheck};
 use diskdrift_diagnostics::apfs::{self, ApfsContainer};
 use serde::Serialize;
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +29,7 @@ pub struct InfoReport {
     pub store_exists: bool,
 }
 
+#[cfg(target_os = "macos")]
 fn sysctl_string(name: &str) -> Option<String> {
     let cname = CString::new(name).ok()?;
     let mut len: libc::size_t = 0;
@@ -45,6 +47,11 @@ fn sysctl_string(name: &str) -> Option<String> {
         }
         Some(String::from_utf8_lossy(&buf).into_owned())
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_string(_name: &str) -> Option<String> {
+    None
 }
 
 pub fn system_info() -> SystemInfo {

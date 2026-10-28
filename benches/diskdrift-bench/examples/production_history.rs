@@ -35,10 +35,16 @@ fn template(name: String) -> SnapshotMeta {
     }
 }
 
+#[cfg(unix)]
 fn rss() -> f64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     ru.ru_maxrss as f64 / 1e6
+}
+
+#[cfg(not(unix))]
+fn rss() -> f64 {
+    0.0
 }
 
 fn time<T>(f: impl FnOnce() -> T) -> (T, f64) {

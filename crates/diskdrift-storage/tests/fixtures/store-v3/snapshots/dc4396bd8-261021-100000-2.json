@@ -1,0 +1,58 @@
+{
+  "formatVersion": 2,
+  "id": 2,
+  "name": "followup",
+  "root": "/r",
+  "disk": "dc4396bd8",
+  "rootInVolume": "/r",
+  "status": "COMPLETED",
+  "startedAt": "2026-10-21T10:00:00+00:00",
+  "finishedAt": "now",
+  "volume": {
+    "uuid": "U",
+    "name": null,
+    "fsType": "apfs",
+    "mountPoint": "/",
+    "volumeGroup": false
+  },
+  "options": {
+    "stayOnFilesystem": true,
+    "exclude": [],
+    "lister": "",
+    "threads": 0
+  },
+  "spaceBefore": null,
+  "spaceAfter": null,
+  "storage": {
+    "stem": "dc4396bd8-261021-100000-2",
+    "base": null,
+    "dataFile": "dc4396bd8-261021-100000-2.dds",
+    "bytesOnDisk": 4096,
+    "blocks": 1,
+    "items": 1
+  },
+  "counts": {
+    "entries": 5,
+    "files": 0,
+    "dirs": 0,
+    "symlinks": 0,
+    "others": 0,
+    "logicalBytes": 0,
+    "allocatedBytes": 0,
+    "hardlinkDuplicates": 0,
+    "inaccessibleDirs": 0,
+    "statErrors": 0,
+    "skippedMounts": 0,
+    "excluded": 0,
+    "issueCount": 0,
+    "issues": [],
+    "devices": [],
+    "cancelled": false,
+    "elapsedMs": 0,
+    "peakPendingDirs": 0,
+    "peakBufferedEntries": 0,
+    "hardlinkInodes": 0
+  },
+  "error": null,
+  "diskdriftVersion": "fixture"
+}

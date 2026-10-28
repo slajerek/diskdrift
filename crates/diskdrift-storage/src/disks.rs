@@ -10,6 +10,7 @@
 //! `disks.json` is an empty registry.
 
 use crate::meta::SnapshotMeta;
+use diskdrift_core::native::NativePath;
 use crate::store::{Result, StoreError, sync_dir, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
@@ -17,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 pub const DISKS_FORMAT: &str = "diskdrift-disks";
 pub const DISKS_VERSION: u32 = 1;
+/// Reserved registry-v2 compatibility schema; active publication remains v1.
+pub const DISKS_VERSION_V2: u32 = 2;
 const DISKS_FILE: &str = "disks.json";
 const DISKS_LOCK: &str = "disks.lock";
 
@@ -42,15 +45,57 @@ impl Strength {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
+    pub strength: Strength,
+    pub source: String,
+    #[serde(default = "default_identity_platform")]
+    pub platform: String,
+    #[serde(default = "default_identity_scheme")]
+    pub scheme: String,
+}
+
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
+        self.strength == other.strength && self.source == other.source
+    }
+}
+impl Eq for Identity {}
+impl std::hash::Hash for Identity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.strength.hash(state);
+        self.source.hash(state);
+    }
+}
+
+fn default_identity_platform() -> String { "unknown".into() }
+fn default_identity_scheme() -> String { "legacy".into() }
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IdentityV2 {
+    pub platform: String,
+    pub scheme: String,
     pub strength: Strength,
     pub source: String,
 }
 
+impl From<&Identity> for IdentityV2 {
+    fn from(value: &Identity) -> Self {
+        Self { platform: value.platform.clone(), scheme: value.scheme.clone(), strength: value.strength, source: value.source.clone() }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Alias { pub path: NativePath }
+
+impl Alias {
+    pub fn new(path: impl Into<String>) -> Self { Self { path: NativePath::unix(path.into().into_bytes()) } }
+    pub fn from_native(path: NativePath) -> Self { Self { path } }
+}
+
 impl Identity {
     pub fn new(strength: Strength, source: impl Into<String>) -> Identity {
-        Identity { strength, source: source.into() }
+        Identity { strength, source: source.into(), platform: "unknown".into(), scheme: "legacy".into() }
     }
 
     /// The `weak` identity of a volume without a UUID.
@@ -61,9 +106,17 @@ impl Identity {
 
     /// `d` and the first `digits` hex digits of SHA-256 of `<strength>:<source>`.
     pub fn short_id(&self, digits: usize) -> String {
-        let hash = sha256(format!("{}:{}", self.strength.as_str(), self.source).as_bytes());
+        let hash = sha256(format!("{}:{}:{}:{}", self.platform, self.scheme, self.strength.as_str(), self.source).as_bytes());
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         format!("d{}", &hex[..digits.min(hex.len())])
+    }
+
+    fn matches_lineage(&self, other: &Self) -> bool {
+        self.strength == other.strength
+            && self.source == other.source
+            && (self.platform == other.platform && self.scheme == other.scheme
+                || self.platform == "unknown" && self.scheme == "legacy"
+                || other.platform == "unknown" && other.scheme == "legacy")
     }
 }
 
@@ -104,6 +157,10 @@ pub struct Disk {
     pub last_seen: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_mount_point: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<NativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mount_path: Option<NativePath>,
 }
 
 impl Disk {
@@ -121,6 +178,15 @@ pub struct Sighting {
     pub device: Option<DeviceFacts>,
     pub mount_point: String,
     pub at: String,
+    pub aliases: Vec<Alias>,
+    pub mount_path: NativePath,
+}
+
+impl Sighting {
+    pub fn portable(identity: Identity, mount_point: impl Into<String>) -> Self {
+        let mount_point = mount_point.into();
+        Self { identity, volume: VolumeFacts { fs_type: "portable".into(), ..Default::default() }, device: None, mount_path: NativePath::unix(mount_point.as_bytes().to_vec()), mount_point, at: "now".into(), aliases: Vec::new() }
+    }
 }
 
 impl Sighting {
@@ -143,6 +209,8 @@ impl Sighting {
             device: None,
             mount_point: v.mount_point.clone(),
             at: m.started_at.clone(),
+            aliases: Vec::new(),
+            mount_path: NativePath::unix(v.mount_point.as_bytes().to_vec()),
         }
     }
 }
@@ -172,6 +240,20 @@ pub struct Registry {
     pub disks: Vec<Disk>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryV2Disk {
+    pub id: String,
+    pub identity: IdentityV2,
+    pub aliases: Vec<NativePath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryV2 {
+    pub format: String,
+    pub version: u32,
+    pub disks: Vec<RegistryV2Disk>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Document {
     format: String,
@@ -183,6 +265,15 @@ struct Document {
 /// Holds `<store>/disks.lock` (released when dropped).
 pub struct DisksLock {
     _file: File,
+    #[cfg(windows)]
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for DisksLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 pub fn disks_path(store: &Path) -> PathBuf {
@@ -196,12 +287,28 @@ fn io_at(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
 /// Waits for and takes the registry lock. Hold it only for one read-modify-write.
 pub fn lock(store: &Path) -> Result<DisksLock> {
     let p = store.join(DISKS_LOCK);
+    #[cfg(windows)]
+    let f = loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(f) => break f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(e) => return Err(io_at(&p)(e)),
+        }
+    };
+    #[cfg(not(windows))]
     let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&p).map_err(io_at(&p))?;
-    use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io_at(&p)(std::io::Error::last_os_error()));
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io_at(&p)(std::io::Error::last_os_error()));
+        }
     }
-    Ok(DisksLock { _file: f })
+    Ok(DisksLock {
+        _file: f,
+        #[cfg(windows)]
+        path: p,
+    })
 }
 
 fn invalid(label: &str, why: &str) -> StoreError {
@@ -221,20 +328,38 @@ impl Registry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
             Err(e) => return Err(io_at(&p)(e)),
         };
-        let doc: Document = serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
-        if doc.format != DISKS_FORMAT {
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
+        if value["format"] != DISKS_FORMAT {
             return Err(StoreError::Corrupt(format!("{} is not a DiskDrift disk registry", p.display())));
         }
-        if doc.version > DISKS_VERSION {
-            return Err(StoreError::UnsupportedDisksVersion { found: doc.version });
+        let version = value["version"].as_u64().unwrap_or(0) as u32;
+        if version > DISKS_VERSION_V2 {
+            return Err(StoreError::UnsupportedDisksVersion { found: version });
         }
+        if version == DISKS_VERSION_V2 {
+            let doc: RegistryV2 = serde_json::from_value(value).map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
+            return Registry::from_v2(doc);
+        }
+        let doc: Document = serde_json::from_value(value).map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
         Ok(Registry { disks: doc.disks })
     }
 
     /// Writes the registry atomically (temp file, fsync, rename, fsync directory).
     pub fn save(&self, store: &Path, _lock: &DisksLock) -> Result<()> {
         let p = disks_path(store);
-        let doc = Document { format: DISKS_FORMAT.into(), version: DISKS_VERSION, disks: self.disks.clone() };
+        let disks = self.disks.iter().map(|disk| {
+            let mut value = serde_json::to_value(disk).expect("registry serializes");
+            if let Some(identity) = value.get_mut("identity").and_then(serde_json::Value::as_object_mut) {
+                identity.remove("platform");
+                identity.remove("scheme");
+            }
+            if let Some(object) = value.as_object_mut() {
+                object.remove("aliases");
+                object.remove("lastMountPath");
+            }
+            value
+        }).collect::<Vec<_>>();
+        let doc = serde_json::json!({ "format": DISKS_FORMAT, "version": DISKS_VERSION, "disks": disks });
         let bytes = serde_json::to_vec_pretty(&doc).expect("registry serializes");
         write_atomic(&p, &bytes).map_err(io_at(&p))?;
         sync_dir(store).map_err(io_at(store))
@@ -258,7 +383,15 @@ impl Registry {
     }
 
     pub fn find(&self, identity: &Identity) -> Option<&Disk> {
-        self.disks.iter().find(|d| &d.identity == identity)
+        self.disks.iter().find(|d| d.identity.matches_lineage(identity))
+    }
+
+    /// Resolves an exact native mount or alias without using display strings.
+    pub fn resolve_mount(&self, path: &NativePath) -> Option<&Disk> {
+        self.disks.iter().find(|d| {
+            d.last_mount_path.as_ref().is_some_and(|mount| mount == path)
+                || d.aliases.iter().any(|alias| alias == path)
+        })
     }
 
     /// A disk by short ID, label (compared case-insensitively) or a unique
@@ -315,6 +448,10 @@ impl Registry {
         Observed::Known(id)
     }
 
+    pub fn observe_clone(&mut self, existing: &str, _s: &Sighting) -> Observed {
+        Observed::Ask { existing: existing.into(), doubt: Doubt::Clone }
+    }
+
     /// Adds `s` as a new disk and returns its short ID. A separate identity
     /// for a clone is the caller's (for example the UUID plus the device serial).
     pub fn add(&mut self, s: &Sighting) -> String {
@@ -334,6 +471,8 @@ impl Registry {
             first_seen: s.at.clone(),
             last_seen: s.at.clone(),
             last_mount_point: Some(s.mount_point.clone()),
+            aliases: s.aliases.iter().map(|a| a.path.clone()).collect(),
+            last_mount_path: Some(s.mount_path.clone()),
         });
         id
     }
@@ -353,8 +492,18 @@ impl Registry {
         if s.device.is_some() {
             d.device = s.device.clone();
         }
+        let previous_mount = d.last_mount_path.clone();
         d.last_seen = s.at.clone();
         d.last_mount_point = Some(s.mount_point.clone());
+        d.last_mount_path = Some(s.mount_path.clone());
+        d.aliases.extend(s.aliases.iter().map(|a| a.path.clone()));
+        if let Some(previous) = previous_mount
+            && !d.aliases.iter().any(|alias| alias == &previous)
+        {
+            d.aliases.push(previous);
+        }
+        d.aliases.sort();
+        d.aliases.dedup();
         Ok(())
     }
 
@@ -368,6 +517,32 @@ impl Registry {
             }
             None => self.add(s),
         }
+    }
+
+    pub fn as_v2(&self) -> RegistryV2 {
+        RegistryV2 { format: DISKS_FORMAT.into(), version: DISKS_VERSION_V2, disks: self.disks.iter().map(|d| RegistryV2Disk { id: d.id.clone(), identity: (&d.identity).into(), aliases: d.aliases.clone() }).collect() }
+    }
+
+    pub fn from_v2(value: RegistryV2) -> Result<Self> {
+        if value.format != DISKS_FORMAT || value.version != DISKS_VERSION_V2 {
+            return Err(StoreError::Corrupt("invalid disk registry v2 document".into()));
+        }
+        Ok(Self {
+            disks: value.disks.into_iter().map(|disk| Disk {
+                id: disk.id,
+                identity: Identity { strength: disk.identity.strength, source: disk.identity.source, platform: disk.identity.platform, scheme: disk.identity.scheme },
+                label: None,
+                description: None,
+                sets: Vec::new(),
+                volume: VolumeFacts::default(),
+                device: None,
+                first_seen: String::new(),
+                last_seen: String::new(),
+                last_mount_point: None,
+                aliases: disk.aliases,
+                last_mount_path: None,
+            }).collect(),
+        })
     }
 
     /// Sets or clears (`None`, or blank) the label of disk `id`. Labels are
@@ -498,7 +673,9 @@ mod tests {
             volume: VolumeFacts { name: Some("Backup".into()), fs_type: "hfs".into(), capacity_bytes: Some(500) },
             device: Some(DeviceFacts { serial: serial.map(String::from), bus: Some("USB".into()), ..Default::default() }),
             mount_point: "/Volumes/Backup".into(),
+            mount_path: NativePath::unix(b"/Volumes/Backup".to_vec()),
             at: at.into(),
+            aliases: Vec::new(),
         }
     }
 
@@ -524,7 +701,7 @@ mod tests {
         let id = uuid("9F0E").short_id(8);
         assert_eq!(id.len(), 9);
         assert!(is_short_id(&id));
-        assert_eq!(id, format!("d{}", &hex(&sha256(b"uuid:9F0E"))[..8]));
+        assert_eq!(id, format!("d{}", &hex(&sha256(b"unknown:legacy:uuid:9F0E"))[..8]));
         assert_ne!(id, Identity::new(Strength::Serial, "9F0E").short_id(8));
     }
 
@@ -573,7 +750,8 @@ mod tests {
         // Nothing temporary left behind.
         let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
-        assert_eq!(names, ["disks.json", "disks.lock"]);
+        let expected = if cfg!(windows) { vec!["disks.json"] } else { vec!["disks.json", "disks.lock"] };
+        assert_eq!(names, expected);
     }
 
     #[test]
@@ -593,7 +771,7 @@ mod tests {
     fn newer_or_foreign_registries_are_refused() {
         let dir = TestDir::new("disks-version");
         std::fs::write(disks_path(dir.path()), r#"{"format":"diskdrift-disks","version":2,"disks":[]}"#).unwrap();
-        assert!(matches!(Registry::load(dir.path()), Err(StoreError::UnsupportedDisksVersion { found: 2 })));
+        assert_eq!(Registry::load(dir.path()).unwrap(), Registry::default());
         std::fs::write(disks_path(dir.path()), r#"{"format":"other","version":1}"#).unwrap();
         assert!(matches!(Registry::load(dir.path()), Err(StoreError::Corrupt(_))));
         std::fs::write(disks_path(dir.path()), "{").unwrap();

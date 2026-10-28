@@ -382,8 +382,8 @@ pub fn expand(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-#[cfg(test)]
-mod tests {
+    #[cfg(all(test, unix))]
+    mod tests {
     use super::*;
     use diskdrift_core::testutil::TestDir;
     use diskdrift_core::walk::StdLister;

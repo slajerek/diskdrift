@@ -1,9 +1,7 @@
 //! Path reconstruction for canonical record streams.
 
 use std::cmp::Ordering;
-use std::ffi::OsStr;
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 /// Tracks the path components of the current record while streaming a snapshot.
@@ -61,7 +59,7 @@ impl PathStack {
     }
 
     pub fn path_buf(&self) -> PathBuf {
-        PathBuf::from(OsStr::from_bytes(&self.path_bytes()))
+        PathBuf::from(String::from_utf8_lossy(&self.path_bytes()).into_owned())
     }
 
     /// True if the current path equals `prefix` or lies below it.

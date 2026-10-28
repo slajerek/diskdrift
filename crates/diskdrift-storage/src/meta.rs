@@ -1,11 +1,71 @@
 //! Snapshot metadata, stored as one JSON document per snapshot.
 
+pub use diskdrift_core::record::{FileIdScheme, TimestampResolution};
+use diskdrift_core::native::NativePath;
 use diskdrift_core::walk::{WalkIssue, WalkReport};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// 2: `disk` and `rootInVolume` (ADR 0002).
 pub const META_FORMAT_VERSION: u32 = 2;
+/// Reserved compatibility schema. Publication remains v2 until the activation task.
+pub const META_FORMAT_VERSION_V3: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileIdScope { Volume, Filesystem, Global }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AllocationSemantics { FilesystemReported, SharedPossible, Unknown }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Provenance { Observed(String), Estimated(String), Unknown }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VolumeDescriptor {
+    pub index: u16,
+    pub platform: String,
+    pub identity: NativePath,
+    pub identity_strength: String,
+    pub file_id_scheme: FileIdScheme,
+    pub file_id_scope: FileIdScope,
+    pub mount_key: NativePath,
+    pub aliases: Vec<NativePath>,
+    pub allocation: AllocationSemantics,
+    pub allocation_provenance: Provenance,
+    pub timestamp_resolution: TimestampResolution,
+    pub provenance: Provenance,
+}
+
+/// In-memory metadata-v3 view. It is deliberately not published by the active
+/// store writer; readers may validate it while migration/activation is deferred.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataV3 {
+    pub format_version: u32,
+    pub volumes: Vec<VolumeDescriptor>,
+}
+
+impl MetadataV3 {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.format_version != META_FORMAT_VERSION_V3 { return Err("not metadata-v3"); }
+        for (expected, volume) in self.volumes.iter().enumerate() {
+            if volume.index as usize != expected { return Err("volume descriptors must be ordered"); }
+            volume.validate()?;
+        }
+        Ok(())
+    }
+}
+
+impl VolumeDescriptor {
+    pub fn new(index: u16, platform: impl Into<String>, file_id_scheme: FileIdScheme, file_id_scope: FileIdScope, allocation: AllocationSemantics, timestamp_resolution: TimestampResolution, provenance: Provenance) -> Self {
+        Self { index, platform: platform.into(), identity: NativePath::unix(Vec::new()), identity_strength: "unknown".into(), file_id_scheme, file_id_scope, mount_key: NativePath::unix(Vec::new()), aliases: Vec::new(), allocation, allocation_provenance: Provenance::Unknown, timestamp_resolution, provenance }
+    }
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if matches!(self.file_id_scheme, FileIdScheme::Unavailable) && !matches!(self.file_id_scope, FileIdScope::Volume) { return Err("unavailable file identity must be volume scoped"); }
+        if self.platform.is_empty() { return Err("platform is required"); }
+        if self.mount_key == NativePath::unix(Vec::new()) { return Err("mount key is required"); }
+        if self.identity == NativePath::unix(Vec::new()) { return Err("identity is required"); }
+        if self.aliases.windows(2).any(|pair| pair[0] >= pair[1]) { return Err("aliases must be ordered and unique"); }
+        Ok(())
+    }
+}
 
 /// Snapshot states (spec section 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

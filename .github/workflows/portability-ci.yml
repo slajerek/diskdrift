@@ -1,0 +1,129 @@
+name: portability
+
+on:
+  push:
+    branches:
+      - 'gh/**'
+  pull_request:
+    branches:
+      - devel
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  workspace:
+    name: ${{ github.event_name }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Check workspace
+        shell: bash
+        run: cargo check --workspace --all-targets 2>&1 | tee target-check.log
+
+      - name: Test workspace
+        shell: bash
+        run: cargo test --workspace 2>&1 | tee target-test.log
+
+      - name: Test portable record pipeline
+        shell: bash
+        run: cargo test -p diskdrift-storage --test portable_records 2>&1 | tee target-portable-records.log
+
+      - name: Test portable core paths
+        shell: bash
+        run: cargo test -p diskdrift-core --test native_paths --test native_json_legacy 2>&1 | tee target-portable-core.log
+
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --all-targets --workspace -- -D warnings 2>&1 | tee target-clippy.log
+
+      - name: Check public tree safety
+        shell: bash
+        run: scripts/check-public-tree.sh . 2>&1 | tee target-public-tree.log
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release -p diskdrift-cli 2>&1 | tee target-build.log
+
+      - name: Package native release
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_target="$(rustc -vV | sed -n 's/^host: //p')"
+          source_sha="$(git rev-parse HEAD)"
+          rm -rf release
+          mkdir release
+
+          case "$RUNNER_OS" in
+            macOS)
+              runner="macos"
+              binary_path="target/release/diskdrift"
+              binary_name="diskdrift-${runner}-${host_target}"
+              archive_name="${binary_name}.tar.gz"
+              ;;
+            Linux)
+              runner="linux"
+              binary_path="target/release/diskdrift"
+              binary_name="diskdrift-${runner}-${host_target}"
+              archive_name="${binary_name}.tar.gz"
+              ;;
+            Windows)
+              runner="windows"
+              binary_path="target/release/diskdrift.exe"
+              binary_name="diskdrift-${runner}-${host_target}.exe"
+              archive_name="${binary_name%.exe}.zip"
+              ;;
+            *)
+              echo "unsupported runner OS: $RUNNER_OS" >&2
+              exit 1
+              ;;
+          esac
+
+          test -f "$binary_path"
+          release_binary="release/$binary_name"
+          cp "$binary_path" "$release_binary"
+
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -Command "Compress-Archive -LiteralPath 'release/$binary_name' -DestinationPath 'release/$archive_name' -Force"
+          else
+            tar -czf "release/$archive_name" -C release "$binary_name"
+          fi
+
+          rm "$release_binary"
+          test -f "release/$archive_name"
+          if command -v sha256sum >/dev/null 2>&1; then
+            archive_sha="$(sha256sum "release/$archive_name" | awk '{print $1}')"
+          else
+            archive_sha="$(shasum -a 256 "release/$archive_name" | awk '{print $1}')"
+          fi
+          printf '{\n  "schema": 1,\n  "source_sha": "%s",\n  "runner": "%s",\n  "rust_target": "%s",\n  "binary": "%s",\n  "sha256": "%s"\n}\n' \
+            "$source_sha" "$runner" "$host_target" "$binary_name" "$archive_sha" \
+            > "release/manifest-${runner}.json"
+
+      - name: Upload native release
+        if: ${{ success() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portability-build-${{ matrix.os }}
+          path: release/
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: portability-logs-${{ matrix.os }}
+          path: target-*.log
+          if-no-files-found: warn

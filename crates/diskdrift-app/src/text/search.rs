@@ -17,11 +17,18 @@ fn kind(k: Kind) -> &'static str {
 
 /// When a scan started, "3 Oct 14:20" (with the year when it is not this year).
 pub fn scan_when(rfc: &str, now: i64) -> String {
+    scan_when_in(rfc, now, &chrono::Local)
+}
+
+fn scan_when_in<Tz: chrono::TimeZone>(rfc: &str, now: i64, timezone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
     let Ok(t) = chrono::DateTime::parse_from_rfc3339(rfc) else {
         return rfc.into();
     };
-    let t = t.with_timezone(&chrono::Local);
-    let this_year = chrono::DateTime::from_timestamp(now, 0).map(|n| n.with_timezone(&chrono::Local).format("%Y").to_string());
+    let t = t.with_timezone(timezone);
+    let this_year = chrono::DateTime::from_timestamp(now, 0).map(|n| n.with_timezone(timezone).format("%Y").to_string());
     if this_year.as_deref() == Some(&t.format("%Y").to_string()) { t.format("%-d %b %H:%M").to_string() } else { t.format("%-d %b %Y %H:%M").to_string() }
 }
 
@@ -32,6 +39,13 @@ pub fn scan_ref(s: &ScanRef, now: i64) -> String {
 
 fn disk(p: &Place) -> String {
     if p.connected { p.disk_name.clone() } else { format!("{} (not connected)", p.disk_name) }
+}
+
+fn scan_ref_in<Tz: chrono::TimeZone>(s: &ScanRef, now: i64, timezone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    format!("scan #{} ({})", s.id, scan_when_in(&s.started_at, now, timezone))
 }
 
 /// The matches in the newest scans.
@@ -95,21 +109,24 @@ pub fn current(c: &Current, u: SizeUnits, now: i64) -> String {
 /// Printed before the history search starts, when nothing is current.
 pub const SEARCHING_HISTORY: &str = "Searching the history for deleted files…";
 
-fn lifetime_lines(out: &mut String, l: &Lifetime, u: SizeUnits, now: i64) {
+fn lifetime_lines<Tz: chrono::TimeZone>(out: &mut String, l: &Lifetime, u: SizeUnits, now: i64, timezone: &Tz)
+where
+    Tz::Offset: std::fmt::Display,
+{
     let size = if l.kind == Kind::Dir { String::new() } else { format!(", {}", format_size(l.size, u)) };
     let _ = writeln!(out, "{}  ({}{size}, modified {})", l.path.lossy(), kind(l.kind), super::date(l.mtime));
     let _ = writeln!(out, "  on {}, scanned at {}", disk(&l.place), l.place.root);
     match &l.gone_in {
         Some(g) => {
-            let _ = writeln!(out, "  last seen in {}, gone in {}: deleted or moved between those two.", scan_ref(&l.last_seen, now), scan_ref(g, now));
+            let _ = writeln!(out, "  last seen in {}, gone in {}: deleted or moved between those two.", scan_ref_in(&l.last_seen, now, timezone), scan_ref_in(g, now, timezone));
         }
         None => {
-            let _ = writeln!(out, "  still there in {}.", scan_ref(&l.last_seen, now));
+            let _ = writeln!(out, "  still there in {}.", scan_ref_in(&l.last_seen, now, timezone));
         }
     }
     let mut since = match &l.appeared_in {
-        Some(a) => format!("  appeared in {}", scan_ref(a, now)),
-        None => format!("  already there in the oldest scan, {}", scan_ref(&l.oldest, now)),
+        Some(a) => format!("  appeared in {}", scan_ref_in(a, now, timezone)),
+        None => format!("  already there in the oldest scan, {}", scan_ref_in(&l.oldest, now, timezone)),
     };
     if l.changes > 0 {
         let _ = write!(since, "; its size or date changed {} {}", l.changes, if l.changes == 1 { "time" } else { "times" });
@@ -126,6 +143,13 @@ fn lifetime_lines(out: &mut String, l: &Lifetime, u: SizeUnits, now: i64) {
 /// The history part: what is gone, and (with `--history`) when the current
 /// matches appeared. `found_now`: there were current matches.
 pub fn history(h: &History, found_now: bool, u: SizeUnits, now: i64) -> String {
+    history_in(h, found_now, u, now, &chrono::Local)
+}
+
+fn history_in<Tz: chrono::TimeZone>(h: &History, found_now: bool, u: SizeUnits, now: i64, timezone: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
     let mut out = String::new();
     if h.cancelled {
         let _ = writeln!(out, "History search stopped after {} of {} scan pairs.", h.pairs_done, h.pairs);
@@ -158,7 +182,7 @@ pub fn history(h: &History, found_now: bool, u: SizeUnits, now: i64) -> String {
         );
         for l in &h.gone {
             out.push('\n');
-            lifetime_lines(&mut out, l, u, now);
+            lifetime_lines(&mut out, l, u, now, timezone);
         }
         out.push_str(
             "\nDiskDrift records metadata, not file contents, and cannot bring a file back. Look in the Trash, \
@@ -169,7 +193,7 @@ pub fn history(h: &History, found_now: bool, u: SizeUnits, now: i64) -> String {
         let _ = writeln!(out, "\nHistory of the current matches that changed:");
         for l in &h.current {
             out.push('\n');
-            lifetime_lines(&mut out, l, u, now);
+            lifetime_lines(&mut out, l, u, now, timezone);
         }
     }
     out
@@ -187,6 +211,7 @@ mod tests {
     #[test]
     fn a_gone_file_reads_as_the_roadmap_says() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-22T12:00:00+02:00").unwrap().timestamp();
+        let offset = chrono::FixedOffset::east_opt(2 * 60 * 60).unwrap();
         let l = Lifetime {
             path: NativePath(b"/Volumes/backupy-2014/Docs/waznasprawa10.txt".to_vec()),
             kind: Kind::File,
@@ -202,7 +227,7 @@ mod tests {
             moved_to: Some("/Volumes/backupy-2014/Old/waznasprawa10.txt".into()),
         };
         let h = History { gone: vec![l], gone_total: 1, pairs_done: 12, pairs: 12, elapsed_ms: 113, ..Default::default() };
-        let text = history(&h, false, SizeUnits::Decimal, now);
+        let text = history_in(&h, false, SizeUnits::Decimal, now, &offset);
         assert!(text.contains("on backupy-2014 (not connected)"), "{text}");
         assert!(text.contains("last seen in scan #12 (3 Oct 14:20), gone in scan #13 (10 Oct 09:05): deleted or moved between those two."), "{text}");
         assert!(text.contains("appeared in scan #4 (3 Oct 2025 14:20); its size or date changed 1 time."), "{text}");

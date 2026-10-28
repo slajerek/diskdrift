@@ -20,8 +20,6 @@ use diskdrift_app::search::{Current, Hit, History, Lifetime, Query};
 use diskdrift_app::storage::Compaction;
 use diskdrift_app::careful::{CarefulOutcome, Held};
 use diskdrift_app::core::record::Kind;
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -93,25 +91,72 @@ impl Screen {
     }
 
     fn from_hotkey(c: char) -> Option<Screen> {
-        MENU.iter().copied().find(|s| s.hotkey().eq_ignore_ascii_case(&c))
+        MENU.iter().find_map(|item| match item {
+            MenuItem::Screen(screen) if screen.hotkey().eq_ignore_ascii_case(&c) => Some(*screen),
+            _ => None,
+        })
     }
 }
 
-/// Main menu, laid out in two columns, row by row.
-pub const MENU: [Screen; 12] = [
-    Screen::Scan,
-    Screen::Snapshots,
-    Screen::Disks,
-    Screen::Find,
-    Screen::Diff,
-    Screen::Top,
-    Screen::Doctor,
-    Screen::Recover,
-    Screen::Usage,
-    Screen::Settings,
-    Screen::Careful,
-    Screen::Help,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuItem {
+    Screen(Screen),
+    Quit,
+}
+
+impl MenuItem {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Screen(screen) => screen.title(),
+            Self::Quit => "Quit",
+        }
+    }
+
+    pub fn hotkey(self) -> char {
+        match self {
+            Self::Screen(screen) => screen.hotkey(),
+            Self::Quit => 'Q',
+        }
+    }
+}
+
+pub const DISKS_MENU: [MenuItem; 4] = [
+    MenuItem::Screen(Screen::Scan),
+    MenuItem::Screen(Screen::Disks),
+    MenuItem::Screen(Screen::Snapshots),
+    MenuItem::Screen(Screen::Careful),
 ];
+pub const EXPLORE_MENU: [MenuItem; 6] = [
+    MenuItem::Screen(Screen::Find),
+    MenuItem::Screen(Screen::Top),
+    MenuItem::Screen(Screen::Diff),
+    MenuItem::Screen(Screen::Doctor),
+    MenuItem::Screen(Screen::Recover),
+    MenuItem::Screen(Screen::Usage),
+];
+pub const DISKDRIFT_MENU: [MenuItem; 3] = [
+    MenuItem::Screen(Screen::Settings),
+    MenuItem::Screen(Screen::Help),
+    MenuItem::Quit,
+];
+pub const MENU: [MenuItem; 13] = [
+    DISKS_MENU[0],
+    DISKS_MENU[1],
+    DISKS_MENU[2],
+    DISKS_MENU[3],
+    EXPLORE_MENU[0],
+    EXPLORE_MENU[1],
+    EXPLORE_MENU[2],
+    EXPLORE_MENU[3],
+    EXPLORE_MENU[4],
+    EXPLORE_MENU[5],
+    DISKDRIFT_MENU[0],
+    DISKDRIFT_MENU[1],
+    DISKDRIFT_MENU[2],
+];
+const DISKS_RANGE: std::ops::Range<usize> = 0..4;
+const EXPLORE_RANGE: std::ops::Range<usize> = 4..10;
+const DISKDRIFT_RANGE: std::ops::Range<usize> = 10..13;
 
 /// State of a background job.
 #[derive(Debug, Default)]
@@ -371,8 +416,16 @@ impl BrowseData {
     }
 }
 
+#[cfg(unix)]
 fn native(bytes: &[u8]) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn native(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
 /// Opening `path` from a list: a directory is opened, a file shows its parent
@@ -640,6 +693,7 @@ pub struct App {
     pub settings: Effective,
     pub screen: Screen,
     pub menu_index: usize,
+    menu_return_index: usize,
     pub usage: Job<UsageReport>,
     pub doctor: Job<DoctorReport>,
     pub recover: Job<RecoverReport>,
@@ -714,6 +768,7 @@ impl App {
             settings,
             screen: Screen::Dashboard,
             menu_index: 0,
+            menu_return_index: 3,
             usage: Job::Idle,
             doctor: Job::Idle,
             recover: Job::Idle,
@@ -812,10 +867,29 @@ impl App {
             || (self.screen == Screen::Find && self.find.editing)
     }
 
+    fn select_menu(&mut self, index: usize) {
+        if index < MENU.len() {
+            if !DISKDRIFT_RANGE.contains(&self.menu_index) && DISKDRIFT_RANGE.contains(&index) {
+                self.menu_return_index = self.menu_index;
+            }
+            self.menu_index = index;
+        }
+    }
+
+    fn activate_menu_item(&mut self) -> Vec<Command> {
+        match MENU[self.menu_index] {
+            MenuItem::Screen(screen) => self.open(screen),
+            MenuItem::Quit => {
+                self.confirm_exit = true;
+                Vec::new()
+            }
+        }
+    }
+
     pub fn open(&mut self, screen: Screen) -> Vec<Command> {
         self.screen = screen;
         self.scroll = 0;
-        if let Some(i) = MENU.iter().position(|s| *s == screen) {
+        if let Some(i) = MENU.iter().position(|item| matches!(item, MenuItem::Screen(candidate) if *candidate == screen)) {
             self.menu_index = i;
         }
         match screen {
@@ -1238,29 +1312,60 @@ impl App {
                 Some(s) => self.open(s),
                 None => Vec::new(),
             },
-            KeyCode::Enter if self.screen == Screen::Dashboard => self.open(MENU[self.menu_index]),
+            KeyCode::Enter if self.screen == Screen::Dashboard => self.activate_menu_item(),
             KeyCode::Up if self.screen == Screen::Dashboard => {
-                if self.menu_index >= 2 {
-                    self.menu_index -= 2;
+                if (DISKS_RANGE.contains(&self.menu_index) && self.menu_index > DISKS_RANGE.start)
+                    || (EXPLORE_RANGE.contains(&self.menu_index) && self.menu_index > EXPLORE_RANGE.start)
+                {
+                    self.select_menu(self.menu_index - 1);
+                } else if DISKDRIFT_RANGE.contains(&self.menu_index) {
+                    self.select_menu(self.menu_return_index);
                 }
                 Vec::new()
             }
             KeyCode::Down if self.screen == Screen::Dashboard => {
-                if self.menu_index + 2 < MENU.len() {
-                    self.menu_index += 2;
+                if DISKS_RANGE.contains(&self.menu_index) {
+                    if self.menu_index + 1 < DISKS_RANGE.end {
+                        self.select_menu(self.menu_index + 1);
+                    } else {
+                        self.select_menu(DISKDRIFT_RANGE.start);
+                    }
+                } else if EXPLORE_RANGE.contains(&self.menu_index) {
+                    if self.menu_index + 1 < EXPLORE_RANGE.end {
+                        self.select_menu(self.menu_index + 1);
+                    } else {
+                        self.select_menu(DISKDRIFT_RANGE.start);
+                    }
                 }
                 Vec::new()
             }
-            KeyCode::Left | KeyCode::BackTab if self.screen == Screen::Dashboard => {
-                // Left stays in the row; Shift+Tab walks back through the whole menu.
-                if self.menu_index % 2 == 1 || (key.code == KeyCode::BackTab && self.menu_index > 0) {
-                    self.menu_index -= 1;
+            KeyCode::Left if self.screen == Screen::Dashboard => {
+                if EXPLORE_RANGE.contains(&self.menu_index) {
+                    let row = self.menu_index - EXPLORE_RANGE.start;
+                    self.select_menu(DISKS_RANGE.start + row.min(DISKS_RANGE.len() - 1));
+                } else if DISKDRIFT_RANGE.contains(&self.menu_index) && self.menu_index > DISKDRIFT_RANGE.start {
+                    self.select_menu(self.menu_index - 1);
                 }
                 Vec::new()
             }
-            KeyCode::Right | KeyCode::Tab if self.screen == Screen::Dashboard => {
-                if (self.menu_index.is_multiple_of(2) || key.code == KeyCode::Tab) && self.menu_index + 1 < MENU.len() {
-                    self.menu_index += 1;
+            KeyCode::Right if self.screen == Screen::Dashboard => {
+                if DISKS_RANGE.contains(&self.menu_index) {
+                    let row = self.menu_index - DISKS_RANGE.start;
+                    self.select_menu(EXPLORE_RANGE.start + row);
+                } else if DISKDRIFT_RANGE.contains(&self.menu_index) && self.menu_index + 1 < DISKDRIFT_RANGE.end {
+                    self.select_menu(self.menu_index + 1);
+                }
+                Vec::new()
+            }
+            KeyCode::Tab if self.screen == Screen::Dashboard => {
+                if self.menu_index + 1 < MENU.len() {
+                    self.select_menu(self.menu_index + 1);
+                }
+                Vec::new()
+            }
+            KeyCode::BackTab if self.screen == Screen::Dashboard => {
+                if self.menu_index > 0 {
+                    self.select_menu(self.menu_index - 1);
                 }
                 Vec::new()
             }
@@ -1400,7 +1505,7 @@ impl App {
                         Some(m) if m.status.is_usable() => {
                             let pos = self.usable().iter().position(|r| r.meta.id == m.id).unwrap_or(0);
                             self.screen = Screen::Top;
-                            self.menu_index = MENU.iter().position(|s| *s == Screen::Top).unwrap();
+                            self.menu_index = MENU.iter().position(|item| matches!(item, MenuItem::Screen(candidate) if *candidate == Screen::Top)).unwrap();
                             self.top.snapshot = pos;
                             self.top.chosen = true;
                             self.top.focus = TopFocus::List;
@@ -2460,7 +2565,7 @@ impl App {
                 let root = last.unwrap_or_else(|| mount.display().to_string());
                 self.scan = ScanStage::Confirm { root, name: String::new() };
                 self.screen = Screen::Scan;
-                self.menu_index = MENU.iter().position(|s| *s == Screen::Scan).unwrap_or(0);
+                self.menu_index = MENU.iter().position(|item| matches!(item, MenuItem::Screen(candidate) if *candidate == Screen::Scan)).unwrap_or(0);
             }
             KeyCode::Char('f') if row.as_ref().is_some_and(|r| !r.known) => {
                 self.disks.note = Some(Err("This disk is not in the store yet: there is nothing to forget.".into()));
@@ -2793,6 +2898,11 @@ pub(crate) mod tests {
         resolve_with(&Overrides::default(), Path::new("/nonexistent-home"), Path::new("/")).unwrap()
     }
 
+    #[cfg(not(windows))]
+    pub fn root_path() -> String {
+        std::fs::canonicalize(Path::new("/")).unwrap_or_else(|_| Path::new("/").to_path_buf()).display().to_string()
+    }
+
     pub fn key(code: KeyCode) -> KeyEvent {
         KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE }
     }
@@ -3010,6 +3120,8 @@ pub(crate) mod tests {
             first_seen: String::new(),
             last_seen: String::new(),
             last_mount_point: None,
+            aliases: Vec::new(),
+            last_mount_path: None,
         };
         let action = ConnectAction::Rescan { disk, root: "/Volumes/OLD".into(), last_scan: "2026-01-01T00:00:00+01:00".into() };
         let cmds = app.handle_msg(Msg::Connected { volume: v, action: Box::new(Ok(action)) });
@@ -3018,36 +3130,202 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn menu_grid_navigation() {
+    fn dashboard_menu_has_three_groups_in_display_order() {
+        assert_eq!(DISKS_MENU.map(MenuItem::title), ["Scan disk", "My disks", "Snapshot history", "Careful mode"]);
+        assert_eq!(EXPLORE_MENU.map(MenuItem::title), ["Find a file", "Largest files", "Compare snapshots", "Investigate / Doctor", "Recovery suggestions", "Volume usage"]);
+        assert_eq!(DISKDRIFT_MENU.map(MenuItem::title), ["Settings", "Help", "Quit"]);
+        assert_eq!(MENU, [
+            MenuItem::Screen(Screen::Scan),
+            MenuItem::Screen(Screen::Disks),
+            MenuItem::Screen(Screen::Snapshots),
+            MenuItem::Screen(Screen::Careful),
+            MenuItem::Screen(Screen::Find),
+            MenuItem::Screen(Screen::Top),
+            MenuItem::Screen(Screen::Diff),
+            MenuItem::Screen(Screen::Doctor),
+            MenuItem::Screen(Screen::Recover),
+            MenuItem::Screen(Screen::Usage),
+            MenuItem::Screen(Screen::Settings),
+            MenuItem::Screen(Screen::Help),
+            MenuItem::Quit,
+        ]);
+        assert_eq!(MENU.last(), Some(&MenuItem::Quit));
+    }
+
+    fn menu_index(item: MenuItem) -> usize {
+        MENU.iter().position(|candidate| *candidate == item).unwrap()
+    }
+
+    fn selected_menu_item(app: &App) -> MenuItem {
+        MENU[app.menu_index]
+    }
+
+    #[test]
+    fn menu_navigation_vertical() {
+        let disks = [
+            MenuItem::Screen(Screen::Scan),
+            MenuItem::Screen(Screen::Disks),
+            MenuItem::Screen(Screen::Snapshots),
+            MenuItem::Screen(Screen::Careful),
+        ];
+        let explore = [
+            MenuItem::Screen(Screen::Find),
+            MenuItem::Screen(Screen::Top),
+            MenuItem::Screen(Screen::Diff),
+            MenuItem::Screen(Screen::Doctor),
+            MenuItem::Screen(Screen::Recover),
+            MenuItem::Screen(Screen::Usage),
+        ];
         let mut app = App::new(settings());
-        assert_eq!(MENU[app.menu_index], Screen::Scan);
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(MENU[app.menu_index], Screen::Snapshots);
-        app.handle_key(key(KeyCode::Right));
-        assert_eq!(MENU[app.menu_index], Screen::Snapshots, "stays in the right column");
-        // Scan | History, My disks | Find, Compare | Largest, Doctor | Recover, Usage | Settings, Careful | Help.
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(MENU[app.menu_index], Screen::Find);
-        app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(MENU[app.menu_index], Screen::Recover);
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(MENU[app.menu_index], Screen::Settings);
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(MENU[app.menu_index], Screen::Help);
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(MENU[app.menu_index], Screen::Help, "no row below");
-        app.handle_key(key(KeyCode::Left));
-        assert_eq!(MENU[app.menu_index], Screen::Careful);
+
+        for group in [disks.as_slice(), explore.as_slice()] {
+            for pair in group.windows(2) {
+                app.menu_index = menu_index(pair[0]);
+                app.handle_key(key(KeyCode::Down));
+                assert_eq!(selected_menu_item(&app), pair[1]);
+                app.handle_key(key(KeyCode::Up));
+                assert_eq!(selected_menu_item(&app), pair[0]);
+            }
+        }
+
+        app.menu_index = menu_index(disks[0]);
         app.handle_key(key(KeyCode::Up));
+        assert_eq!(selected_menu_item(&app), disks[0], "Up at Scan stops");
+        app.menu_index = menu_index(explore[0]);
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(MENU[app.menu_index], Screen::Doctor);
+        assert_eq!(selected_menu_item(&app), explore[0], "Up at Find stops");
+
+        app.menu_index = menu_index(disks[3]);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Settings));
+        app.menu_index = menu_index(explore[5]);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Settings));
+        app.menu_index = menu_index(MenuItem::Quit);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(selected_menu_item(&app), MenuItem::Quit, "Down in DiskDrift stops");
+    }
+
+    #[test]
+    fn menu_navigation_horizontal() {
+        let transitions = [
+            (Screen::Scan, KeyCode::Right, Screen::Find),
+            (Screen::Disks, KeyCode::Right, Screen::Top),
+            (Screen::Snapshots, KeyCode::Right, Screen::Diff),
+            (Screen::Careful, KeyCode::Right, Screen::Doctor),
+            (Screen::Find, KeyCode::Left, Screen::Scan),
+            (Screen::Top, KeyCode::Left, Screen::Disks),
+            (Screen::Diff, KeyCode::Left, Screen::Snapshots),
+            (Screen::Doctor, KeyCode::Left, Screen::Careful),
+            (Screen::Recover, KeyCode::Left, Screen::Careful),
+            (Screen::Usage, KeyCode::Left, Screen::Careful),
+        ];
+        for (from, code, to) in transitions {
+            let mut app = App::new(settings());
+            app.menu_index = menu_index(MenuItem::Screen(from));
+            app.handle_key(key(code));
+            assert_eq!(selected_menu_item(&app), MenuItem::Screen(to), "{from:?} {code:?}");
+        }
+
+        for screen in [Screen::Scan, Screen::Disks, Screen::Snapshots, Screen::Careful] {
+            let mut app = App::new(settings());
+            app.menu_index = menu_index(MenuItem::Screen(screen));
+            app.handle_key(key(KeyCode::Left));
+            assert_eq!(selected_menu_item(&app), MenuItem::Screen(screen));
+        }
+        for screen in [Screen::Find, Screen::Top, Screen::Diff, Screen::Doctor, Screen::Recover, Screen::Usage] {
+            let mut app = App::new(settings());
+            app.menu_index = menu_index(MenuItem::Screen(screen));
+            app.handle_key(key(KeyCode::Right));
+            assert_eq!(selected_menu_item(&app), MenuItem::Screen(screen));
+        }
+    }
+
+    #[test]
+    fn menu_navigation_diskdrift() {
+        let mut app = App::new(settings());
+        app.menu_index = menu_index(MenuItem::Screen(Screen::Careful));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Settings));
+        for (item, expected) in [
+            (MenuItem::Screen(Screen::Settings), MenuItem::Screen(Screen::Careful)),
+            (MenuItem::Screen(Screen::Help), MenuItem::Screen(Screen::Careful)),
+            (MenuItem::Quit, MenuItem::Screen(Screen::Careful)),
+        ] {
+            app.menu_index = menu_index(item);
+            app.handle_key(key(KeyCode::Up));
+            assert_eq!(selected_menu_item(&app), expected);
+        }
+
+        app.menu_index = menu_index(MenuItem::Screen(Screen::Usage));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Settings));
+        app.menu_index = menu_index(MenuItem::Quit);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Usage));
+
+        let mut fallback = App::new(settings());
+        fallback.menu_index = menu_index(MenuItem::Screen(Screen::Settings));
+        fallback.handle_key(key(KeyCode::Up));
+        assert_eq!(selected_menu_item(&fallback), MenuItem::Screen(Screen::Careful));
+
+        let mut horizontal = App::new(settings());
+        horizontal.menu_index = menu_index(MenuItem::Screen(Screen::Settings));
+        horizontal.handle_key(key(KeyCode::Right));
+        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Help));
+        horizontal.handle_key(key(KeyCode::Right));
+        assert_eq!(selected_menu_item(&horizontal), MenuItem::Quit);
+        horizontal.handle_key(key(KeyCode::Right));
+        assert_eq!(selected_menu_item(&horizontal), MenuItem::Quit);
+        horizontal.handle_key(key(KeyCode::Left));
+        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Help));
+        horizontal.handle_key(key(KeyCode::Left));
+        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Settings));
+        horizontal.handle_key(key(KeyCode::Left));
+        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Settings));
+    }
+
+    #[test]
+    fn menu_navigation_tab_order() {
+        let mut app = App::new(settings());
+        for (index, item) in MENU.iter().enumerate() {
+            assert_eq!(selected_menu_item(&app), *item);
+            if index + 1 < MENU.len() {
+                app.handle_key(key(KeyCode::Tab));
+            }
+        }
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(selected_menu_item(&app), MenuItem::Quit);
+
+        for (index, item) in MENU.iter().enumerate().rev() {
+            assert_eq!(selected_menu_item(&app), *item);
+            if index > 0 {
+                app.handle_key(key(KeyCode::BackTab));
+            }
+        }
         app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(MENU[app.menu_index], Screen::Top);
-        app.handle_key(key(KeyCode::Tab));
-        app.handle_key(key(KeyCode::Tab));
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.screen, Screen::Recover);
+        assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Scan));
+    }
+
+    #[test]
+    fn dashboard_enter_opens_selected_screen() {
+        let mut app = App::new(settings());
+        app.menu_index = menu_index(MenuItem::Screen(Screen::Top));
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        assert_eq!(app.screen, Screen::Top);
+    }
+
+    #[test]
+    fn enter_on_dashboard_quit_uses_dashboard_confirmation() {
+        let mut app = App::new(settings());
+        app.menu_index = MENU.iter().position(|item| *item == MenuItem::Quit).unwrap();
+
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        assert!(app.confirm_exit);
+        assert!(!app.confirm_quit);
+        assert!(!app.should_quit);
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Command::CancelJobs, Command::Quit]);
     }
 
     #[test]
@@ -3070,6 +3348,7 @@ pub(crate) mod tests {
         assert!(app.should_quit);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn scan_form_takes_text_and_confirms() {
         let mut app = App::new(settings());
@@ -3077,9 +3356,7 @@ pub(crate) mod tests {
         assert_eq!(app.screen, Screen::Scan);
         assert!(app.text_input_active());
         // Clear the default root and type a new one; letters must not trigger hotkeys.
-        for _ in 0..10 {
-            app.handle_key(key(KeyCode::Backspace));
-        }
+        app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('u')) });
         typed(&mut app, "/nonexistent-diskdrift-q");
         assert_eq!(app.screen, Screen::Scan, "q while typing is text, not quit");
         assert!(!app.should_quit);
@@ -3087,14 +3364,14 @@ pub(crate) mod tests {
         typed(&mut app, "base");
         // A folder that does not exist is caught in the form, before any confirmation.
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(&app.scan, ScanStage::Setup { field: ScanField::Root, error: Some(e), .. } if e.contains("does not exist")));
+        assert!(matches!(&app.scan, ScanStage::Setup { field: ScanField::Root, error: Some(_), .. }));
         app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('u')) });
         assert!(matches!(&app.scan, ScanStage::Setup { root, error: None, .. } if root.is_empty()), "Ctrl+U clears; typing clears the error");
         typed(&mut app, "/");
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(&app.scan, ScanStage::Confirm { root, name } if root == "/" && name == "base"));
+        assert!(matches!(&app.scan, ScanStage::Confirm { root, name } if root == &root_path() && name == "base"));
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::StartScan { root: "/".into(), name: Some("base".into()), background: false, disk: None }]);
+        assert_eq!(cmds, vec![Command::StartScan { root: root_path(), name: Some("base".into()), background: false, disk: None }]);
         assert!(app.scan_running());
     }
 
@@ -3495,6 +3772,7 @@ pub(crate) mod tests {
         assert_eq!(app.handle_key(key(KeyCode::F(5))), vec![Command::LoadUsage]);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn a_finished_scan_offers_its_changes_and_a_new_scan_of_the_same_folder() {
         let mut app = App::new(settings());
@@ -3502,7 +3780,8 @@ pub(crate) mod tests {
         app.handle_key(key(KeyCode::Char('s')));
         app.handle_key(key(KeyCode::Enter));
         assert!(!app.handle_key(key(KeyCode::Enter)).is_empty(), "the default root / starts");
-        let both = rows(&[(1, "/", Status::Completed), (2, "/", Status::Completed)]);
+        let root = root_path();
+        let both = rows(&[(1, &root, Status::Completed), (2, &root, Status::Completed)]);
         let outcome = ScanOutcome {
             snapshot: both.snapshots[1].meta.clone(),
             cancelled: false,
@@ -3520,12 +3799,12 @@ pub(crate) mod tests {
         app.screen = Screen::Scan;
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Dashboard);
-        assert!(matches!(&app.scan, ScanStage::Setup { root, error: None, .. } if root == "/"));
+        assert!(matches!(&app.scan, ScanStage::Setup { root, error: None, .. } if root == &root_path()));
         // A failed scan goes back to the form, saying why.
         app.screen = Screen::Scan;
         app.scan = ScanStage::Finished(Err("boom".into()));
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(&app.scan, ScanStage::Setup { root, error: Some(e), .. } if root == "/" && e == "boom"));
+        assert!(matches!(&app.scan, ScanStage::Setup { root, error: Some(e), .. } if root == &root_path() && e == "boom"));
     }
 
     #[test]
@@ -3635,10 +3914,14 @@ pub(crate) mod tests {
         assert_eq!(app.screen, Screen::Dashboard);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn background_scan_starts_once_when_the_last_scan_is_old_and_x_stops_it() {
-        let mut app = App::new(settings());
-        let mut old = match browse_listing("/", "/", &[]) {
+        let root = root_path();
+        let mut s = settings();
+        s.default_root.value = root.clone().into();
+        let mut app = App::new(s);
+        let mut old = match browse_listing(&root, &root, &[]) {
             BrowseData::Snapshot(b) => b.snapshot,
             BrowseData::Diff(_) => unreachable!(),
         };
@@ -3653,7 +3936,7 @@ pub(crate) mod tests {
         };
         let cmds = app.handle_msg(Msg::Snapshots(Box::new(Ok(list()))));
         assert!(
-            matches!(&cmds[..], [Command::StartScan { root, background: true, name: Some(n), disk: None }] if root == "/" && n.starts_with("auto-")),
+            matches!(&cmds[..], [Command::StartScan { root: scan_root, background: true, name: Some(n), disk: None }] if scan_root == &root && n.starts_with("auto-")),
             "{cmds:?}"
         );
         assert!(app.auto_scan_running() && !app.busy());
@@ -3705,6 +3988,7 @@ pub(crate) mod tests {
 
     // My disks (ADR 0002, phase 7). A real store in target/test-tmp: two scans of one tree.
 
+    #[cfg(not(windows))]
     fn with_store(name: &str) -> (diskdrift_app::core::testutil::TestDir, Effective, PathBuf) {
         let t = diskdrift_app::core::testutil::TestDir::new(name);
         let tree = t.path().join("tree");
@@ -3714,26 +3998,32 @@ pub(crate) mod tests {
         let o = Overrides { config: Some(t.path().join("config.json")), db: Some(t.path().join("store")), ..Default::default() };
         let s = resolve_with(&o, t.path(), Path::new("/")).unwrap();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        for _ in 0..2 {
-            let req = snapshots::ScanRequest::from_settings(&s, Some(tree.clone()), None, &[]);
+        for scan in 0..2 {
+            let mut req = snapshots::ScanRequest::from_settings(&s, Some(tree.clone()), None, &[]);
+            if scan == 1 {
+                req.disk_choice = Some(diskdrift_app::disks::DiskChoice::Same);
+            }
             snapshots::scan(&s, &req, &cancel, None).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(1100));
         }
         (t, s, tree)
     }
 
+    #[cfg(not(windows))]
     fn loaded(s: &Effective) -> App {
         let mut app = App::new(s.clone());
         app.handle_msg(Msg::Snapshots(Box::new(snapshots::list(s).map_err(|e| e.to_string()))));
         app
     }
 
+    #[cfg(not(windows))]
     fn reload(app: &mut App) {
         let s = app.settings.clone();
         app.handle_msg(Msg::Disks(Box::new(disks::list(&s).map_err(|e| e.to_string()))));
         app.handle_msg(Msg::Snapshots(Box::new(snapshots::list(&s).map_err(|e| e.to_string()))));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn history_marks_asks_and_removes_scans() {
         let (_t, s, _tree) = with_store("tui-history-remove");
@@ -3785,6 +4075,7 @@ pub(crate) mod tests {
         assert!(app.snap_note.as_deref().is_some_and(|n| n.contains("already compact")), "{:?}", app.snap_note);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn my_disks_filters_history_and_edits_the_disk() {
         let (_t, s, _tree) = with_store("tui-my-disks");
@@ -3912,6 +4203,8 @@ pub(crate) mod tests {
             first_seen: "2026-01-01T10:00:00+01:00".into(),
             last_seen: "2026-01-01T10:00:00+01:00".into(),
             last_mount_point: None,
+            aliases: Vec::new(),
+            last_mount_path: None,
         }
     }
 

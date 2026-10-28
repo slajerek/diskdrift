@@ -6,6 +6,7 @@ use diskdrift_app::core::units::{SizeUnits, parse_size};
 use diskdrift_app::diagnostics::doctor::{self, DoctorOptions, DoctorStep};
 use diskdrift_app::platform::{self, ListerKind};
 use diskdrift_app::text as render;
+use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -183,7 +184,7 @@ struct DoctorArgs {
 #[derive(Args)]
 struct ScanArgs {
     /// Directory to scan (default: scan.defaultRoot from the config, normally /).
-    root: Option<PathBuf>,
+    root: Option<OsString>,
     /// Snapshot name (default: the start time).
     #[arg(long)]
     name: Option<String>,
@@ -455,7 +456,7 @@ type Outcome = Result<(), Failure>;
 fn main() -> ExitCode {
     // Exceeding a file-size limit must surface as an error (EFBIG) that the store
     // handles like a full disk, not kill the process mid-write.
-    unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+    ignore_file_size_limit();
     let cli = Cli::parse();
     if let Err(e) = init_logging(&cli.global) {
         eprintln!("diskdrift: {e}");
@@ -478,6 +479,14 @@ fn main() -> ExitCode {
         }
     }
 }
+
+#[cfg(unix)]
+fn ignore_file_size_limit() {
+    unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+}
+
+#[cfg(not(unix))]
+fn ignore_file_size_limit() {}
 
 fn init_logging(g: &Global) -> Result<(), String> {
     use tracing_subscriber::prelude::*;
@@ -674,6 +683,7 @@ fn careful_cmd(g: &Global, args: CarefulArgs) -> Outcome {
             _ => print_text("  Left held back, not mounted: it can be unplugged.\n")?,
         }
     }
+    #[cfg(target_os = "macos")]
     drop(guard);
     print_text(&format!("{}\n", text::OFF))?;
     Ok(())
@@ -1028,7 +1038,11 @@ fn disks_cmd(g: &Global, action: Option<DiskAction>, json: bool) -> Outcome {
 fn scan_cmd(g: &Global, args: ScanArgs) -> Outcome {
     use diskdrift_app::core::units::format_size;
     let s = settings(g, args.threads)?;
-    let mut req = diskdrift_app::snapshots::ScanRequest::from_settings(&s, args.root.clone(), args.name.clone(), &args.exclude);
+    if let Some(root) = args.root.as_deref() {
+        platform::native_root(root).map_err(|e| Failure::Usage(format!("invalid scan root: {e}")))?;
+    }
+    let root = args.root.as_ref().map(PathBuf::from);
+    let mut req = diskdrift_app::snapshots::ScanRequest::from_settings(&s, root, args.name.clone(), &args.exclude);
     req.disk_choice = args.disk.map(|d| match d {
         DiskArg::Same => diskdrift_app::disks::DiskChoice::Same,
         DiskArg::New => diskdrift_app::disks::DiskChoice::New,

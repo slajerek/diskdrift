@@ -565,8 +565,8 @@ numbers in the ADR like ADR 0001 does.
 ## Sources
 
 Repository: [ADR 0001](../adr/0001-storage-engine.md),
-[spec](../../specs/DiskDrift_Spec_v0.1.md) sections 2A, 7, 8, 12,
-[ROADMAP](../../ROADMAP.md) sections 3-4,
+the private specification sections 2A, 7, 8, 12, and private roadmap
+sections 3-4,
 `crates/diskdrift-storage/src/{store,codec,container}.rs`,
 `crates/diskdrift-core/src/{record,delta}.rs`.
 

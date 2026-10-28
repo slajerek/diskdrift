@@ -1,7 +1,10 @@
 //! End-to-end: scan, change files, scan again, compare. Everything (scanned tree,
 //! config, store) lives in the test scratch directory under `target/`.
 
+#![cfg(not(windows))]
+
 use diskdrift_core::testutil::TestDir;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -27,12 +30,18 @@ impl Env {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        let mut confirmed = Vec::new();
+        if args.first() == Some(&"scan") && self.t.path().join("store").exists() && !args.contains(&"--disk") {
+            confirmed.extend(args.iter().copied());
+            confirmed.extend(["--disk", "same"]);
+        }
+        let args = if confirmed.is_empty() { args.to_vec() } else { confirmed };
         Command::new(env!("CARGO_BIN_EXE_diskdrift"))
             .arg("--config")
             .arg(self.t.path().join("config.json"))
             .arg("--db")
             .arg(self.t.path().join("store"))
-            .args(args)
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -158,6 +167,7 @@ fn incompatible_snapshots_are_rejected_unless_allowed() {
 }
 
 #[test]
+#[cfg(unix)]
 fn exclusions_and_non_utf8_paths() {
     let e = Env::new("e2e-exclude");
     e.file("node_modules/pkg/index.js", 5000);
@@ -204,6 +214,7 @@ fn base64_decode(s: &str) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(unix)]
 fn unreadable_directory_makes_partial_snapshot() {
     use std::os::unix::fs::PermissionsExt;
     let e = Env::new("e2e-partial");
@@ -267,7 +278,7 @@ fn write_failure_keeps_earlier_snapshots() {
     }
     // ulimit -f is in 512-byte blocks: no file may grow beyond 8 KiB.
     let cmd = format!(
-        "ulimit -f 16; exec '{}' --config '{}' --db '{}' scan '{}' --name big",
+        "ulimit -f 16; exec '{}' --config '{}' --db '{}' scan '{}' --name big --disk same",
         env!("CARGO_BIN_EXE_diskdrift"),
         e.t.path().join("config.json").display(),
         e.t.path().join("store").display(),

@@ -22,8 +22,14 @@ pub struct SnapInfo {
 }
 
 pub trait Store {
-    fn write_full(&mut self, id: u32, records: &mut dyn Iterator<Item = Record>) -> io::Result<u64>;
-    fn write_delta(&mut self, id: u32, base: u32, ops: &mut dyn Iterator<Item = DeltaOp>) -> io::Result<u64>;
+    fn write_full(&mut self, id: u32, records: &mut dyn Iterator<Item = Record>)
+    -> io::Result<u64>;
+    fn write_delta(
+        &mut self,
+        id: u32,
+        base: u32,
+        ops: &mut dyn Iterator<Item = DeltaOp>,
+    ) -> io::Result<u64>;
     fn read_full(&self, id: u32) -> io::Result<RecordStream<'_>>;
     fn read_delta(&self, id: u32) -> io::Result<Ops<'_>>;
     fn list(&self) -> io::Result<Vec<SnapInfo>>;
@@ -31,7 +37,10 @@ pub trait Store {
     /// Records at or below `prefix` (components including the root). The default
     /// streams the whole snapshot and filters.
     fn read_prefix(&self, id: u32, prefix: &[Vec<u8>]) -> io::Result<RecordStream<'_>> {
-        Ok(Box::new(PrefixFilter::new(self.read_full(id)?, prefix.to_vec())))
+        Ok(Box::new(PrefixFilter::new(
+            self.read_full(id)?,
+            prefix.to_vec(),
+        )))
     }
 
     /// Largest files by a native query, if the engine has one (an index).
@@ -42,13 +51,15 @@ pub trait Store {
 
 /// Opens any snapshot, reconstructing deltas (recursively for chains).
 pub fn open<'a>(store: &'a dyn Store, infos: &[SnapInfo], id: u32) -> io::Result<RecordStream<'a>> {
-    let info = infos
-        .iter()
-        .find(|i| i.id == id)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("snapshot {id} not found")))?;
+    let info = infos.iter().find(|i| i.id == id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("snapshot {id} not found"))
+    })?;
     match info.base {
         None => store.read_full(id),
-        Some(base) => Ok(Box::new(Apply::new(open(store, infos, base)?, store.read_delta(id)?))),
+        Some(base) => Ok(Box::new(Apply::new(
+            open(store, infos, base)?,
+            store.read_delta(id)?,
+        ))),
     }
 }
 
@@ -63,7 +74,13 @@ pub struct PrefixFilter<'a> {
 
 impl<'a> PrefixFilter<'a> {
     pub fn new(inner: RecordStream<'a>, prefix: Vec<Vec<u8>>) -> Self {
-        PrefixFilter { inner, prefix, stack: PathStack::new(), inside: false, done: false }
+        PrefixFilter {
+            inner,
+            prefix,
+            stack: PathStack::new(),
+            inside: false,
+            done: false,
+        }
     }
 
     /// Starts with a pre-filled path context (ancestors of the first record).
@@ -88,7 +105,10 @@ impl Iterator for PrefixFilter<'_> {
                 Ok(r) => r,
                 Err(e) => return Some(Err(e)),
             };
-            if let Err(e) = self.stack.set(rec.depth, &rec.name) {
+            if let Err(e) = self
+                .stack
+                .set(rec.depth, rec.name.as_unix_bytes().unwrap_or_default())
+            {
                 return Some(Err(e));
             }
             if self.stack.starts_with(&self.prefix) {
@@ -105,24 +125,36 @@ impl Iterator for PrefixFilter<'_> {
 
 /// Allocated bytes of everything under `dir`.
 pub fn footprint(dir: &Path) -> u64 {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     let mut total = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let Ok(md) = e.metadata() else { continue };
             if md.is_dir() {
                 stack.push(e.path());
             } else {
-                total += md.blocks() * 512;
+                #[cfg(unix)]
+                {
+                    total += md.blocks() * 512;
+                }
+                #[cfg(not(unix))]
+                {
+                    total += md.len();
+                }
             }
         }
     }
     total
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, clap::ValueEnum,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Backend {
     /// Versioned sorted records in zstd blocks, one file per snapshot.
@@ -166,14 +198,19 @@ impl Backend {
             Backend::Binary => Box::new(binary::BinaryStore::open(dir, 3, false)?),
             Backend::BinaryColumnar => Box::new(binary::BinaryStore::open(dir, 3, true)?),
             Backend::SqliteRows => Box::new(sqlite::SqliteStore::open(dir, sqlite::Mode::Rows)?),
-            Backend::SqliteIndexed => Box::new(sqlite::SqliteStore::open(dir, sqlite::Mode::Indexed)?),
-            Backend::SqliteBlocks => Box::new(sqlite::SqliteStore::open(dir, sqlite::Mode::Blocks)?),
+            Backend::SqliteIndexed => {
+                Box::new(sqlite::SqliteStore::open(dir, sqlite::Mode::Indexed)?)
+            }
+            Backend::SqliteBlocks => {
+                Box::new(sqlite::SqliteStore::open(dir, sqlite::Mode::Blocks)?)
+            }
             Backend::Lmdb => Box::new(lmdb::LmdbStore::open(dir)?),
         })
     }
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::synth::{Gen, Params};
@@ -184,28 +221,49 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn every_backend_roundtrips_full_delta_and_prefix() {
-        let p = Params { entries: 30_000, seed: 9, change: 0.05, horizon: 3 };
+        let p = Params {
+            entries: 30_000,
+            seed: 9,
+            change: 0.05,
+            horizon: 3,
+        };
         let v0: Vec<Record> = Gen::new(p, 0).collect();
         let v1: Vec<Record> = Gen::new(p, 1).collect();
         let v2: Vec<Record> = Gen::new(p, 2).collect();
-        let ops1 = diskdrift_core::delta::compute(Box::new(v0.clone().into_iter().map(Ok)), Box::new(v1.clone().into_iter().map(Ok))).unwrap();
-        let ops2 = diskdrift_core::delta::compute(Box::new(v1.clone().into_iter().map(Ok)), Box::new(v2.clone().into_iter().map(Ok))).unwrap();
+        let ops1 = diskdrift_core::delta::compute(
+            Box::new(v0.clone().into_iter().map(Ok)),
+            Box::new(v1.clone().into_iter().map(Ok)),
+        )
+        .unwrap();
+        let ops2 = diskdrift_core::delta::compute(
+            Box::new(v1.clone().into_iter().map(Ok)),
+            Box::new(v2.clone().into_iter().map(Ok)),
+        )
+        .unwrap();
         // A prefix: path of the 100th record if it is a directory, else its parent.
         let mut stack = PathStack::new();
         let mut prefix = Vec::new();
         for (i, r) in v0.iter().enumerate() {
-            stack.set(r.depth, &r.name).unwrap();
+            stack
+                .set(r.depth, r.name.as_unix_bytes().unwrap_or_default())
+                .unwrap();
             if i >= 100 && r.is_dir() && r.depth >= 2 {
                 prefix = stack.components().to_vec();
                 break;
             }
         }
         let expected_prefix: Vec<Record> =
-            PrefixFilter::new(Box::new(v0.clone().into_iter().map(Ok)), prefix.clone()).map(Result::unwrap).collect();
+            PrefixFilter::new(Box::new(v0.clone().into_iter().map(Ok)), prefix.clone())
+                .map(Result::unwrap)
+                .collect();
         assert!(expected_prefix.len() > 1);
 
         for b in Backend::ALL {
+            if cfg!(windows) && b == Backend::Lmdb {
+                continue;
+            }
             let t = TestDir::new(&format!("store-{}", b.name()));
             let mut s = b.open(t.path()).unwrap();
             s.write_full(0, &mut v0.clone().into_iter()).unwrap();
@@ -213,15 +271,38 @@ mod tests {
             s.write_delta(2, 1, &mut ops2.clone().into_iter()).unwrap();
             let infos = s.list().unwrap();
             assert_eq!(infos.len(), 3, "{}", b.name());
-            assert_eq!(collect(open(s.as_ref(), &infos, 0).unwrap()), v0, "{}", b.name());
-            assert_eq!(collect(open(s.as_ref(), &infos, 1).unwrap()), v1, "{}", b.name());
-            assert_eq!(collect(open(s.as_ref(), &infos, 2).unwrap()), v2, "{} chain", b.name());
-            assert_eq!(collect(s.read_prefix(0, &prefix).unwrap()), expected_prefix, "{} prefix", b.name());
+            assert_eq!(
+                collect(open(s.as_ref(), &infos, 0).unwrap()),
+                v0,
+                "{}",
+                b.name()
+            );
+            assert_eq!(
+                collect(open(s.as_ref(), &infos, 1).unwrap()),
+                v1,
+                "{}",
+                b.name()
+            );
+            assert_eq!(
+                collect(open(s.as_ref(), &infos, 2).unwrap()),
+                v2,
+                "{} chain",
+                b.name()
+            );
+            assert_eq!(
+                collect(s.read_prefix(0, &prefix).unwrap()),
+                expected_prefix,
+                "{} prefix",
+                b.name()
+            );
             drop(s);
             // Reopen: data persisted.
             let s = b.open(t.path()).unwrap();
             let infos = s.list().unwrap();
-            assert_eq!(collect(open(s.as_ref(), &infos, 2).unwrap()).len(), v2.len());
+            assert_eq!(
+                collect(open(s.as_ref(), &infos, 2).unwrap()).len(),
+                v2.len()
+            );
         }
     }
 }

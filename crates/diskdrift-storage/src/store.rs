@@ -34,7 +34,6 @@ use diskdrift_core::record::Record;
 use diskdrift_core::walk::WalkReport;
 use std::fs::File;
 use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -86,7 +85,11 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 fn is_disk_full(e: &io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EFBIG))
+    #[cfg(unix)]
+    let unix_full = matches!(e.raw_os_error(), Some(libc::ENOSPC) | Some(libc::EDQUOT) | Some(libc::EFBIG));
+    #[cfg(not(unix))]
+    let unix_full = false;
+    unix_full
         || e.kind() == io::ErrorKind::StorageFull
 }
 
@@ -120,10 +123,25 @@ pub struct Store {
 /// Exclusive writer lock (released when dropped or when the process dies).
 pub struct WriteLock {
     _file: File,
+    #[cfg(windows)]
+    path: PathBuf,
 }
 
+#[cfg(windows)]
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(not(windows))]
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -193,14 +211,23 @@ fn time_stem(rfc3339: &str) -> Option<String> {
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
-        _ => false,
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
     }
+    #[cfg(not(unix))]
+    { a == b }
 }
 
 fn allocated(path: &Path) -> u64 {
-    std::fs::metadata(path).map(|m| m.blocks() * 512).unwrap_or(0)
+    #[cfg(unix)]
+    { std::fs::metadata(path).map(|m| { use std::os::unix::fs::MetadataExt; m.blocks() * 512 }).unwrap_or(0) }
+    #[cfg(not(unix))]
+    { std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) }
 }
 
 impl Store {
@@ -229,15 +256,25 @@ impl Store {
 
     /// Opens the store, creating it (user-only permissions) if needed.
     pub fn create(path: &Path) -> Result<Store> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         if Self::exists(path) {
             return Self::open(path);
         }
         if path.exists() && std::fs::read_dir(path).at(path)?.next().is_some() {
             return Err(StoreError::NotAStore(path.to_path_buf()));
         }
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path.join("snapshots")).at(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).at(path)?;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(path.join("snapshots")).at(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).at(path)?;
+        }
         let marker = serde_json::json!({ "format": STORE_FORMAT, "version": STORE_VERSION });
         write_atomic(&path.join("store.json"), marker.to_string().as_bytes()).at(path)?;
         Ok(Store { root: path.to_path_buf() })
@@ -460,14 +497,28 @@ impl Store {
 
     fn try_lock(&self) -> Result<Option<WriteLock>> {
         let p = self.root.join("lock");
+        #[cfg(windows)]
+        let mut f = match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(e) => return Err(StoreError::Io { path: p, source: e }),
+        };
+        #[cfg(not(windows))]
         let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&p).at(&p)?;
-        use std::os::fd::AsRawFd;
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Ok(None);
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Ok(None);
+            }
         }
         f.set_len(0).at(&p)?;
         let _ = write!(f, "{}", std::process::id());
-        Ok(Some(WriteLock { _file: f }))
+        Ok(Some(WriteLock {
+            _file: f,
+            #[cfg(windows)]
+            path: p,
+        }))
     }
 
     /// True while another process holds the writer lock.
@@ -1399,7 +1450,10 @@ impl Iterator for PrefixFilter {
                 Ok(r) => r,
                 Err(e) => return Some(Err(e)),
             };
-            if let Err(e) = self.stack.set(rec.depth, &rec.name) {
+            let Some(name) = rec.name.as_unix_bytes() else {
+                return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "Windows names are not valid in DDS1 prefix queries")));
+            };
+            if let Err(e) = self.stack.set(rec.depth, name) {
                 return Some(Err(e));
             }
             if self.stack.starts_with(&self.prefix) {

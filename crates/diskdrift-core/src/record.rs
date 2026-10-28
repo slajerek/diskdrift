@@ -6,8 +6,143 @@
 //! own name and its depth; full paths are reconstructed while streaming (spec 2A:
 //! paths are never stored as full strings per entry).
 
+use crate::native::NativeName;
 use serde::{Deserialize, Serialize};
 use std::io;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct FileId {
+    pub low: u64,
+    pub high: u64,
+}
+
+impl FileId {
+    pub const ZERO: Self = Self { low: 0, high: 0 };
+    pub fn to_le_bytes(self) -> [u8; 16] {
+        let mut out = [0; 16];
+        out[..8].copy_from_slice(&self.low.to_le_bytes());
+        out[8..].copy_from_slice(&self.high.to_le_bytes());
+        out
+    }
+    pub fn from_le_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            low: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            high: u64::from_le_bytes(bytes[8..].try_into().unwrap()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct EntryFields(pub u16);
+
+impl EntryFields {
+    pub const KIND: Self = Self(1 << 0);
+    pub const LOGICAL_SIZE: Self = Self(1 << 1);
+    pub const ALLOCATED_SIZE: Self = Self(1 << 2);
+    pub const MTIME: Self = Self(1 << 3);
+    pub const BIRTH_TIME: Self = Self(1 << 4);
+    pub const FILE_ID: Self = Self(1 << 5);
+    pub const LINK_COUNT: Self = Self(1 << 6);
+    pub const MTIME_NANOS: Self = Self(1 << 7);
+    pub const BIRTH_TIME_NANOS: Self = Self(1 << 8);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileIdScheme {
+    PosixInode64,
+    WindowsFileId128,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveCertainty {
+    Definite,
+    Probable,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentityEvidence {
+    pub volume: u16,
+    pub file_id: FileId,
+    pub scheme: FileIdScheme,
+    pub stable: bool,
+}
+
+impl IdentityEvidence {
+    pub const fn new(volume: u16, file_id: FileId, scheme: FileIdScheme, stable: bool) -> Self {
+        Self {
+            volume,
+            file_id,
+            scheme,
+            stable,
+        }
+    }
+    pub const fn supports_hardlinks(self) -> bool {
+        self.stable
+            && !matches!(self.scheme, FileIdScheme::Unavailable)
+            && (self.file_id.low != 0 || self.file_id.high != 0)
+    }
+    pub fn move_certainty(self, other: &Self) -> MoveCertainty {
+        if self.volume == other.volume
+            && self.file_id == other.file_id
+            && self.scheme == other.scheme
+            && self.stable
+            && other.stable
+        {
+            MoveCertainty::Definite
+        } else if self.volume == other.volume && self.file_id == other.file_id {
+            MoveCertainty::Probable
+        } else {
+            MoveCertainty::None
+        }
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampResolution {
+    Unknown,
+    Seconds,
+    Milliseconds,
+    Microseconds,
+    Nanoseconds,
+}
+
+impl TimestampResolution {
+    pub fn common(self, other: Self) -> Self {
+        if self <= other { self } else { other }
+    }
+    pub const fn nanos(self) -> i64 {
+        match self {
+            Self::Unknown => i64::MAX,
+            Self::Seconds => 1_000_000_000,
+            Self::Milliseconds => 1_000_000,
+            Self::Microseconds => 1_000,
+            Self::Nanoseconds => 1,
+        }
+    }
+    pub const fn quantize(self, nanos: i64, _source: Self) -> i64 {
+        if self.nanos() == i64::MAX {
+            nanos
+        } else {
+            nanos.div_euclid(self.nanos()) * self.nanos()
+        }
+    }
+}
 
 /// Entry type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -50,12 +185,12 @@ pub mod flags {
 }
 
 /// Metadata of one filesystem entry.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone)]
 pub struct Record {
     /// Depth below the scan root; the root itself has depth 0.
     pub depth: u16,
     /// Native name bytes. For the root record this is the full root path.
-    pub name: Vec<u8>,
+    pub name: NativeName,
     pub kind: Kind,
     pub flags: u8,
     /// Logical size in bytes (file length).
@@ -64,12 +199,95 @@ pub struct Record {
     pub alloc: u64,
     /// Modification time, seconds since the Unix epoch.
     pub mtime: i64,
+    pub mtime_nanos: u32,
     /// Creation (birth) time, seconds since the Unix epoch; 0 if unknown.
     pub btime: i64,
+    pub btime_nanos: u32,
+    pub file_id: FileId,
     pub ino: u64,
     pub nlink: u32,
+    pub available: EntryFields,
     /// Index into the snapshot's volume table.
     pub vol: u16,
+}
+
+impl PartialEq for Record {
+    fn eq(&self, other: &Self) -> bool {
+        if self.has(flags::STAT_ERROR) && other.has(flags::STAT_ERROR) {
+            return self.depth == other.depth
+                && self.name == other.name
+                && self.kind == other.kind
+                && self.flags == other.flags
+                && self.vol == other.vol;
+        }
+        let same_legacy_id = if self.file_id != FileId::ZERO && other.file_id != FileId::ZERO {
+            self.file_id == other.file_id
+        } else if self.file_id == FileId::ZERO && other.file_id == FileId::ZERO {
+            self.ino == other.ino
+        } else if self.file_id == FileId::ZERO {
+            self.ino == other.file_id.low
+        } else {
+            other.ino == self.file_id.low
+        };
+        self.depth == other.depth
+            && self.name == other.name
+            && self.flags == other.flags
+            && (self.available.contains(EntryFields::KIND)
+                && other.available.contains(EntryFields::KIND)
+                && self.kind == other.kind
+                || !self.available.contains(EntryFields::KIND)
+                || !other.available.contains(EntryFields::KIND))
+            && (!self.available.contains(EntryFields::LOGICAL_SIZE)
+                || !other.available.contains(EntryFields::LOGICAL_SIZE)
+                || self.size == other.size)
+            && (!self.available.contains(EntryFields::ALLOCATED_SIZE)
+                || !other.available.contains(EntryFields::ALLOCATED_SIZE)
+                || self.alloc == other.alloc)
+            && (!self.available.contains(EntryFields::MTIME)
+                || !other.available.contains(EntryFields::MTIME)
+                || self.mtime == other.mtime)
+            && (!self.available.contains(EntryFields::MTIME_NANOS)
+                || !other.available.contains(EntryFields::MTIME_NANOS)
+                || self.mtime_nanos == other.mtime_nanos)
+            && (!self.available.contains(EntryFields::BIRTH_TIME)
+                || !other.available.contains(EntryFields::BIRTH_TIME)
+                || self.btime == other.btime)
+            && (!self.available.contains(EntryFields::BIRTH_TIME_NANOS)
+                || !other.available.contains(EntryFields::BIRTH_TIME_NANOS)
+                || self.btime_nanos == other.btime_nanos)
+            && same_legacy_id
+            && (!self.available.contains(EntryFields::LINK_COUNT)
+                || !other.available.contains(EntryFields::LINK_COUNT)
+                || self.nlink == other.nlink)
+            && self.vol == other.vol
+    }
+}
+impl Eq for Record {}
+
+impl Default for Record {
+    fn default() -> Self {
+        Self {
+            depth: 0,
+            name: NativeName::default(),
+            kind: Kind::default(),
+            flags: 0,
+            size: 0,
+            alloc: 0,
+            mtime: 0,
+            mtime_nanos: 0,
+            btime: 0,
+            btime_nanos: 0,
+            file_id: FileId::ZERO,
+            ino: 0,
+            nlink: 0,
+            available: EntryFields::KIND
+                .union(EntryFields::LOGICAL_SIZE)
+                .union(EntryFields::ALLOCATED_SIZE)
+                .union(EntryFields::MTIME)
+                .union(EntryFields::LINK_COUNT),
+            vol: 0,
+        }
+    }
 }
 
 impl Record {
@@ -83,37 +301,86 @@ impl Record {
 
     /// Logical bytes this record contributes to totals (hardlink duplicates count 0).
     pub fn counted_size(&self) -> u64 {
-        if self.has(flags::HARDLINK_DUP) { 0 } else { self.size }
+        if self.has(flags::HARDLINK_DUP) || !self.available.contains(EntryFields::LOGICAL_SIZE) {
+            0
+        } else {
+            self.size
+        }
     }
 
     /// Allocated bytes this record contributes to totals (hardlink duplicates count 0).
     pub fn counted_alloc(&self) -> u64 {
-        if self.has(flags::HARDLINK_DUP) { 0 } else { self.alloc }
+        if self.has(flags::HARDLINK_DUP) || !self.available.contains(EntryFields::ALLOCATED_SIZE) {
+            0
+        } else {
+            self.alloc
+        }
+    }
+
+    pub fn has_observed_size(&self) -> bool {
+        self.available.contains(EntryFields::LOGICAL_SIZE)
     }
 
     /// True if any attribute other than depth/name differs in a way a diff reports.
     pub fn content_differs(&self, other: &Record) -> bool {
-        self.kind != other.kind
-            || self.size != other.size
-            || self.alloc != other.alloc
-            || self.mtime != other.mtime
-            || self.ino != other.ino
+        if self.has(flags::STAT_ERROR) && other.has(flags::STAT_ERROR) {
+            return self.kind != other.kind
+                || (self.flags & !flags::HARDLINK_DUP) != (other.flags & !flags::HARDLINK_DUP);
+        }
+        (self.available.contains(EntryFields::KIND)
+            && other.available.contains(EntryFields::KIND)
+            && self.kind != other.kind)
+            || (self.available.contains(EntryFields::LOGICAL_SIZE)
+                && other.available.contains(EntryFields::LOGICAL_SIZE)
+                && self.size != other.size)
+            || (self.available.contains(EntryFields::ALLOCATED_SIZE)
+                && other.available.contains(EntryFields::ALLOCATED_SIZE)
+                && self.alloc != other.alloc)
+            || (self.available.contains(EntryFields::MTIME)
+                && other.available.contains(EntryFields::MTIME)
+                && self.mtime != other.mtime)
+            || (self.available.contains(EntryFields::MTIME_NANOS)
+                && other.available.contains(EntryFields::MTIME_NANOS)
+                && self.mtime_nanos != other.mtime_nanos)
+            || (self.available.contains(EntryFields::BIRTH_TIME)
+                && other.available.contains(EntryFields::BIRTH_TIME)
+                && self.btime != other.btime)
+            || (self.available.contains(EntryFields::BIRTH_TIME_NANOS)
+                && other.available.contains(EntryFields::BIRTH_TIME_NANOS)
+                && self.btime_nanos != other.btime_nanos)
+            || (self.available.contains(EntryFields::FILE_ID)
+                && other.available.contains(EntryFields::FILE_ID)
+                && self.file_id != other.file_id)
             || (self.flags & !flags::HARDLINK_DUP) != (other.flags & !flags::HARDLINK_DUP)
     }
 
     /// Appends the compact encoding of this record to `out`.
-    pub fn encode(&self, out: &mut Vec<u8>) {
+    pub fn encode_dds1(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        let NativeName::Unix(name) = &self.name else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DDS1 only supports Unix-native names",
+            ));
+        };
         put_varint(out, self.depth as u64);
         put_varint(out, self.name.len() as u64);
-        out.extend_from_slice(&self.name);
+        out.extend_from_slice(name);
         out.push((self.kind as u8) | (self.flags << 2));
         put_varint(out, self.size);
         put_varint(out, self.alloc);
         put_varint(out, zigzag(self.mtime));
         put_varint(out, zigzag(self.btime));
-        put_varint(out, self.ino);
+        put_varint(
+            out,
+            if self.file_id == FileId::ZERO {
+                self.ino
+            } else {
+                self.file_id.low
+            },
+        );
         put_varint(out, self.nlink as u64);
         put_varint(out, self.vol as u64);
+        Ok(())
     }
 
     /// Decodes one record from the front of `buf`, advancing it.
@@ -130,8 +397,7 @@ impl Record {
         if buf.len() < len {
             return Err(corrupt("name length"));
         }
-        rec.name.clear();
-        rec.name.extend_from_slice(&buf[..len]);
+        rec.name = NativeName::unix(buf[..len].to_vec());
         *buf = &buf[len..];
         let kf = *buf.first().ok_or_else(|| corrupt("kind"))?;
         *buf = &buf[1..];
@@ -141,15 +407,44 @@ impl Record {
         rec.alloc = get_varint(buf)?;
         rec.mtime = unzigzag(get_varint(buf)?);
         rec.btime = unzigzag(get_varint(buf)?);
-        rec.ino = get_varint(buf)?;
+        let _ino = get_varint(buf)?;
         rec.nlink = u32::try_from(get_varint(buf)?).map_err(|_| corrupt("nlink"))?;
         rec.vol = u16::try_from(get_varint(buf)?).map_err(|_| corrupt("volume index"))?;
+        rec.mtime_nanos = 0;
+        rec.btime_nanos = 0;
+        rec.available = if rec.has(flags::STAT_ERROR) {
+            rec.size = 0;
+            rec.alloc = 0;
+            rec.mtime = 0;
+            rec.btime = 0;
+            rec.ino = 0;
+            rec.nlink = 0;
+            rec.file_id = FileId::ZERO;
+            EntryFields::empty()
+        } else {
+            // DDS1 has no nanosecond columns and its inode is only the low half
+            // of the portable identity, so only the legacy scalar is retained.
+            rec.ino = _ino;
+            rec.file_id = FileId { low: _ino, high: 0 };
+            let mut fields = EntryFields::KIND
+                .union(EntryFields::LOGICAL_SIZE)
+                .union(EntryFields::ALLOCATED_SIZE)
+                .union(EntryFields::MTIME)
+                .union(EntryFields::LINK_COUNT);
+            if rec.btime != 0 {
+                fields = fields.union(EntryFields::BIRTH_TIME);
+            }
+            fields
+        };
         Ok(())
     }
 }
 
 fn corrupt(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("corrupt record: bad {what}"))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("corrupt record: bad {what}"),
+    )
 }
 
 /// LEB128 unsigned varint.
@@ -208,20 +503,24 @@ mod tests {
     fn record_roundtrip() {
         let rec = Record {
             depth: 3,
-            name: b"caf\xc3\xa9 \xff not utf8".to_vec(),
+            name: NativeName::unix(b"caf\xc3\xa9 \xff not utf8".to_vec()),
             kind: Kind::Symlink,
             flags: flags::HARDLINK_DUP | flags::STAT_ERROR,
             size: 1 << 40,
             alloc: 4096,
             mtime: 1_760_000_000,
+            mtime_nanos: 0,
             btime: -5,
-            ino: 123_456_789,
+            btime_nanos: 0,
+            ino: 0,
+            file_id: FileId::ZERO,
             nlink: 2,
             vol: 1,
+            available: EntryFields::empty(),
         };
         let mut out = Vec::new();
-        rec.encode(&mut out);
-        rec.encode(&mut out);
+        rec.encode_dds1(&mut out).unwrap();
+        rec.encode_dds1(&mut out).unwrap();
         let mut s = out.as_slice();
         assert_eq!(Record::decode(&mut s).unwrap(), rec);
         assert_eq!(Record::decode(&mut s).unwrap(), rec);
@@ -229,10 +528,92 @@ mod tests {
     }
 
     #[test]
+    fn dds1_decode_normalizes_stat_error_payload() {
+        let rec = Record {
+            name: NativeName::unix(b"error".to_vec()),
+            flags: flags::STAT_ERROR,
+            size: 11,
+            alloc: 4096,
+            mtime: 12,
+            mtime_nanos: 13,
+            btime: 14,
+            btime_nanos: 15,
+            file_id: FileId { low: 16, high: 17 },
+            ino: 16,
+            nlink: 18,
+            available: EntryFields::KIND
+                .union(EntryFields::LOGICAL_SIZE)
+                .union(EntryFields::ALLOCATED_SIZE)
+                .union(EntryFields::MTIME)
+                .union(EntryFields::BIRTH_TIME)
+                .union(EntryFields::FILE_ID)
+                .union(EntryFields::LINK_COUNT),
+            ..Default::default()
+        };
+        let mut encoded = Vec::new();
+        rec.encode_dds1(&mut encoded).unwrap();
+
+        let mut input = encoded.as_slice();
+        let decoded = Record::decode(&mut input).unwrap();
+        assert_eq!(decoded.size, 0);
+        assert_eq!(decoded.alloc, 0);
+        assert_eq!(decoded.mtime, 0);
+        assert_eq!(decoded.mtime_nanos, 0);
+        assert_eq!(decoded.btime, 0);
+        assert_eq!(decoded.btime_nanos, 0);
+        assert_eq!(decoded.file_id, FileId::ZERO);
+        assert_eq!(decoded.ino, 0);
+        assert_eq!(decoded.nlink, 0);
+        assert_eq!(decoded.available, EntryFields::empty());
+    }
+
+    #[test]
+    fn dds1_decode_does_not_claim_unrepresentable_precision_or_identity() {
+        let rec = Record {
+            name: NativeName::unix(b"legacy".to_vec()),
+            mtime: 12,
+            mtime_nanos: 13,
+            btime: 14,
+            btime_nanos: 15,
+            file_id: FileId { low: 16, high: 17 },
+            ino: 16,
+            available: EntryFields::MTIME
+                .union(EntryFields::MTIME_NANOS)
+                .union(EntryFields::BIRTH_TIME)
+                .union(EntryFields::BIRTH_TIME_NANOS)
+                .union(EntryFields::FILE_ID),
+            ..Default::default()
+        };
+        let mut encoded = Vec::new();
+        rec.encode_dds1(&mut encoded).unwrap();
+
+        let mut input = encoded.as_slice();
+        let decoded = Record::decode(&mut input).unwrap();
+        assert_eq!(decoded.mtime, rec.mtime);
+        assert_eq!(decoded.btime, rec.btime);
+        assert_eq!(decoded.mtime_nanos, 0);
+        assert_eq!(decoded.btime_nanos, 0);
+        assert!(!decoded.available.contains(EntryFields::MTIME_NANOS));
+        assert!(!decoded.available.contains(EntryFields::BIRTH_TIME_NANOS));
+        assert!(!decoded.available.contains(EntryFields::FILE_ID));
+        assert_eq!(
+            decoded.file_id,
+            FileId {
+                low: rec.ino,
+                high: 0
+            }
+        );
+        assert_eq!(decoded.ino, rec.ino);
+    }
+
+    #[test]
     fn truncated_input_is_an_error() {
-        let rec = Record { name: b"abc".to_vec(), ..Default::default() };
+        let rec = Record {
+            name: NativeName::unix(b"abc".to_vec()),
+            ..Default::default()
+        };
         let mut out = Vec::new();
-        rec.encode(&mut out);
+        rec.encode_dds1(&mut out).unwrap();
         for cut in 0..out.len() {
             let mut s = &out[..cut];
             assert!(Record::decode(&mut s).is_err(), "cut at {cut}");

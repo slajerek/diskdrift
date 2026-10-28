@@ -10,7 +10,12 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn test_tmp_root() -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
     std::fs::create_dir_all(&root).expect("create target/test-tmp");
-    root.canonicalize().expect("canonicalize target/test-tmp")
+    let root = root.canonicalize().expect("canonicalize target/test-tmp");
+    #[cfg(windows)]
+    if let Some(path) = root.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+        return PathBuf::from(path);
+    }
+    root
 }
 
 /// A scratch directory removed on drop.
@@ -69,7 +74,8 @@ pub fn records<S: AsRef<str>>(spec: &[(S, crate::record::Kind, u64)]) -> Vec<cra
             depth: (comps.len() - 1) as u16,
             // Stable per path, like a real inode across scans.
             ino: comps.iter().flatten().fold(1469598103934665603u64, |h, &b| (h ^ b as u64).wrapping_mul(1099511628211)),
-            name: comps.last().unwrap().clone(),
+            file_id: crate::record::FileId { low: comps.iter().flatten().fold(1469598103934665603u64, |h, &b| (h ^ b as u64).wrapping_mul(1099511628211)), high: 0 },
+            name: crate::native::NativeName::unix(comps.last().unwrap().clone()),
             kind,
             size: alloc,
             alloc,

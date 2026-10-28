@@ -62,9 +62,11 @@ pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<Vec<u8>, C
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn captures_output_and_failures() {
         assert_eq!(run("/bin/echo", &["hi"], Duration::from_secs(5)).unwrap(), b"hi\n");
         assert!(matches!(run("/usr/bin/false", &[], Duration::from_secs(5)), Err(CommandError::Failed { .. })));

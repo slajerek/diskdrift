@@ -16,10 +16,16 @@ use std::time::Instant;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(unix)]
 fn rss_mb() -> f64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     ru.ru_maxrss as f64 / 1e6
+}
+
+#[cfg(not(unix))]
+fn rss_mb() -> f64 {
+    0.0
 }
 
 fn main() {

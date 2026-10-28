@@ -10,7 +10,6 @@ use diskdrift_core::walk::{self, ExcludeRules, Progress, WalkError, WalkOptions}
 use diskdrift_platform::ListerKind;
 use diskdrift_storage::{Rebase, ScanOptions, SnapshotMeta, SpaceSample, Status, Store, StoreError, VolumeIdentity, meta};
 use serde::Serialize;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -87,6 +86,7 @@ pub(crate) fn require_store(settings: &Effective) -> Result<Store> {
 #[derive(Debug, Clone)]
 pub struct ScanRequest {
     pub root: PathBuf,
+    pub root_native: Option<diskdrift_core::native::NativeRoot>,
     pub name: Option<String>,
     /// Exclusion patterns (config plus command line).
     pub exclude: Vec<String>,
@@ -106,6 +106,7 @@ impl ScanRequest {
         let mut exclude = settings.exclude.value.clone();
         exclude.extend(extra_exclude.iter().cloned());
         ScanRequest {
+            root_native: root.is_none().then(|| settings.default_root_native.value.clone()),
             root: root.unwrap_or_else(|| settings.default_root.value.clone()),
             name,
             exclude,
@@ -135,8 +136,9 @@ pub struct ScanOutcome {
     pub disk: Option<crate::disks::ScanDisk>,
 }
 
-fn resolve_root(root: &Path) -> Result<PathBuf> {
-    let abs = std::path::absolute(root).map_err(|e| AppError::Usage(format!("{}: {e}", root.display())))?;
+fn resolve_root(root: &Path, exact: Option<&diskdrift_core::native::NativeRoot>) -> Result<PathBuf> {
+    let root = exact.map(|r| diskdrift_platform::path_from_native(&r.path).map_err(|e| AppError::Usage(format!("scan root {}: {e}", r.path.display())))).transpose()?.unwrap_or_else(|| root.to_path_buf());
+    let abs = std::path::absolute(&root).map_err(|e| AppError::Usage(format!("{}: {e}", root.display())))?;
     let canon = abs.canonicalize().map_err(|e| AppError::Usage(format!("scan root {}: {e}", abs.display())))?;
     if !canon.is_dir() {
         return Err(AppError::Usage(format!("scan root {} is not a directory", canon.display())));
@@ -219,7 +221,7 @@ pub fn auto_scan(settings: &Effective, list: &SnapshotList, now: i64) -> AutoSca
 
 /// Runs a full metadata scan and stores it as a snapshot.
 pub fn scan(settings: &Effective, req: &ScanRequest, cancel: &AtomicBool, progress: Option<&Progress>) -> Result<ScanOutcome> {
-    let root = resolve_root(&req.root)?;
+    let root = resolve_root(&req.root, req.root_native.as_ref())?;
     let store_path = std::path::absolute(&settings.storage_path.value).map_err(|e| AppError::Runtime(e.to_string()))?;
     let store = Store::create(&store_path)?;
     let lock = store.lock()?;
@@ -410,10 +412,21 @@ pub fn verify(settings: &Effective, reference: &str) -> Result<(SnapshotMeta, u6
 fn prefix_for(meta: &SnapshotMeta, path: Option<&Path>) -> Result<Option<Vec<Vec<u8>>>> {
     let Some(p) = path else { return Ok(None) };
     let abs = std::path::absolute(p).map_err(|e| AppError::Usage(e.to_string()))?;
-    let comps = components_under(meta.root.as_bytes(), abs.as_os_str().as_bytes()).ok_or_else(|| {
+    let comps = components_under(meta.root.as_bytes(), &path_bytes(&abs)).ok_or_else(|| {
         AppError::Usage(format!("{} is not inside the scan root {} of snapshot {}", abs.display(), meta.root, meta.id))
     })?;
     Ok(Some(comps))
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -689,12 +702,18 @@ mod pair_tests {
 
     #[test]
     fn previous_comparable_and_last_scan_of_a_root() {
-        let all = [meta(1, "/a", Status::Completed), meta(2, "/b", Status::Completed), meta(3, "/a", Status::Cancelled), meta(4, "/a", Status::Partial)];
+        let root_a = std::env::temp_dir().join("diskdrift-pair-a");
+        let root_b = std::env::temp_dir().join("diskdrift-pair-b");
+        let root_c = std::env::temp_dir().join("diskdrift-pair-c");
+        let root_a = root_a.to_string_lossy().into_owned();
+        let root_b = root_b.to_string_lossy().into_owned();
+        let root_c = root_c.to_string_lossy().into_owned();
+        let all = [meta(1, &root_a, Status::Completed), meta(2, &root_b, Status::Completed), meta(3, &root_a, Status::Cancelled), meta(4, &root_a, Status::Partial)];
         let metas: Vec<&SnapshotMeta> = all.iter().collect();
         assert_eq!(previous_comparable(&metas, &all[3]).map(|m| m.id), Some(1));
         assert_eq!(previous_comparable(&metas, &all[1]).map(|m| m.id), None);
-        assert_eq!(last_scan_of(&metas[..3], Path::new("/a")).map(|m| m.id), Some(1), "#3 holds no data");
-        assert_eq!(last_scan_of(&metas, Path::new("/c")).map(|m| m.id), None);
+        assert_eq!(last_scan_of(&metas[..3], Path::new(&root_a)).map(|m| m.id), Some(1), "#3 holds no data");
+        assert_eq!(last_scan_of(&metas, Path::new(&root_c)).map(|m| m.id), None);
     }
 
     #[test]

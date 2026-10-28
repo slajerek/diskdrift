@@ -14,8 +14,25 @@ use diskdrift_core::delta::DeltaOp;
 use diskdrift_core::record::{Record, get_varint, put_varint};
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+        if n == 0 { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short positional read")); }
+        done += n;
+    }
+    Ok(())
+}
 
 const MAGIC: &[u8; 4] = b"DDS1";
 const END: &[u8; 4] = b"DDSE";
@@ -130,7 +147,7 @@ impl DataFile {
             return Err(corrupt(path, "file too short"));
         }
         let mut h = [0u8; 8];
-        file.read_exact_at(&mut h, 0)?;
+        read_at(&file, &mut h, 0)?;
         if &h[..4] != MAGIC {
             return Err(corrupt(path, "not a DiskDrift snapshot file"));
         }
@@ -140,7 +157,7 @@ impl DataFile {
             k => return Err(corrupt(path, &format!("unsupported data kind {k}"))),
         };
         let mut t = [0u8; TRAILER];
-        file.read_exact_at(&mut t, len - TRAILER as u64)?;
+        read_at(&file, &mut t, len - TRAILER as u64)?;
         if &t[TRAILER - 4..] != END {
             return Err(corrupt(path, "missing trailer (incomplete write?)"));
         }
@@ -152,7 +169,7 @@ impl DataFile {
             return Err(corrupt(path, "index out of bounds"));
         }
         let mut idx = vec![0u8; idx_len];
-        file.read_exact_at(&mut idx, idx_off)?;
+        read_at(&file, &mut idx, idx_off)?;
         if crc32fast::hash(&idx) != idx_crc {
             return Err(corrupt(path, "index checksum mismatch"));
         }
@@ -185,7 +202,7 @@ impl DataFile {
 
     fn read_block(&self, e: &IndexEntry) -> io::Result<Vec<u8>> {
         let mut comp = vec![0u8; e.comp_len as usize];
-        self.file.read_exact_at(&mut comp, e.offset)?;
+        read_at(&self.file, &mut comp, e.offset)?;
         codec::decompress(&comp, e.raw_len, e.crc).map_err(|err| corrupt(&self.path, &err.to_string()))
     }
 

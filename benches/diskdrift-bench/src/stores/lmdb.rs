@@ -35,8 +35,9 @@ const CHUNK: usize = 20_000;
 
 impl LmdbStore {
     pub fn open(dir: &Path) -> io::Result<Self> {
+        let map_size = if cfg!(windows) { 64 << 20 } else { 256 << 30 };
         let env = unsafe {
-            EnvOpenOptions::new().map_size(256 << 30).max_dbs(4).open(dir).map_err(err)?
+            EnvOpenOptions::new().map_size(map_size).max_dbs(4).open(dir).map_err(err)?
         };
         let mut wtxn = env.write_txn().map_err(err)?;
         let entries = env.create_database(&mut wtxn, Some("entries")).map_err(err)?;
@@ -124,7 +125,7 @@ impl Store for LmdbStore {
         let mut n = 0u64;
         for (seq, r) in records.enumerate() {
             buf.clear();
-            r.encode(&mut buf);
+            r.encode_dds1(&mut buf)?;
             self.entries.put_with_flags(&mut wtxn, PutFlags::APPEND, &key(id, seq as u64), &buf).map_err(err)?;
             n += 1;
         }
@@ -140,7 +141,7 @@ impl Store for LmdbStore {
         let mut n = 0u64;
         for (seq, op) in ops.enumerate() {
             buf.clear();
-            enc.encode(&op, &mut buf);
+            enc.encode(&op, &mut buf)?;
             self.ops.put_with_flags(&mut wtxn, PutFlags::APPEND, &key(id, seq as u64), &buf).map_err(err)?;
             n += 1;
         }

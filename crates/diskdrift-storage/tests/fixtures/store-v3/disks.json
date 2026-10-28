@@ -1,0 +1,22 @@
+{
+  "format": "diskdrift-disks",
+  "version": 1,
+  "disks": [
+    {
+      "id": "dc4396bd8",
+      "identity": {
+        "strength": "uuid",
+        "source": "U"
+      },
+      "sets": [],
+      "volume": {
+        "name": null,
+        "fsType": "apfs",
+        "capacityBytes": null
+      },
+      "firstSeen": "2026-10-21T10:00:00+00:00",
+      "lastSeen": "2026-10-21T10:00:00+00:00",
+      "lastMountPoint": "/"
+    }
+  ]
+}

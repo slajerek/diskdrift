@@ -1,0 +1,1 @@
+{"format":"diskdrift-disks","version":1,"disks":[{"id":"dlegacy01","identity":{"strength":"weak","source":"exfat|ARCHIVE|1234"},"sets":[],"volume":{"fsType":"exfat","name":"ARCHIVE","capacityBytes":1234},"firstSeen":"2026-01-01T00:00:00Z","lastSeen":"2026-01-01T00:00:00Z"}]}
