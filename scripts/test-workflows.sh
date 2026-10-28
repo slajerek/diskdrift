@@ -189,6 +189,9 @@ assert(unstable_text.include?("repos/$REPO/git/ref/heads/devel") ||
        "prepare must resolve the current devel head through the API")
 assert(unstable_text.include?("merged_at") && unstable_text.include?("base.ref"),
        "prepare must require a merged PR targeting devel")
+assert(prepare_run.include?("--slurp") &&
+       prepare_run.include?("|\n  jq -r 'add | any("),
+       "prepare must pipe paginated API JSON through jq instead of combining gh --slurp with --jq")
 private_path_markers = ["CLAUDE.md", "AGENTS.md", "docs/superpowers", "specs/", "claude/"]
 [portability_text, unstable_text].each do |workflow_text|
   private_path_markers.each do |marker|
