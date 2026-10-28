@@ -2,6 +2,8 @@
 //! per system call, without a separate `lstat` per entry.
 
 use diskdrift_core::record::Kind;
+use diskdrift_core::native::NativeName;
+use diskdrift_core::record::{EntryFields, FileId};
 use diskdrift_core::walk::{DirLister, RawEntry, StdLister};
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -125,6 +127,7 @@ fn parse_entries(b: &[u8], count: usize, out: &mut Vec<RawEntry>) -> io::Result<
         f += 20; // attribute_set_t
 
         let mut e = RawEntry { nlink: 1, ..RawEntry::default() };
+        let mut available = EntryFields::empty();
         if common & ATTR_CMN_ERROR != 0 {
             let errno = rd_u32(b, f)?;
             if errno != 0 {
@@ -138,7 +141,7 @@ fn parse_entries(b: &[u8], count: usize, out: &mut Vec<RawEntry>) -> io::Result<
             let start = (f as isize + off as isize) as usize;
             let name = b.get(start..start + nlen).ok_or_else(|| bad("name out of range"))?;
             let name = name.strip_suffix(&[0]).unwrap_or(name);
-            e.name = name.to_vec();
+            e.name = NativeName::unix(name.to_vec());
             f += 8;
         }
         if common & libc::ATTR_CMN_DEVID != 0 {
@@ -152,18 +155,25 @@ fn parse_entries(b: &[u8], count: usize, out: &mut Vec<RawEntry>) -> io::Result<
                 VLNK => Kind::Symlink,
                 _ => Kind::Other,
             };
+            available = available.union(EntryFields::KIND);
             f += 4;
         }
         if common & libc::ATTR_CMN_CRTIME != 0 {
             e.btime = rd_i64(b, f)?;
+            e.btime_nanos = rd_i64(b, f + 8)? as u32;
+            available = available.union(EntryFields::BIRTH_TIME).union(EntryFields::BIRTH_TIME_NANOS);
             f += 16;
         }
         if common & libc::ATTR_CMN_MODTIME != 0 {
             e.mtime = rd_i64(b, f)?;
+            e.mtime_nanos = rd_i64(b, f + 8)? as u32;
+            available = available.union(EntryFields::MTIME).union(EntryFields::MTIME_NANOS);
             f += 16;
         }
         if common & libc::ATTR_CMN_FILEID != 0 {
             e.ino = rd_i64(b, f)? as u64;
+            e.file_id = FileId { low: e.ino, high: 0 };
+            available = available.union(EntryFields::FILE_ID);
             f += 8;
         }
         if dirattr & libc::ATTR_DIR_MOUNTSTATUS != 0 {
@@ -174,14 +184,21 @@ fn parse_entries(b: &[u8], count: usize, out: &mut Vec<RawEntry>) -> io::Result<
         }
         if fileattr & libc::ATTR_FILE_LINKCOUNT != 0 {
             e.nlink = rd_u32(b, f)?;
+            available = available.union(EntryFields::LINK_COUNT);
             f += 4;
         }
         if fileattr & libc::ATTR_FILE_TOTALSIZE != 0 {
             e.size = rd_i64(b, f)?.max(0) as u64;
+            available = available.union(EntryFields::LOGICAL_SIZE);
             f += 8;
         }
         if fileattr & libc::ATTR_FILE_ALLOCSIZE != 0 {
             e.alloc = rd_i64(b, f)?.max(0) as u64;
+            available = available.union(EntryFields::ALLOCATED_SIZE);
+        }
+        e.available = available;
+        if e.error.is_some() {
+            e.clear_metadata();
         }
         if !e.name.is_empty() {
             out.push(e);
@@ -215,14 +232,14 @@ mod tests {
         assert_eq!(bulk.len(), std.len());
         for (a, b) in bulk.iter().zip(std.iter()) {
             assert_eq!(a.name, b.name);
-            assert_eq!(a.kind, b.kind, "{:?}", String::from_utf8_lossy(&a.name));
+            assert_eq!(a.kind, b.kind, "{:?}", a.name.display());
             assert_eq!(a.ino, b.ino);
             assert_eq!(a.dev, b.dev);
             assert_eq!(a.mtime, b.mtime);
             assert_eq!(a.btime, b.btime);
             if a.kind != Kind::Dir {
-                assert_eq!(a.size, b.size, "{:?}", String::from_utf8_lossy(&a.name));
-                assert_eq!(a.alloc, b.alloc, "{:?}", String::from_utf8_lossy(&a.name));
+                assert_eq!(a.size, b.size, "{:?}", a.name.display());
+                assert_eq!(a.alloc, b.alloc, "{:?}", a.name.display());
                 assert_eq!(a.nlink, b.nlink);
             }
             assert!(a.error.is_none());
@@ -245,7 +262,7 @@ mod tests {
         // /System/Volumes/Data is a mount point on every APFS system since 10.15.
         let mut out = Vec::new();
         if BulkLister.list(Path::new("/System/Volumes"), &mut out).is_ok()
-            && let Some(data) = out.iter().find(|e| e.name == b"Data") {
+            && let Some(data) = out.iter().find(|e| e.name == NativeName::unix(b"Data".to_vec())) {
                 assert!(data.is_mount_point);
             }
     }

@@ -21,7 +21,7 @@ pub fn with_root_name<'a>(stream: RecordStream<'a>, root: Vec<u8>) -> RecordStre
     Box::new(stream.map(move |r| {
         r.map(|mut rec| {
             if rec.depth == 0 {
-                rec.name.clone_from(&root);
+                rec.name = crate::native::NativeName::unix(root.clone());
             }
             rec
         })
@@ -72,7 +72,8 @@ impl<'a> Side<'a> {
     fn advance(&mut self) -> io::Result<()> {
         self.cur = self.iter.next().transpose()?;
         if let Some(r) = &self.cur {
-            self.stack.set(r.depth, &r.name)?;
+            let name = r.name.as_unix_bytes().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "portable diff requires Unix names"))?;
+            self.stack.set(r.depth, name)?;
         }
         Ok(())
     }
@@ -617,7 +618,7 @@ pub(crate) mod tests {
             .enumerate()
             .map(|(i, (comps, kind, alloc))| Record {
                 depth: (comps.len() - 1) as u16,
-                name: comps.last().unwrap().clone(),
+                name: crate::native::NativeName::unix(comps.last().unwrap().clone()),
                 kind,
                 size: alloc,
                 alloc,
@@ -657,7 +658,7 @@ pub(crate) mod tests {
             ("a/z", F, 4000),
             ("c", F, 5),
         ]);
-        new.iter_mut().find(|r| r.name == b"y").unwrap().ino = 102; // same as before
+        new.iter_mut().find(|r| r.name == crate::native::NativeName::unix(b"y".to_vec())).unwrap().ino = 102; // same as before
         let r = diff(boxed(base()), boxed(new), DiffOptions { detect_moves: false, ..Default::default() }).unwrap();
         let s = &r.summary;
         assert_eq!(s.added.count, 1);
@@ -764,7 +765,7 @@ pub(crate) mod tests {
     fn with_root_name_renames_only_the_root() {
         let v = stream(&[("", Kind::Dir, 0), ("a", Kind::Dir, 0), ("a/b", Kind::File, 5)]);
         let out: Vec<Record> = with_root_name(boxed(v.clone()), b"/Volumes/X 1".to_vec()).collect::<io::Result<_>>().unwrap();
-        assert_eq!(out[0].name, b"/Volumes/X 1");
+        assert_eq!(out[0].name, crate::native::NativeName::unix(b"/Volumes/X 1".to_vec()));
         assert_eq!(out[1..], v[1..]);
         let report = diff(with_root_name(boxed(v.clone()), b"/x".to_vec()), with_root_name(boxed(v.clone()), b"/x".to_vec()), DiffOptions::default()).unwrap();
         assert_eq!(report.summary.unchanged, 3);

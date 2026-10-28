@@ -3,6 +3,7 @@
 pub mod delta;
 pub mod browse;
 pub mod diff;
+pub mod native;
 pub mod paths;
 pub mod pathser;
 pub mod record;

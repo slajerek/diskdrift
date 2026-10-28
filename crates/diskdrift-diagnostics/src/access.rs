@@ -1,9 +1,11 @@
 //! Full Disk Access detection.
 
 use serde::Serialize;
+#[cfg(unix)]
 use std::ffi::CString;
 
 /// Protected by TCC; readable only with Full Disk Access (even for root).
+#[cfg(unix)]
 const PROBE: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -23,6 +25,7 @@ pub struct AccessCheck {
 
 /// Probes Full Disk Access by opening a TCC-protected file read-only (the file is
 /// opened and closed, never read or written).
+#[cfg(unix)]
 pub fn full_disk_access() -> AccessCheck {
     let path = CString::new(PROBE).unwrap();
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -42,5 +45,13 @@ pub fn full_disk_access() -> AccessCheck {
                 .into(),
         },
         _ => AccessCheck { full_disk_access: Access::Unknown, detail: format!("probe failed: {err}") },
+    }
+}
+
+#[cfg(not(unix))]
+pub fn full_disk_access() -> AccessCheck {
+    AccessCheck {
+        full_disk_access: Access::Unknown,
+        detail: "Full Disk Access probing is not supported on this platform".into(),
     }
 }

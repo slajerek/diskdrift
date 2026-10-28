@@ -1,0 +1,55 @@
+{
+  "formatVersion": 1,
+  "id": 1,
+  "name": "legacy",
+  "root": "/r",
+  "status": "COMPLETED",
+  "startedAt": "2026-10-21T10:00:00+00:00",
+  "finishedAt": "now",
+  "volume": {
+    "uuid": "U",
+    "name": null,
+    "fsType": "apfs",
+    "mountPoint": "/",
+    "volumeGroup": false
+  },
+  "options": {
+    "stayOnFilesystem": true,
+    "exclude": [],
+    "lister": "",
+    "threads": 0
+  },
+  "spaceBefore": null,
+  "spaceAfter": null,
+  "storage": {
+    "base": 2,
+    "dataFile": "00000001.r00000002.dds",
+    "bytesOnDisk": 4096,
+    "blocks": 1,
+    "items": 1
+  },
+  "counts": {
+    "entries": 5,
+    "files": 0,
+    "dirs": 0,
+    "symlinks": 0,
+    "others": 0,
+    "logicalBytes": 0,
+    "allocatedBytes": 0,
+    "hardlinkDuplicates": 0,
+    "inaccessibleDirs": 0,
+    "statErrors": 0,
+    "skippedMounts": 0,
+    "excluded": 0,
+    "issueCount": 0,
+    "issues": [],
+    "devices": [],
+    "cancelled": false,
+    "elapsedMs": 0,
+    "peakPendingDirs": 0,
+    "peakBufferedEntries": 0,
+    "hardlinkInodes": 0
+  },
+  "error": null,
+  "diskdriftVersion": "fixture"
+}

@@ -95,6 +95,15 @@ fn bad_size_argument_is_a_usage_error() {
 }
 
 #[test]
+fn drive_relative_root_is_rejected_before_scan() {
+    let t = TestDir::new("cli-drive-relative");
+    let o = run_in(&t, &["scan", "C:relative"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("invalid scan root"));
+    assert!(!t.path().join("store").exists());
+}
+
+#[test]
 fn doctor_quick_json_is_read_only() {
     let t = TestDir::new("cli-doctor");
     let o = run_in(&t, &["doctor", "--quick", "--budget", "2", "--json"]);
@@ -127,6 +136,7 @@ fn analyze_lists_children_and_rejects_files() {
 }
 
 #[test]
+#[cfg(not(windows))]
 fn browse_lists_a_level_and_its_changes() {
     let t = TestDir::new("cli-browse");
     t.file("tree/a/big", 300_000);
@@ -135,7 +145,7 @@ fn browse_lists_a_level_and_its_changes() {
     let tree = tree.to_str().unwrap();
     assert!(run_in(&t, &["scan", tree, "--name", "one"]).status.success());
     t.file("tree/a/more", 500_000);
-    assert!(run_in(&t, &["scan", tree, "--name", "two"]).status.success());
+    assert!(run_in(&t, &["scan", tree, "--name", "two", "--disk", "same"]).status.success());
 
     let o = run_in(&t, &["browse", "--json"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));

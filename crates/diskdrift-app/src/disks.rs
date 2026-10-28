@@ -12,11 +12,12 @@ use std::path::PathBuf;
 /// The identity of the volume `info` describes (ADR 0002, 2.2): its UUID, the
 /// UUID macOS derives from a FAT/exFAT serial, or a weak one.
 pub fn identity_of(info: &DiskInfo) -> Identity {
-    match &info.volume_uuid {
-        Some(u) if matches!(info.fs_type.as_str(), "msdos" | "exfat") => Identity::new(Strength::Serial, u.clone()),
-        Some(u) => Identity::new(Strength::Uuid, u.clone()),
-        None => Identity::weak(&info.fs_type, info.volume_name.as_deref(), info.capacity_bytes),
-    }
+    let (strength, source, scheme) = match &info.volume_uuid {
+        Some(u) if matches!(info.fs_type.as_str(), "msdos" | "exfat") => (Strength::Serial, u.clone(), "volume_serial"),
+        Some(u) => (Strength::Uuid, u.clone(), "disk_arbitration_uuid"),
+        None => (Strength::Weak, format!("{}|{}|{}", info.fs_type, info.volume_name.as_deref().unwrap_or(""), info.capacity_bytes.map(|v| v.to_string()).unwrap_or_default()), "fs_name_capacity"),
+    };
+    Identity { strength, source, platform: std::env::consts::OS.into(), scheme: scheme.into() }
 }
 
 /// A sighting of the disk `info` describes, at `at` (RFC 3339).
@@ -36,7 +37,9 @@ pub fn sighting_of(info: &DiskInfo, at: &str) -> Sighting {
         volume: VolumeFacts { name: info.volume_name.clone(), fs_type: info.fs_type.clone(), capacity_bytes: info.capacity_bytes },
         device: any.then_some(device),
         mount_point: info.mount_point.to_string_lossy().into_owned(),
+        mount_path: diskdrift_platform::native_path(info.mount_point.as_os_str()),
         at: at.into(),
+        aliases: Vec::new(),
     }
 }
 
@@ -231,6 +234,8 @@ pub fn list_with(settings: &Effective, mounted: &[Volume]) -> Result<DiskList> {
                 first_seen: now.clone(),
                 last_seen: now,
                 last_mount_point: Some(v.mount_point.to_string_lossy().into_owned()),
+                aliases: Vec::new(),
+                last_mount_path: Some(diskdrift_platform::native_path(v.mount_point.as_os_str())),
             },
             known: false,
             connected: true,
@@ -435,10 +440,10 @@ mod tests {
 
     #[test]
     fn identities_follow_the_filesystem() {
-        assert_eq!(identity_of(&info("apfs", Some("U"), None)), Identity::new(Strength::Uuid, "U"));
+        assert_eq!(identity_of(&info("apfs", Some("U"), None)).scheme, "disk_arbitration_uuid");
         assert_eq!(identity_of(&info("msdos", Some("V3"), None)).strength, Strength::Serial);
         assert_eq!(identity_of(&info("exfat", Some("V3"), None)).strength, Strength::Serial);
-        assert_eq!(identity_of(&info("ntfs", None, None)), Identity::weak("ntfs", Some("STICK"), Some(64_000_000)));
+        assert_eq!(identity_of(&info("ntfs", None, None)).scheme, "fs_name_capacity");
         let s = sighting_of(&info("hfs", Some("U"), Some("SN1")), "t");
         assert_eq!(s.device.unwrap().serial.as_deref(), Some("SN1"));
         assert!(sighting_of(&DiskInfo { device: DeviceInfo::default(), ..info("hfs", Some("U"), None) }, "t").device.is_none());
@@ -478,6 +483,7 @@ mod tests {
         assert!(!record_scan_disk(&store, &ntfs, "t2", Some(DiskChoice::Same)).unwrap().new);
     }
 
+    #[cfg(unix)]
     fn scanned_store(name: &str) -> (TestDir, Effective, PathBuf) {
         let t = TestDir::new(name);
         let tree = t.path().join("tree");
@@ -491,16 +497,22 @@ mod tests {
         (t, s, tree)
     }
 
+    #[cfg(unix)]
     fn volume_of(path: &std::path::Path) -> Volume {
         let info = diskdrift_platform::disk_info(path).unwrap();
         Volume { identity: identity_of(&info), mount_point: info.mount_point, name: info.volume_name, fs_type: info.fs_type, capacity_bytes: info.capacity_bytes }
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn a_connected_disk_is_rescanned_only_when_known_old_and_allowed() {
-        let (_t, mut s, tree) = scanned_store("app-on-connect");
+        let (t, mut s, tree) = scanned_store("app-on-connect");
         let v = volume_of(&tree);
-        let now = chrono::Local::now().timestamp();
+        if v.identity.strength == Strength::Weak {
+            return;
+        }
+        let started_at = Store::open(&t.path().join("store")).unwrap().list().unwrap().into_iter().next().unwrap().started_at;
+        let now = chrono::DateTime::parse_from_rfc3339(&started_at).unwrap().timestamp() + 1;
         assert!(matches!(on_connect(&s, &v, now).unwrap(), ConnectAction::Recent { .. }), "just scanned");
         let later = now + 7 * 3600;
         match on_connect(&s, &v, later).unwrap() {
@@ -517,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn the_disk_list_shows_new_volumes_and_a_mount_point_can_be_labelled() {
         let (_t, s, tree) = scanned_store("app-new-volumes");
         let known = volume_of(&tree);

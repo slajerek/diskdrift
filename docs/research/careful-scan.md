@@ -162,9 +162,8 @@ it starts, and the disk mounted read-only (with `force` if dirty).
 Run on 2026-10-22 with the owner's approval, on 64 MB raw read-write images
 (`hdiutil create -format UDRW`, so any write to the device changes the image
 file). Each run starts from a fresh copy and compares 4 KiB blocks before and
-after. The scripts are in
-[`experiments/careful-scan/`](../../experiments/careful-scan/README.md)
-(`run_all.sh` repeats everything). Every attach and mount was undone, and no
+after. The scripts are kept in the private experiment tree (`run_all.sh`
+repeats everything). Every attach and mount was undone, and no
 real disk was involved. The scan is the real `diskdrift scan` against a
 scratch store.
 

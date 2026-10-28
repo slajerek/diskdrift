@@ -50,11 +50,11 @@ impl RecordBlockEncoder {
                 self.raw.extend_from_slice(c);
             }
         }
-        self.stack.set(r.depth, &r.name)?;
+        self.stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default())?;
         if self.count == 0 {
             self.first_path = self.stack.components().to_vec();
         }
-        r.encode(&mut self.raw);
+        r.encode_dds1(&mut self.raw)?;
         self.count += 1;
         Ok(done)
     }
@@ -98,9 +98,9 @@ impl OpBlockEncoder {
         }
         if self.count == 0 {
             self.first_path = op.parent.clone();
-            self.first_path.push(op.record.name.clone());
+            self.first_path.push(op.record.name.as_unix_bytes().unwrap_or_default().to_vec());
         }
-        self.enc.encode(op, &mut self.raw);
+        self.enc.encode(op, &mut self.raw)?;
         self.count += 1;
         Ok(done)
     }
@@ -237,7 +237,7 @@ pub mod columnar {
                 encode_path(&self.stack.components()[..r.depth as usize], &mut self.ctx);
                 self.prev = (r.depth, 0, 0);
             }
-            self.stack.set(r.depth, &r.name)?;
+            self.stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default())?;
             if self.count == 0 {
                 self.first_path = self.stack.components().to_vec();
             }
@@ -246,7 +246,7 @@ pub mod columnar {
             put_varint(&mut c[0], zigzag(r.depth as i64 - self.prev.0 as i64));
             c[1].push((r.kind as u8) | (r.flags << 2));
             put_varint(&mut c[2], r.name.len() as u64);
-            c[3].extend_from_slice(&r.name);
+            c[3].extend_from_slice(r.name.as_unix_bytes().unwrap_or_default());
             put_varint(&mut c[4], r.size);
             put_varint(&mut c[5], zigzag(r.alloc as i64 - expected_alloc(r.size) as i64));
             put_varint(&mut c[6], zigzag(r.mtime - self.prev.1));
@@ -321,7 +321,7 @@ pub mod columnar {
             let nv = get_varint(&mut cols[9])?;
             out.push(Record {
                 depth,
-                name,
+                name: diskdrift_core::native::NativeName::unix(name),
                 kind: match kf & 3 {
                     0 => Kind::File,
                     1 => Kind::Dir,
@@ -336,6 +336,7 @@ pub mod columnar {
                 ino,
                 nlink: (nv >> 16) as u32,
                 vol: (nv & 0xffff) as u16,
+                ..Default::default()
             });
             prev = (depth, mtime, ino);
         }

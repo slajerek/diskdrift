@@ -274,6 +274,14 @@ impl Runner {
     }
 
     fn robustness(&mut self, s: &Suite) {
+        #[cfg(not(unix))]
+        {
+            let _ = s;
+            eprintln!("== robustness unsupported: crash and disk-full jobs require Unix process/resource limits");
+        }
+
+        #[cfg(unix)]
+        {
         let n = s.robustness_n;
         let params = Params { entries: n, seed: 17, change: 0.01, horizon: 100 };
         for &b in &s.backends {
@@ -282,7 +290,14 @@ impl Runner {
             let dir = self.fresh(&format!("crash-{}", b.name()));
             let first = self.run("crash-setup", b.name(), n, "import snapshot 0", 0, Job::Import { backend: b, dir: dir.clone(), params, version: 0, id: 0 });
             let kill_at = (first.result.elapsed_ms * 0.5).max(50.0) as u64;
-            let m = jobs::run_child_with(&Job::Import { backend: b, dir: dir.clone(), params, version: 1, id: 1 }, Some(kill_at)).unwrap();
+            let m = match jobs::run_child_with(&Job::Import { backend: b, dir: dir.clone(), params, version: 1, id: 1 }, Some(kill_at)) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("  crash-kill unsupported: {e}");
+                    let _ = std::fs::remove_dir_all(&dir);
+                    continue;
+                }
+            };
             self.record("crash-kill", b.name(), n, &format!("SIGKILL after {kill_at} ms"), 0, m);
             let v = self.run("crash-verify", b.name(), n, "snapshot 0 intact after kill", 0, Job::Verify { backend: b, dir: dir.clone(), id: 0, params, version: 0 });
             let listed_partial = v.result.extra["snapshots"].as_array().is_some_and(|a| a.iter().any(|x| x == 1));
@@ -305,6 +320,7 @@ impl Runner {
             self.run("diskfull-verify", b.name(), n, "snapshot 0 intact after failed write", 0, Job::Verify { backend: b, dir: dir.clone(), id: 0, params, version: 0 });
             self.run("diskfull-reuse", b.name(), n, "write snapshot 2 afterwards", 0, Job::Import { backend: b, dir: dir.clone(), params, version: 1, id: 2 });
             let _ = std::fs::remove_dir_all(&dir);
+        }
         }
     }
 
@@ -339,6 +355,7 @@ impl Runner {
     }
 }
 
+#[cfg(unix)]
 fn largest_file(dir: &Path) -> u64 {
     let mut max = 0;
     let mut stack = vec![dir.to_path_buf()];
@@ -368,7 +385,7 @@ pub fn prefix_target(params: Params) -> (Vec<Vec<u8>>, u64) {
         }
     };
     for r in Gen::new(params, 0) {
-        stack.set(r.depth, &r.name).unwrap();
+        stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default()).unwrap();
         while open.last().is_some_and(|(p, _)| p.len() > r.depth as usize) {
             let (p, c) = open.pop().unwrap();
             if let Some(parent) = open.last_mut() {

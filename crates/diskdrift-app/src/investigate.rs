@@ -59,7 +59,6 @@ pub fn baseline(settings: &Effective, now: i64) -> Option<String> {
 /// out (the doctor measures those now).
 pub fn known_sizes(settings: &Effective, max_age: i64, now: i64) -> Result<Option<KnownSizes>, AppError> {
     use diskdrift_core::paths::components_under;
-    use std::os::unix::ffi::OsStrExt;
     let Some(store) = snapshots::open_store(settings)? else { return Ok(None) };
     let Some(m) = store.list()?.into_iter().rev().find(|m| m.status.is_usable()) else { return Ok(None) };
     let started = chrono::DateTime::parse_from_rfc3339(&m.started_at).map(|t| t.timestamp()).unwrap_or(0);
@@ -69,7 +68,7 @@ pub fn known_sizes(settings: &Effective, max_age: i64, now: i64) -> Result<Optio
     let paths: Vec<std::path::PathBuf> =
         diskdrift_diagnostics::suspects::macos_catalog().iter().map(|s| diskdrift_diagnostics::suspects::expand(s.path, &settings.home)).collect();
     let (paths, dirs): (Vec<_>, Vec<_>) =
-        paths.into_iter().filter_map(|p| components_under(m.root.as_bytes(), p.as_os_str().as_bytes()).map(|c| (p, c))).unzip();
+        paths.into_iter().filter_map(|p| components_under(m.root.as_bytes(), &path_bytes(&p)).map(|c| (p, c))).unzip();
     if dirs.is_empty() {
         return Ok(None);
     }
@@ -101,6 +100,17 @@ pub fn known_sizes(settings: &Effective, max_age: i64, now: i64) -> Result<Optio
         .collect();
     let source = snapshots::scan_label(&m, now);
     Ok(Some(KnownSizes { source, sizes, large_files }))
+}
+
+#[cfg(unix)]
+fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &std::path::Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
 }
 
 fn is_inside(path: &str, dir: &str) -> bool {
@@ -512,6 +522,7 @@ mod candidate_tests {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod known_sizes_tests {
     use super::*;
     use crate::config::{Overrides, resolve_with};
@@ -519,6 +530,7 @@ mod known_sizes_tests {
     use std::path::Path;
 
     #[test]
+    #[cfg(not(windows))]
     fn sizes_come_from_a_fresh_scan_that_covers_them() {
         let t = TestDir::new("known-sizes");
         t.file("Library/Caches/app/blob", 300_000);

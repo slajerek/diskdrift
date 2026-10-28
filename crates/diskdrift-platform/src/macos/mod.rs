@@ -7,12 +7,23 @@ pub mod guard;
 pub mod space;
 
 use crate::{MountInfo, ScanLayout};
+use diskdrift_core::native::{NativeError, NativePath, NativeRoot, RootKind};
 use std::ffi::CStr;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
 pub const DATA_VOLUME_MOUNT: &str = "/System/Volumes/Data";
 const FIRMLINKS_FILE: &str = "/usr/share/firmlinks";
+
+pub fn native_path(value: &OsStr) -> NativePath {
+    use std::os::unix::ffi::OsStrExt;
+    NativePath::unix(value.as_bytes().to_vec())
+}
+
+pub fn native_root(value: &OsStr) -> Result<NativeRoot, NativeError> {
+    NativeRoot::new(native_path(value), RootKind::Posix, false)
+}
 
 fn cstr_field(field: &[libc::c_char]) -> String {
     unsafe { CStr::from_ptr(field.as_ptr()) }.to_string_lossy().into_owned()

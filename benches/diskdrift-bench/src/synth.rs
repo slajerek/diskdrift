@@ -124,7 +124,7 @@ impl Gen {
 
     fn dir_record(&self, name: Vec<u8>, id: u64) -> Record {
         Record {
-            name,
+            name: diskdrift_core::native::NativeName::unix(name),
             kind: Kind::Dir,
             size: 64 + (mix(id) % 2048),
             alloc: 0,
@@ -143,7 +143,7 @@ impl Gen {
         let size = if hot && v > 0 { (base as f64 * (0.5 + unit(h2(id, v)))) as u64 } else { base };
         let mtime = if hot && v > 0 { T0 + v as i64 * 3600 } else { T0 - (mix(id ^ 7) % 90_000_000) as i64 };
         Record {
-            name,
+            name: diskdrift_core::native::NativeName::unix(name),
             kind: Kind::File,
             size,
             alloc: size.div_ceil(4096) * 4096,
@@ -286,7 +286,7 @@ mod tests {
         let mut stack = PathStack::new();
         let mut prev: Option<Vec<Vec<u8>>> = None;
         for r in &a {
-            stack.set(r.depth, &r.name).unwrap();
+            stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default()).unwrap();
             let cur = stack.components().to_vec();
             if let Some(p) = &prev {
                 assert_eq!(compare_paths(p, &cur), std::cmp::Ordering::Less);

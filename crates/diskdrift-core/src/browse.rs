@@ -66,7 +66,8 @@ pub fn children(stream: RecordStream<'_>, dir: &[Vec<u8>], limit: usize) -> io::
     let level = dir.len();
     for rec in stream {
         let rec = rec?;
-        stack.set(rec.depth, &rec.name)?;
+        let name = rec.name.as_unix_bytes().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "portable browse requires Unix names"))?;
+        stack.set(rec.depth, name)?;
         if !stack.starts_with(dir) {
             if this.is_some() {
                 break;
@@ -292,7 +293,8 @@ pub fn totals(stream: RecordStream<'_>, dirs: &[Vec<Vec<u8>>], large_files: usiz
     let mut large: Vec<Child> = Vec::new();
     for rec in stream {
         let rec = rec?;
-        stack.set(rec.depth, &rec.name)?;
+        let name = rec.name.as_unix_bytes().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "portable browse requires Unix names"))?;
+        stack.set(rec.depth, name)?;
         if stack.components().len() <= max_len {
             active.clear();
             active.extend((0..dirs.len()).filter(|&i| stack.starts_with(&dirs[i])));

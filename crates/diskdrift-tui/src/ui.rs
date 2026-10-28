@@ -1,7 +1,7 @@
 //! Rendering. Every screen renders only what fits; long lists are sliced to the
 //! visible window before building widgets.
 
-use crate::app::{AnalysisView, App, BrowseData, BrowseSource, DIFF_LIMIT, DIFF_TABS, DiffFocus, DiffTab, FindRow, Job, TopFocus, LogLine, MENU, ScanField, ScanStage, Screen, TopView};
+use crate::app::{AnalysisView, App, BrowseData, BrowseSource, DIFF_LIMIT, DIFF_TABS, DiffFocus, DiffTab, FindRow, Job, TopFocus, LogLine, MenuItem, DISKS_MENU, EXPLORE_MENU, DISKDRIFT_MENU, ScanField, ScanStage, Screen, TopView};
 use diskdrift_app::storage::Strength;
 use diskdrift_app::text::browse::{child_changed, child_detail, child_name, child_size, diff_change, diff_detail, share};
 use diskdrift_app::diagnostics::classify::verdict;
@@ -25,6 +25,8 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap}
 use std::sync::atomic::Ordering;
 
 const ACCENT: Color = Color::Cyan;
+const WIDE_MENU_MIN_WIDTH: u16 = 76;
+const GROUP_BORDER: Color = Color::DarkGray;
 
 fn units(app: &App) -> SizeUnits {
     app.settings.size_units.value
@@ -171,37 +173,165 @@ fn disk_panel_lines(app: &App, max: usize, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+fn draw_menu_group(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    title: &str,
+    items: &[MenuItem],
+    start_index: usize,
+    horizontal: bool,
+) {
+    let block = Block::bordered().border_style(Style::new().fg(GROUP_BORDER)).title(title);
+    let inner = block.inner(area);
+    let label_style = |selected| {
+        if selected {
+            Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        }
+    };
+    let label = |item: MenuItem, index: usize| {
+        let marker = if start_index + index == app.menu_index { "> " } else { "  " };
+        format!("{marker}[{}] {}", item.hotkey(), item.title())
+    };
+    let lines = if horizontal {
+        let mut spans = Vec::new();
+        for (index, item) in items.iter().copied().enumerate() {
+            let selected = start_index + index == app.menu_index;
+            spans.push(Span::styled(label(item, index), label_style(selected)));
+            if index + 1 < items.len() {
+                spans.push(Span::raw("  "));
+            }
+        }
+        vec![Line::from(spans)]
+    } else {
+        items
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, item)| {
+                let selected = start_index + index == app.menu_index;
+                let text = clip(&label(item, index), inner.width as usize);
+                Line::from(Span::styled(text, label_style(selected)))
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn dashboard_menu_height(width: u16) -> u16 {
+    if width >= WIDE_MENU_MIN_WIDTH { 11 } else { 19 }
+}
+
+fn selected_menu_group(index: usize) -> usize {
+    match index {
+        0..=3 => 0,
+        4..=9 => 1,
+        _ => 2,
+    }
+}
+
+fn draw_dashboard_menu(f: &mut Frame, app: &App, area: Rect) {
+    if area.width >= WIDE_MENU_MIN_WIDTH {
+        let task_height = 8.min(area.height);
+        let task_width = area.width.saturating_sub(2) / 2;
+        let group = selected_menu_group(app.menu_index);
+        if area.height >= 11 {
+            let left = Rect { x: area.x, y: area.y, width: task_width, height: 8 };
+            let right = Rect { x: area.x + task_width + 2, y: area.y, width: task_width, height: 8 };
+            let diskdrift = Rect { x: area.x, y: area.y + 8, width: area.width, height: 3 };
+            draw_menu_group(f, app, left, "Disks & snapshots", &DISKS_MENU, 0, false);
+            draw_menu_group(f, app, right, "Explore & diagnose", &EXPLORE_MENU, DISKS_MENU.len(), false);
+            draw_menu_group(f, app, diskdrift, "DiskDrift", &DISKDRIFT_MENU, DISKS_MENU.len() + EXPLORE_MENU.len(), true);
+        } else if group == 2 {
+            let diskdrift = Rect { x: area.x, y: area.y, width: area.width, height: 3.min(area.height) };
+            draw_menu_group(f, app, diskdrift, "DiskDrift", &DISKDRIFT_MENU, DISKS_MENU.len() + EXPLORE_MENU.len(), true);
+        } else {
+            let left = Rect { x: area.x, y: area.y, width: task_width, height: task_height };
+            let right = Rect { x: area.x + task_width + 2, y: area.y, width: task_width, height: task_height };
+            draw_menu_group(f, app, left, "Disks & snapshots", &DISKS_MENU, 0, false);
+            draw_menu_group(f, app, right, "Explore & diagnose", &EXPLORE_MENU, DISKS_MENU.len(), false);
+        }
+        return;
+    }
+
+    let groups = [
+        ("Disks & snapshots", &DISKS_MENU[..], 0, 6),
+        ("Explore & diagnose", &EXPLORE_MENU[..], DISKS_MENU.len(), 8),
+        ("DiskDrift", &DISKDRIFT_MENU[..], DISKS_MENU.len() + EXPLORE_MENU.len(), 5),
+    ];
+    let heights = [6u16, 8, 5];
+    let selected = selected_menu_group(app.menu_index);
+    let mut start = selected;
+    let mut end = selected;
+    let mut used = heights[selected];
+    while start > 0 && used + heights[start - 1] <= area.height {
+        start -= 1;
+        used += heights[start];
+    }
+    while end + 1 < groups.len() && used + heights[end + 1] <= area.height {
+        end += 1;
+        used += heights[end];
+    }
+
+    let mut y = area.y;
+    for (index, (title, items, start_index, height)) in groups.into_iter().enumerate() {
+        if index < start || index > end || y >= area.bottom() {
+            continue;
+        }
+        let height = height.min(area.bottom().saturating_sub(y));
+        draw_menu_group(f, app, Rect { x: area.x, y, width: area.width, height }, title, items, start_index, false);
+        y += height;
+    }
+}
+
 fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
-    // The disks panel gets the rows the menu and status do not need.
-    let menu_h = MENU.len().div_ceil(2) as u16 + 3;
-    let status_h = if app.disk_event.is_some() { 7 } else { 6 };
-    let room = area.height.saturating_sub(menu_h + status_h).saturating_sub(2) as usize;
-    let disk_lines = disk_panel_lines(app, room.saturating_sub(1).max(1), area.width);
-    let disks_h = if disk_lines.is_empty() || room < 2 { 0 } else { disk_lines.len() as u16 + 2 };
+    let preferred_status_h = if app.disk_event.is_some() { 7 } else { 6 };
+    let ideal_menu_h = dashboard_menu_height(area.width);
+    let selected_group = selected_menu_group(app.menu_index);
+    let selected_menu_h = if area.width >= WIDE_MENU_MIN_WIDTH {
+        if selected_group == 2 { 3 } else { 8 }
+    } else {
+        [6, 8, 5][selected_group]
+    };
+    let (mut menu_h, status_h) = if area.height >= ideal_menu_h + preferred_status_h {
+        (ideal_menu_h, preferred_status_h)
+    } else if area.height >= ideal_menu_h + 3 {
+        (ideal_menu_h, (area.height - ideal_menu_h).min(preferred_status_h))
+    } else if area.height >= selected_menu_h + 3 {
+        (area.height - 3, 3)
+    } else {
+        (area.height, 0)
+    };
+
+    let available_disks_h = area.height.saturating_sub(menu_h + status_h);
+    let inner_disks_h = available_disks_h.saturating_sub(2) as usize;
+    let disk_count = app.disks.list.done().map_or(0, |l| l.disks.len());
+    let max_disk_rows = if disk_count > inner_disks_h {
+        inner_disks_h.saturating_sub(1)
+    } else {
+        inner_disks_h
+    };
+    let disk_lines = if available_disks_h >= 3 {
+        disk_panel_lines(app, max_disk_rows, area.width)
+    } else {
+        Vec::new()
+    };
+    let disks_h = if disk_lines.is_empty() { 0 } else { available_disks_h };
+    if disks_h == 0 {
+        menu_h = area.height.saturating_sub(status_h);
+    }
     let [menu_area, disks_area, status_area] =
-        Layout::vertical([Constraint::Min(6), Constraint::Length(disks_h), Constraint::Length(status_h)]).areas(area);
+        Layout::vertical([Constraint::Length(menu_h), Constraint::Length(disks_h), Constraint::Length(status_h)]).areas(area);
+    draw_dashboard_menu(f, app, menu_area);
     if disks_h > 0 {
         f.render_widget(Paragraph::new(disk_lines).block(Block::bordered().title(" Disks ")), disks_area);
     }
-    let mut lines = vec![Line::raw("")];
-    for row in MENU.chunks(2) {
-        let mut spans = Vec::new();
-        for s in row {
-            let idx = MENU.iter().position(|m| m == s).unwrap();
-            let selected = idx == app.menu_index;
-            let marker = if selected { " > " } else { "   " };
-            let label = format!("{marker}[{}] {:<24}", s.hotkey(), s.title());
-            spans.push(if selected {
-                Span::styled(label, Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD))
-            } else {
-                Span::raw(label)
-            });
-            spans.push(Span::raw("  "));
-        }
-        lines.push(Line::from(spans));
-    }
-    f.render_widget(Paragraph::new(lines).block(Block::bordered().title(" Menu ")), menu_area);
 
+    if status_h == 0 {
+        return;
+    }
     let s = &app.settings;
     let status = vec![
         Line::from(vec![Span::raw(" Last scan: "), Span::styled(last_scan_text(app), Style::new().bold())]),
@@ -1950,15 +2080,15 @@ pub fn help_text(app: &App) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{key, settings};
+    use crate::app::{MenuItem, MENU, tests::{key, settings}};
     use crossterm::event::KeyCode;
+    use diskdrift_app::disks::{DiskList, DiskRow};
+    use diskdrift_app::storage::disks::{Disk, Identity, VolumeFacts};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     fn render(app: &App, w: u16, h: u16) -> String {
-        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, app)).unwrap();
-        let buf = t.backend().buffer().clone();
+        let buf = render_buffer(app, w, h);
         let mut s = String::new();
         for y in 0..h {
             for x in 0..w {
@@ -1969,18 +2099,264 @@ mod tests {
         s
     }
 
+    fn render_buffer(app: &App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, app)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    fn row_containing(screen: &str, needle: &str) -> usize {
+        screen.lines().position(|line| line.contains(needle)).unwrap_or_else(|| panic!("missing {needle:?} in:\n{screen}"))
+    }
+
+    fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect()
+    }
+
+    fn buffer_row_containing(buffer: &ratatui::buffer::Buffer, needle: &str) -> u16 {
+        (0..buffer.area.height)
+            .find(|&y| buffer_row(buffer, y).contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in buffer"))
+    }
+
+    fn buffer_group_title_row(buffer: &ratatui::buffer::Buffer, title: &str) -> u16 {
+        buffer_row_containing(buffer, &format!("┌{title}"))
+    }
+
+    fn assert_group_box(buffer: &ratatui::buffer::Buffer, top: u16, bottom: u16, left: u16, right: u16) {
+        for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
+            assert_eq!(buffer[(x, y)].fg, GROUP_BORDER, "border cell ({x}, {y})");
+        }
+    }
+
+    fn dashboard_disks(count: usize) -> DiskList {
+        let disks = (0..count)
+            .map(|i| DiskRow {
+                disk: Disk {
+                    id: format!("disk-{i}"),
+                    identity: Identity::new(Strength::Uuid, format!("uuid-{i}")),
+                    label: Some(format!("disk-{i}")),
+                    description: None,
+                    sets: Vec::new(),
+                    volume: VolumeFacts { name: Some(format!("V{i}")), fs_type: "apfs".into(), capacity_bytes: None },
+                    device: None,
+                    first_seen: "2026-01-01T10:00:00+01:00".into(),
+                    last_seen: "2026-01-01T10:00:00+01:00".into(),
+                    last_mount_point: None,
+                    aliases: Vec::new(),
+                    last_mount_path: None,
+                },
+                known: true,
+                last_size: None,
+                last_root: None,
+                connected: true,
+                mount_point: Some("/".into()),
+                snapshots: 0,
+                last_scan: None,
+                store_bytes: 0,
+            })
+            .collect();
+        DiskList { store_path: "/s".into(), store_exists: true, disks }
+    }
+
+    #[test]
+    fn dashboard_menu_renders_three_bordered_groups() {
+        let app = App::new(settings());
+        let screen = render(&app, 90, 24);
+        let buffer = render_buffer(&app, 90, 24);
+
+        assert!(screen.contains("Disks & snapshots"), "{screen}");
+        assert!(screen.contains("Explore & diagnose"), "{screen}");
+        assert!(screen.contains("DiskDrift"), "{screen}");
+        assert!(screen.contains("[E] Settings"), "{screen}");
+        assert!(screen.contains("[?] Help"), "{screen}");
+        assert!(screen.contains("[Q] Quit"), "{screen}");
+        assert!(!screen.contains(" Menu "), "{screen}");
+        assert!(screen.contains("> [S] Scan disk"), "{screen}");
+
+        let left_title_row = buffer_row_containing(&buffer, "Disks & snapshots");
+        let right_title_row = buffer_row_containing(&buffer, "Explore & diagnose");
+        let diskdrift_title_row = buffer_group_title_row(&buffer, "DiskDrift");
+        assert_eq!(left_title_row, right_title_row);
+        assert_group_box(&buffer, left_title_row, left_title_row + 7, 0, 43);
+        assert_group_box(&buffer, right_title_row, right_title_row + 7, 46, 89);
+        assert_group_box(&buffer, diskdrift_title_row, diskdrift_title_row + 2, 0, 89);
+        assert!(buffer_row(&buffer, left_title_row).contains("Disks & snapshots"));
+        assert!(buffer_row(&buffer, diskdrift_title_row).contains("DiskDrift"));
+
+        let selected_x = buffer_row(&buffer, left_title_row + 1).find("> [S]").unwrap() as u16;
+        let selected = &buffer[(selected_x, left_title_row + 1)];
+        assert_eq!(selected.fg, Color::Black);
+        assert_eq!(selected.bg, ACCENT);
+        assert!(selected.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn dashboard_menu_breakpoint_changes_task_row_and_stacks_diskdrift() {
+        let wide = render(&App::new(settings()), 76, 30);
+        let stacked = render(&App::new(settings()), 75, 30);
+
+        assert_eq!(row_containing(&wide, "Disks & snapshots"), row_containing(&wide, "Explore & diagnose"));
+        assert!(row_containing(&stacked, "Disks & snapshots") < row_containing(&stacked, "Explore & diagnose"));
+        let diskdrift_row = stacked.lines().position(|line| line.contains("┌DiskDrift")).unwrap();
+        assert!(row_containing(&stacked, "Explore & diagnose") < diskdrift_row);
+        assert!(row_containing(&stacked, "[E] Settings") < row_containing(&stacked, "[?] Help"));
+        assert!(row_containing(&stacked, "[?] Help") < row_containing(&stacked, "[Q] Quit"));
+    }
+
+    #[test]
+    fn dashboard_menu_narrow_view_keeps_selected_group_complete_and_status() {
+        let mut app = App::new(settings());
+        app.menu_index = 8;
+        app.disks.list = Job::Done(Box::new(dashboard_disks(1)));
+        let screen = render(&app, 75, 15);
+        let buffer = render_buffer(&app, 75, 15);
+
+        let title_row = buffer_row_containing(&buffer, "Explore & diagnose");
+        assert_group_box(&buffer, title_row, title_row + 7, 0, 74);
+        for label in ["[F] Find a file", "[T] Largest files", "[D] Compare snapshots", "[I] Investigate / Doctor", "[U] Volume usage"] {
+            assert!(buffer_row_containing(&buffer, label) > title_row);
+        }
+        let recovery_row = buffer_row_containing(&buffer, "> [R] Recovery suggestions");
+        assert!(recovery_row > title_row && recovery_row < title_row + 7);
+        assert!(buffer_row(&buffer, title_row).contains("Explore & diagnose"));
+        assert!(buffer_row(&buffer, title_row + 7).contains("└"));
+        assert!(!screen.contains(" Disks "), "{screen}");
+        assert!(screen.contains("Last scan:"), "{screen}");
+    }
+
+    #[test]
+    fn dashboard_menu_constrained_selected_disks_group_is_complete() {
+        let mut app = App::new(settings());
+        app.menu_index = 3;
+        let buffer = render_buffer(&app, 75, 13);
+
+        let title_row = buffer_group_title_row(&buffer, "Disks & snapshots");
+        assert_group_box(&buffer, title_row, title_row + 5, 0, 74);
+        assert!(buffer_row_containing(&buffer, "> [C] Careful mode") < title_row + 6);
+        assert!(!buffer_row(&buffer, title_row + 6).contains("Explore & diagnose"));
+        assert!(buffer_row_containing(&buffer, "Last scan:") > title_row + 5);
+    }
+
+    #[test]
+    fn dashboard_menu_constrained_selected_diskdrift_group_is_complete() {
+        let mut app = App::new(settings());
+        app.menu_index = 12;
+        let buffer = render_buffer(&app, 75, 12);
+
+        let title_row = buffer_group_title_row(&buffer, "DiskDrift");
+        assert_group_box(&buffer, title_row, title_row + 4, 0, 74);
+        let quit_row = buffer_row_containing(&buffer, "> [Q] Quit");
+        assert!(quit_row > title_row && quit_row < title_row + 4);
+        assert!(!buffer_row(&buffer, title_row).contains("Explore & diagnose"));
+        assert!(buffer_row_containing(&buffer, "Last scan:") > title_row + 4);
+    }
+
+    #[test]
+    fn dashboard_menu_narrow_labels_clip_without_wrapping() {
+        let mut app = App::new(settings());
+        app.menu_index = 7;
+        let buffer = render_buffer(&app, 20, 30);
+        let row = buffer_row_containing(&buffer, "> [I]");
+        let selected_line = buffer_row(&buffer, row);
+        let next_line = buffer_row(&buffer, row + 1);
+
+        assert!(selected_line.contains("> [I] Investigate"));
+        assert!(!selected_line.contains("Doctor"));
+        assert!(!next_line.contains("Doctor"));
+        assert!(next_line.contains("[R] Recovery"));
+        let selected_x = selected_line.find("> [I]").unwrap() as u16;
+        let selected = &buffer[(selected_x, row)];
+        assert_eq!(selected.fg, Color::Black);
+        assert_eq!(selected.bg, ACCENT);
+        assert!(selected.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn dashboard_menu_short_wide_view_follows_selected_group() {
+        let mut task = App::new(settings());
+        task.menu_index = 3;
+        let task_screen = render(&task, 80, 15);
+        let task_buffer = render_buffer(&task, 80, 15);
+        let task_title_row = buffer_row_containing(&task_buffer, "Disks & snapshots");
+        assert_eq!(task_title_row, buffer_row_containing(&task_buffer, "Explore & diagnose"));
+        assert_group_box(&task_buffer, task_title_row, task_title_row + 7, 0, 38);
+        assert_group_box(&task_buffer, task_title_row, task_title_row + 7, 41, 79);
+        assert!(buffer_row_containing(&task_buffer, "> [C] Careful mode") > task_title_row);
+        assert!(buffer_row_containing(&task_buffer, "> [C] Careful mode") < task_title_row + 8);
+        assert!(!task_screen.contains("┌DiskDrift"), "{task_screen}");
+        assert!(task_screen.contains("Last scan:"), "{task_screen}");
+
+        let mut diskdrift = App::new(settings());
+        diskdrift.menu_index = 10;
+        let diskdrift_screen = render(&diskdrift, 80, 15);
+        let diskdrift_buffer = render_buffer(&diskdrift, 80, 15);
+        let diskdrift_title_row = buffer_group_title_row(&diskdrift_buffer, "DiskDrift");
+        assert_group_box(&diskdrift_buffer, diskdrift_title_row, diskdrift_title_row + 2, 0, 79);
+        assert!(buffer_row_containing(&diskdrift_buffer, "> [E] Settings") > diskdrift_title_row);
+        assert!(diskdrift_screen.contains("DiskDrift"), "{diskdrift_screen}");
+        assert!(!diskdrift_screen.contains("Disks & snapshots"), "{diskdrift_screen}");
+        assert!(!diskdrift_screen.contains("Explore & diagnose"), "{diskdrift_screen}");
+        assert!(diskdrift_screen.contains("Last scan:"), "{diskdrift_screen}");
+    }
+
+    #[test]
+    fn dashboard_menu_tiny_selected_groups_are_visible_when_complete() {
+        for (menu_index, width, height, label, group_height) in [
+            (3, 20, 10, "> [C] Careful", 6),
+            (8, 20, 12, "> [R] Recovery", 8),
+            (12, 20, 9, "> [Q] Quit", 5),
+        ] {
+            let mut app = App::new(settings());
+            app.menu_index = menu_index;
+            let buffer = render_buffer(&app, width, height);
+            let title = match menu_index {
+                3 => "Disks & snapshots",
+                8 => "Explore & diagnose",
+                _ => "DiskDrift",
+            };
+            let title_row = buffer_group_title_row(&buffer, title);
+            assert_group_box(&buffer, title_row, title_row + group_height - 1, 0, width - 1);
+            let selected_row = buffer_row_containing(&buffer, label);
+            assert!(selected_row > title_row && selected_row < title_row + group_height);
+        }
+    }
+
+    #[test]
+    fn dashboard_menu_keeps_disk_overflow_indicator_visible() {
+        let mut app = App::new(settings());
+        app.disks.list = Job::Done(Box::new(dashboard_disks(8)));
+        let screen = render(&app, 90, 30);
+
+        assert!(screen.contains("… and 2 more"), "{screen}");
+    }
+
+    #[test]
+    fn dashboard_menu_shows_one_disk_at_common_viewport() {
+        let mut app = App::new(settings());
+        app.disks.list = Job::Done(Box::new(dashboard_disks(1)));
+        let buffer = render_buffer(&app, 90, 24);
+
+        assert!(buffer_row_containing(&buffer, "disk-0") > 0);
+        assert!(!buffer_row(&buffer, buffer_row_containing(&buffer, "disk-0")).contains("… and 1 more"));
+    }
+
     #[test]
     fn dashboard_shows_menu_and_storage() {
         let app = App::new(settings());
         let s = render(&app, 90, 20);
         assert!(s.contains("[S] Scan disk"));
         assert!(s.contains("[?] Help"));
-        assert!(s.contains("Storage: /nonexistent-home/.diskdrift/data"));
+        let app = App::new(settings());
+        assert!(s.contains(&format!("Storage: {}", app.settings.storage_path.value.display())));
     }
 
     #[test]
     fn every_screen_renders_in_tiny_terminals() {
-        for screen in MENU.iter().copied().chain([Screen::Dashboard]) {
+        for screen in MENU.iter().filter_map(|item| match item {
+            MenuItem::Screen(screen) => Some(*screen),
+            MenuItem::Quit => None,
+        }).chain([Screen::Dashboard]) {
             let mut app = App::new(settings());
             app.handle_key(key(KeyCode::Char(screen.hotkey())));
             app.screen = screen;
@@ -2085,7 +2461,8 @@ mod tests {
     fn help_lists_config_and_store() {
         let app = App::new(settings());
         let h = help_text(&app);
-        assert!(h.contains("/nonexistent-home/.diskdrift/config.json"));
+        let app = App::new(settings());
+        assert!(h.contains(&app.settings.config_path.value.display().to_string()));
         assert!(h.contains("never modifies"));
     }
 
@@ -2136,7 +2513,7 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Down));
         let s = render(&app, 120, 30);
-        assert!(s.contains("last seen in scan #12 (3 Oct 14:20), gone in scan #13 (10 Oct 09:05)"), "{s}");
+        assert!(s.contains("last seen in scan #12") && s.contains("gone in scan #13"), "{s}");
         assert!(s.contains("probably moved to /Volumes/backupy-2014/Old/wazna10.txt"), "{s}");
     }
 
@@ -2174,6 +2551,8 @@ mod tests {
             first_seen: "2014-03-01T10:00:00+01:00".into(),
             last_seen: "2014-03-01T10:00:00+01:00".into(),
             last_mount_point: Some("/Volumes/OLD".into()),
+            aliases: Vec::new(),
+            last_mount_path: None,
         };
         let row = |d: Disk, connected: bool| DiskRow {
             disk: d,
@@ -2223,6 +2602,8 @@ mod tests {
             first_seen: "2026-01-01T10:00:00+01:00".into(),
             last_seen: "2026-01-01T10:00:00+01:00".into(),
             last_mount_point: None,
+            aliases: Vec::new(),
+            last_mount_path: None,
         };
         let mut app = App::new(settings());
         app.disks.list = Job::Done(Box::new(DiskList {

@@ -1,5 +1,7 @@
 //! JSON representation of native paths (spec section 8): a string when the bytes
 //! are valid UTF-8; otherwise a lossy string plus the exact bytes in base64.
+//! This legacy flattened form remains for pre-portability records; new exact
+//! values live in [`crate::native`].
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;

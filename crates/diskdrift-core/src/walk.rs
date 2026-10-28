@@ -8,12 +8,16 @@
 //! memory independent of tree size); the directory the consumer is waiting for is
 //! always allowed through, so the budget cannot deadlock the walk.
 
-use crate::record::{Kind, Record, flags};
+use crate::native::NativeName;
+use crate::record::{FileId, Kind, Record, flags};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::ffi::{OsStr, OsString};
-use std::io;
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::ffi::OsStr;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -22,13 +26,17 @@ use std::time::Instant;
 /// One directory entry as returned by a platform lister.
 #[derive(Debug, Clone, Default)]
 pub struct RawEntry {
-    pub name: Vec<u8>,
+    pub name: NativeName,
     pub kind: Kind,
     pub size: u64,
     pub alloc: u64,
     pub mtime: i64,
+    pub mtime_nanos: u32,
     pub btime: i64,
+    pub btime_nanos: u32,
     pub ino: u64,
+    pub file_id: FileId,
+    pub available: crate::record::EntryFields,
     pub nlink: u32,
     pub dev: u64,
     /// The lister knows this directory is a mount point.
@@ -37,6 +45,23 @@ pub struct RawEntry {
     pub is_trigger: bool,
     /// errno if the entry's own metadata could not be read.
     pub error: Option<i32>,
+}
+
+impl RawEntry {
+    /// Keep only identity needed to report an unavailable entry. The device is
+    /// retained so the walk can still attribute the record to a volume.
+    pub fn clear_metadata(&mut self) {
+        self.size = 0;
+        self.alloc = 0;
+        self.mtime = 0;
+        self.mtime_nanos = 0;
+        self.btime = 0;
+        self.btime_nanos = 0;
+        self.ino = 0;
+        self.file_id = FileId::ZERO;
+        self.available = crate::record::EntryFields::empty();
+        self.nlink = 0;
+    }
 }
 
 /// Platform-specific directory listing.
@@ -78,15 +103,15 @@ impl ExcludeRules {
         self.paths.is_empty() && self.names.is_empty()
     }
 
-    fn matches(&self, path: &Path, name: &[u8]) -> bool {
-        self.names.iter().any(|n| n.as_bytes() == name) || self.paths.iter().any(|p| path.starts_with(p))
+    fn matches(&self, path: &Path, name: &NativeName) -> bool {
+        self.names.iter().any(|n| native_name_matches(n, name)) || self.paths.iter().any(|p| path.starts_with(p))
     }
 
     /// Patterns in config notation, for snapshot metadata.
     pub fn patterns(&self) -> Vec<String> {
         let mut out: Vec<String> =
-            self.paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        out.extend(self.names.iter().map(|n| n.to_string_lossy().into_owned()));
+            self.paths.iter().map(|p| p.display().to_string()).collect();
+        out.extend(self.names.iter().map(|n| n.to_str().unwrap_or_default().to_owned()));
         out
     }
 }
@@ -316,7 +341,7 @@ impl State {
                 let mut k = Vec::with_capacity(key.len() + 1);
                 k.extend_from_slice(key);
                 k.push(i as u32);
-                self.pending.push(Task { key: k, slot, path: dir.join(OsStr::from_bytes(&child.raw.name)), dev });
+                self.pending.push(Task { key: k, slot, path: join_native(dir, &child.raw.name), dev });
                 child.descend = Descend::Queued(slot);
                 queued += 1;
             }
@@ -399,7 +424,7 @@ impl Shared<'_> {
         for child in children.iter_mut() {
             if child.raw.kind != Kind::Dir {
                 if !opts.exclude.is_empty() {
-                    let path = task.path.join(OsStr::from_bytes(&child.raw.name));
+                    let path = join_native(&task.path, &child.raw.name);
                     if opts.exclude.matches(&path, &child.raw.name) {
                         child.descend = Descend::Omit;
                     }
@@ -410,7 +435,7 @@ impl Shared<'_> {
                 child.descend = Descend::No;
                 continue;
             }
-            let path = task.path.join(OsStr::from_bytes(&child.raw.name));
+            let path = join_native(&task.path, &child.raw.name);
             if !opts.alias_paths.is_empty() && opts.alias_paths.contains(&path) {
                 child.descend = Descend::Omit;
                 continue;
@@ -479,7 +504,7 @@ struct Emitter<'s> {
     sink: &'s mut dyn RecordSink,
     report: WalkReport,
     dev_index: HashMap<u64, u16>,
-    hardlinks: HashSet<(u64, u64)>,
+    hardlinks: HashSet<(u64, FileId)>,
     rec: Record,
     max_issues: usize,
     progress: Option<&'s Progress>,
@@ -494,7 +519,7 @@ impl Emitter<'_> {
         if self.report.issues.len() < self.max_issues {
             self.report.issues.push(WalkIssue {
                 kind,
-                path: path.to_string_lossy().into_owned(),
+                path: path.display().to_string(),
                 message: err.to_string(),
             });
         }
@@ -510,21 +535,26 @@ impl Emitter<'_> {
         if raw.error.is_some() {
             fl |= flags::STAT_ERROR;
         }
-        if raw.kind != Kind::Dir && raw.nlink > 1 && !self.hardlinks.insert((raw.dev, raw.ino)) {
+        let unavailable = fl & flags::STAT_ERROR != 0;
+        if !unavailable && raw.kind != Kind::Dir && raw.nlink > 1 && raw.available.contains(crate::record::EntryFields::FILE_ID)
+            && !self.hardlinks.insert((raw.dev, raw.file_id)) {
             fl |= flags::HARDLINK_DUP;
         }
         let rec = &mut self.rec;
         rec.depth = depth;
-        rec.name.clear();
-        rec.name.extend_from_slice(&raw.name);
+        rec.name = raw.name.clone();
         rec.kind = raw.kind;
         rec.flags = fl;
-        rec.size = raw.size;
-        rec.alloc = raw.alloc;
-        rec.mtime = raw.mtime;
-        rec.btime = raw.btime;
-        rec.ino = raw.ino;
-        rec.nlink = raw.nlink;
+        rec.size = if unavailable { 0 } else { raw.size };
+        rec.alloc = if unavailable { 0 } else { raw.alloc };
+        rec.mtime = if unavailable { 0 } else { raw.mtime };
+        rec.mtime_nanos = if unavailable { 0 } else { raw.mtime_nanos };
+        rec.btime = if unavailable { 0 } else { raw.btime };
+        rec.btime_nanos = if unavailable { 0 } else { raw.btime_nanos };
+        rec.ino = if unavailable { 0 } else { raw.ino };
+        rec.file_id = if unavailable { FileId::ZERO } else { raw.file_id };
+        rec.available = if unavailable { crate::record::EntryFields::empty() } else { raw.available };
+        rec.nlink = if unavailable { 0 } else { raw.nlink };
         rec.vol = vol;
 
         let r = &mut self.report;
@@ -538,8 +568,8 @@ impl Emitter<'_> {
         if fl & flags::HARDLINK_DUP != 0 {
             r.hardlink_duplicates += 1;
         } else {
-            r.logical_bytes += raw.size;
-            r.allocated_bytes += raw.alloc;
+            r.logical_bytes += rec.counted_size();
+            r.allocated_bytes += rec.counted_alloc();
         }
         if fl & flags::INACCESSIBLE != 0 {
             r.inaccessible_dirs += 1;
@@ -556,7 +586,7 @@ impl Emitter<'_> {
         if let Some(p) = self.progress {
             let n = p.entries.fetch_add(1, AtomicOrdering::Relaxed);
             if fl & flags::HARDLINK_DUP == 0 {
-                p.bytes_alloc.fetch_add(raw.alloc, AtomicOrdering::Relaxed);
+                p.bytes_alloc.fetch_add(rec.counted_alloc(), AtomicOrdering::Relaxed);
             }
             if raw.kind == Kind::Dir {
                 p.dirs.fetch_add(1, AtomicOrdering::Relaxed);
@@ -564,7 +594,7 @@ impl Emitter<'_> {
             if n % 4096 == 0
                 && let Ok(mut cur) = p.current.try_lock() {
                     cur.clear();
-                    cur.push_str(&path.to_string_lossy());
+                    cur.push_str(&path.display().to_string());
                 }
         }
         self.sink.record(&self.rec, path)
@@ -589,7 +619,7 @@ pub fn walk(
         path: root.display().to_string(),
         source,
     })?;
-    root_raw.name = root.as_os_str().as_bytes().to_vec();
+    root_raw.name = native_from_path(root);
 
     let shared = Arc::new(Shared {
         state: Mutex::new(State::default()),
@@ -702,7 +732,7 @@ fn consume(
         let frame = frames.last_mut().unwrap();
         let child = std::mem::take(&mut frame.children[i].raw);
         let descend = frame.children[i].descend;
-        path.push(OsStr::from_bytes(&child.name));
+        path = join_native(&path, &child.name);
         if let Some(errno) = child.error {
             em.issue(IssueKind::StatFailed, &path, &io::Error::from_raw_os_error(errno));
         }
@@ -751,8 +781,10 @@ fn open_listing(
 }
 
 /// Portable lister built on `std::fs::read_dir` + `lstat`.
+#[cfg(any(unix, windows))]
 pub struct StdLister;
 
+#[cfg(unix)]
 impl StdLister {
     fn raw_from_metadata(name: Vec<u8>, md: &std::fs::Metadata) -> RawEntry {
         use std::os::unix::fs::MetadataExt;
@@ -772,14 +804,28 @@ impl StdLister {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let mut available = crate::record::EntryFields::KIND
+            .union(crate::record::EntryFields::LOGICAL_SIZE)
+            .union(crate::record::EntryFields::ALLOCATED_SIZE)
+            .union(crate::record::EntryFields::MTIME)
+            .union(crate::record::EntryFields::FILE_ID)
+            .union(crate::record::EntryFields::LINK_COUNT);
+        if md.created().is_ok() {
+            available = available.union(crate::record::EntryFields::BIRTH_TIME).union(crate::record::EntryFields::BIRTH_TIME_NANOS);
+        }
+        available = available.union(crate::record::EntryFields::MTIME_NANOS);
         RawEntry {
-            name,
+            name: NativeName::unix(name),
             kind,
-            size: md.len(),
+            size: if kind == Kind::Dir { 0 } else { md.len() },
             alloc: md.blocks().saturating_mul(512),
             mtime: md.mtime(),
+            mtime_nanos: md.mtime_nsec() as u32,
             btime,
+            btime_nanos: md.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.subsec_nanos()).unwrap_or(0),
             ino: md.ino(),
+            file_id: FileId { low: md.ino(), high: 0 },
+            available,
             nlink: md.nlink() as u32,
             dev: md.dev(),
             is_mount_point: false,
@@ -789,6 +835,7 @@ impl StdLister {
     }
 }
 
+#[cfg(unix)]
 impl DirLister for StdLister {
     fn name(&self) -> &'static str {
         "readdir"
@@ -807,7 +854,7 @@ impl DirLister for StdLister {
                 Ok(md) => out.push(Self::raw_from_metadata(name, &md)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {} // vanished during the scan
                 Err(e) => out.push(RawEntry {
-                    name,
+                    name: NativeName::unix(name),
                     error: Some(e.raw_os_error().unwrap_or(libc_eio())),
                     ..RawEntry::default()
                 }),
@@ -817,11 +864,96 @@ impl DirLister for StdLister {
     }
 }
 
+#[cfg(windows)]
+impl StdLister {
+    fn raw_from_metadata(name: Vec<u16>, md: &std::fs::Metadata) -> RawEntry {
+        let ft = md.file_type();
+        let kind = if ft.is_dir() { Kind::Dir } else if ft.is_file() { Kind::File } else if ft.is_symlink() { Kind::Symlink } else { Kind::Other };
+        let timestamp = |time: std::io::Result<std::time::SystemTime>| {
+            time.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| (d.as_secs() as i64, d.subsec_nanos())).unwrap_or((0, 0))
+        };
+        let (mtime, mtime_nanos) = timestamp(md.modified());
+        let (btime, btime_nanos) = timestamp(md.created());
+        RawEntry {
+            name: NativeName::windows(name),
+            kind,
+            size: if kind == Kind::Dir { 0 } else { md.len() },
+            alloc: md.len(),
+            mtime,
+            mtime_nanos,
+            btime,
+            btime_nanos,
+            available: crate::record::EntryFields::KIND.union(crate::record::EntryFields::LOGICAL_SIZE).union(crate::record::EntryFields::ALLOCATED_SIZE).union(crate::record::EntryFields::MTIME).union(crate::record::EntryFields::MTIME_NANOS).union(crate::record::EntryFields::BIRTH_TIME).union(crate::record::EntryFields::BIRTH_TIME_NANOS),
+            ..RawEntry::default()
+        }
+    }
+}
+
+#[cfg(windows)]
+impl DirLister for StdLister {
+    fn name(&self) -> &'static str { "readdir" }
+
+    fn stat(&self, path: &Path) -> io::Result<RawEntry> {
+        let md = std::fs::symlink_metadata(path)?;
+        use std::os::windows::ffi::OsStrExt;
+        Ok(Self::raw_from_metadata(path.as_os_str().encode_wide().collect(), &md))
+    }
+
+    fn list(&self, dir: &Path, out: &mut Vec<RawEntry>) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name: Vec<u16> = entry.file_name().encode_wide().collect();
+            match entry.metadata() {
+                Ok(md) => out.push(Self::raw_from_metadata(name, &md)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => out.push(RawEntry { name: NativeName::windows(name), error: Some(e.raw_os_error().unwrap_or(5)), ..RawEntry::default() }),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
 fn libc_eio() -> i32 {
     5
 }
 
-#[cfg(test)]
+#[cfg(unix)]
+fn join_native(path: &Path, name: &NativeName) -> PathBuf {
+    match name.as_unix_bytes() {
+        Some(bytes) => path.join(OsStr::from_bytes(bytes)),
+        None => panic!("Unix walker received a Windows-native name"),
+    }
+}
+#[cfg(windows)]
+fn join_native(path: &Path, name: &NativeName) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    match name {
+        NativeName::Windows(units) => path.join(OsString::from_wide(units)),
+        NativeName::Unix(_) => panic!("Windows walker received a Unix-native name"),
+    }
+}
+#[cfg(unix)]
+fn native_from_path(path: &Path) -> NativeName { NativeName::unix(path.as_os_str().as_bytes().to_vec()) }
+#[cfg(windows)]
+fn native_from_path(path: &Path) -> NativeName {
+    use std::os::windows::ffi::OsStrExt;
+    NativeName::windows(path.as_os_str().encode_wide().collect())
+}
+
+#[cfg(unix)]
+fn native_name_matches(value: &OsString, name: &NativeName) -> bool {
+    name.as_unix_bytes().is_some_and(|bytes| value.as_bytes() == bytes)
+}
+
+#[cfg(windows)]
+fn native_name_matches(value: &OsString, name: &NativeName) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    matches!(name, NativeName::Windows(units) if value.encode_wide().eq(units.iter().copied()))
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::testutil::TestDir;
@@ -829,7 +961,7 @@ mod tests {
     fn collect(root: &Path, opts: &WalkOptions) -> (Vec<(String, Record)>, WalkReport) {
         let mut out = Vec::new();
         let mut sink = |rec: &Record, path: &Path| {
-            out.push((path.to_string_lossy().into_owned(), rec.clone()));
+            out.push((path.display().to_string(), rec.clone()));
             Ok(())
         };
         let cancel = AtomicBool::new(false);
@@ -848,7 +980,7 @@ mod tests {
         let (records, report) = collect(t.path(), &WalkOptions { threads: 4, ..Default::default() });
         let rel: Vec<String> = records
             .iter()
-            .map(|(p, _)| p.strip_prefix(&*t.path().to_string_lossy()).unwrap().to_string())
+            .map(|(p, _)| p.strip_prefix(&*t.path().display().to_string()).unwrap().to_string())
             .collect();
         assert_eq!(rel, ["", "/a", "/a/b", "/a/b/c.dat", "/a/z.bin", "/a-b", "/a-b/x", "/b.txt", "/empty"]);
         let depths: Vec<u16> = records.iter().map(|(_, r)| r.depth).collect();
@@ -912,7 +1044,7 @@ mod tests {
         let mut opts = WalkOptions {
             exclude: ExcludeRules::from_patterns(&[
                 "node_modules".into(),
-                t.path().join("skipme").to_string_lossy().into_owned(),
+                t.path().join("skipme").display().to_string(),
             ]),
             ..Default::default()
         };
@@ -991,10 +1123,10 @@ mod tests {
         fn add(&mut self, path: &str, kind: Kind, dev: u64, mount: bool, trigger: bool) {
             let p = PathBuf::from(path);
             let name = p.file_name().map(|n| n.as_bytes().to_vec()).unwrap_or_else(|| path.as_bytes().to_vec());
-            let e = RawEntry { name, kind, dev, size: 10, alloc: 4096, nlink: 1, is_mount_point: mount, is_trigger: trigger, ..Default::default() };
+            let e = RawEntry { name: NativeName::unix(name), kind, dev, size: 10, alloc: 4096, nlink: 1, is_mount_point: mount, is_trigger: trigger, ..Default::default() };
             if let Some(parent) = p.parent()
                 && let Some(pe) = self.entries.get_mut(parent) {
-                    pe.1.push(p.file_name().unwrap().to_string_lossy().into_owned());
+                    pe.1.push(p.file_name().unwrap().display().to_string());
                 }
             self.entries.insert(p, (e, Vec::new()));
         }
@@ -1038,7 +1170,7 @@ mod tests {
         l.add("/root/net/share", Kind::File, 9, false, false);
         let mut seen = Vec::new();
         let mut sink = |r: &Record, p: &Path| {
-            seen.push((p.to_string_lossy().into_owned(), r.flags));
+            seen.push((p.display().to_string(), r.flags));
             Ok(())
         };
         let opts = WalkOptions { same_filesystem_devs: vec![3], ..Default::default() };
@@ -1063,6 +1195,67 @@ mod tests {
         let all = WalkOptions { stay_on_filesystem: false, ..Default::default() };
         walk(Path::new("/root"), &l, &all, &mut count, &cancel, None).unwrap();
         assert_eq!(n, 9 - 1, "everything except the trigger's contents");
+    }
+
+    #[test]
+    fn emitted_records_preserve_timestamp_nanos_and_availability() {
+        let mut l = FakeLister::new();
+        l.add("/root", Kind::Dir, 1, false, false);
+        l.add("/root/file", Kind::File, 1, false, false);
+        let entry = l.entries.get_mut(Path::new("/root/file")).unwrap();
+        entry.0.mtime = 12;
+        entry.0.mtime_nanos = 345;
+        entry.0.btime = 11;
+        entry.0.btime_nanos = 678;
+        entry.0.available = crate::record::EntryFields::MTIME
+            .union(crate::record::EntryFields::MTIME_NANOS)
+            .union(crate::record::EntryFields::BIRTH_TIME)
+            .union(crate::record::EntryFields::BIRTH_TIME_NANOS);
+        let mut seen = Vec::new();
+        let mut sink = |r: &Record, _: &Path| { seen.push(r.clone()); Ok(()) };
+        walk(Path::new("/root"), &l, &WalkOptions::default(), &mut sink, &AtomicBool::new(false), None).unwrap();
+        let file = seen.iter().find(|r| r.name == NativeName::unix(b"file".to_vec())).unwrap();
+        assert_eq!((file.mtime, file.mtime_nanos, file.btime, file.btime_nanos), (12, 345, 11, 678));
+        assert!(file.available.contains(crate::record::EntryFields::BIRTH_TIME_NANOS));
+    }
+
+    #[test]
+    fn stat_error_records_discard_payload_and_bytes() {
+        let mut l = FakeLister::new();
+        l.add("/root", Kind::Dir, 1, false, false);
+        l.add("/root/bad", Kind::File, 1, false, false);
+        let bad = l.entries.get_mut(Path::new("/root/bad")).unwrap();
+        bad.0.size = 1234;
+        bad.0.alloc = 4096;
+        bad.0.mtime = 77;
+        bad.0.file_id = FileId { low: 42, high: 9 };
+        bad.0.ino = 42;
+        bad.0.nlink = 3;
+        bad.0.available = crate::record::EntryFields::KIND
+            .union(crate::record::EntryFields::LOGICAL_SIZE)
+            .union(crate::record::EntryFields::ALLOCATED_SIZE)
+            .union(crate::record::EntryFields::MTIME)
+            .union(crate::record::EntryFields::FILE_ID)
+            .union(crate::record::EntryFields::LINK_COUNT);
+        bad.0.error = Some(5);
+        let mut seen = Vec::new();
+        let mut sink = |r: &Record, _: &Path| {
+            seen.push(r.clone());
+            Ok(())
+        };
+        let report = walk(Path::new("/root"), &l, &WalkOptions::default(), &mut sink, &AtomicBool::new(false), None).unwrap();
+        let bad = seen.iter().find(|r| r.name == NativeName::unix(b"bad".to_vec())).unwrap();
+        assert_eq!(report.logical_bytes, 0);
+        assert_eq!(report.allocated_bytes, 0);
+        assert_eq!((bad.size, bad.alloc, bad.mtime, bad.file_id, bad.ino, bad.nlink), (0, 0, 0, FileId::ZERO, 0, 0));
+        assert!(bad.available == crate::record::EntryFields::empty());
+        let mut other = bad.clone();
+        other.size = u64::MAX;
+        other.mtime = i64::MAX;
+        other.file_id = FileId { low: 99, high: 1 };
+        other.ino = 99;
+        other.nlink = 8;
+        assert_eq!(*bad, other);
     }
 
     #[test]

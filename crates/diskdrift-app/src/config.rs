@@ -3,6 +3,7 @@
 //! Precedence: CLI flag > config file > built-in default. Each effective value
 //! remembers where it came from so `config show` can explain it.
 
+use diskdrift_core::native::{NativePath, NativeRoot};
 use diskdrift_core::units::SizeUnits;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -11,6 +12,17 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const APP_DIR: &str = ".diskdrift";
+
+fn native_path_value(value: serde_json::Value) -> Result<NativePath, String> {
+    if let Some(s) = value.as_str() {
+        return Ok(diskdrift_platform::native_path(std::ffi::OsStr::new(s)));
+    }
+    serde_json::from_value::<NativePath>(value).map_err(|e| e.to_string())
+}
+
+fn native_root_value(value: serde_json::Value) -> Result<NativeRoot, String> {
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -26,31 +38,98 @@ pub struct Config {
     pub output: OutputConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct StorageConfig {
     /// Snapshot store location. `~` is expanded; a relative path is resolved
     /// against the directory containing the config file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    pub path_native: Option<NativePath>,
     /// Retention rules for `snapshots prune` and the TUI (0 = rule off; all
     /// off by default). Nothing is ever removed without a confirmation.
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub keep_last: usize,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub keep_weekly: usize,
-    #[serde(default, skip_serializing_if = "is_zero")]
     pub keep_monthly: usize,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StorageWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<Option<serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    keep_last: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    keep_weekly: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    keep_monthly: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StorageWireFields {
+    #[serde(default)]
+    path: Option<serde_json::Value>,
+    #[serde(default)]
+    keep_last: usize,
+    #[serde(default)]
+    keep_weekly: usize,
+    #[serde(default)]
+    keep_monthly: usize,
+}
+
+impl<'de> Deserialize<'de> for StorageWire {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let present = value.as_object().is_some_and(|object| object.contains_key("path"));
+        let fields = StorageWireFields::deserialize(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            path: present.then_some(fields.path),
+            keep_last: fields.keep_last,
+            keep_weekly: fields.keep_weekly,
+            keep_monthly: fields.keep_monthly,
+        })
+    }
+}
+
+impl Serialize for StorageConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let path = match (&self.path, &self.path_native) {
+            (_, Some(path)) => Some(Some(serde_json::to_value(path).map_err(serde::ser::Error::custom)?)),
+            (Some(path), None) => Some(Some(serde_json::Value::String(path.clone()))),
+            (None, None) => None,
+        };
+        StorageWire { path, keep_last: self.keep_last, keep_weekly: self.keep_weekly, keep_monthly: self.keep_monthly }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = StorageWire::deserialize(deserializer)?;
+        let path_value = match wire.path {
+            Some(Some(value)) => Some(value),
+            Some(None) => return Err(serde::de::Error::custom("storage.path must not be null")),
+            None => None,
+        };
+        let path_native = path_value.clone().filter(|v| !v.is_string()).map(native_path_value).transpose().map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            path: path_native.as_ref().map(NativePath::display).or_else(|| path_value.as_ref().and_then(serde_json::Value::as_str).map(str::to_owned)),
+            path_native,
+            keep_last: wire.keep_last,
+            keep_weekly: wire.keep_weekly,
+            keep_monthly: wire.keep_monthly,
+        })
+    }
 }
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields, default)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ScanConfig {
     pub default_root: String,
+    pub default_root_native: NativeRoot,
+    default_root_native_tagged: bool,
     /// 0 = automatic.
     pub threads: usize,
     pub stay_on_filesystem: bool,
@@ -66,10 +145,58 @@ pub struct ScanConfig {
     pub on_connect: bool,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScanWire {
+    #[serde(default)] default_root: Option<serde_json::Value>,
+    #[serde(default)] threads: Option<usize>,
+    #[serde(default)] stay_on_filesystem: Option<bool>,
+    #[serde(default)] follow_symlinks: Option<bool>,
+    #[serde(default)] exclude: Option<Vec<String>>,
+    #[serde(default)] auto_on_start: Option<bool>,
+    #[serde(default)] auto_max_age_hours: Option<u64>,
+    #[serde(default)] on_connect: Option<bool>,
+}
+
+impl Serialize for ScanConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let default_root = if self.default_root_native_tagged {
+            serde_json::to_value(&self.default_root_native).map_err(serde::ser::Error::custom)?
+        } else { serde_json::Value::String(self.default_root.clone()) };
+        ScanWire { default_root: Some(default_root), threads: Some(self.threads), stay_on_filesystem: Some(self.stay_on_filesystem), follow_symlinks: Some(self.follow_symlinks), exclude: Some(self.exclude.clone()), auto_on_start: Some(self.auto_on_start), auto_max_age_hours: Some(self.auto_max_age_hours), on_connect: Some(self.on_connect) }.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ScanConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ScanWire::deserialize(deserializer)?;
+        let defaults = Self::default();
+        let (default_root, default_root_native, default_root_native_tagged) = match wire.default_root {
+            Some(value) if value.is_string() => {
+                let display = value.as_str().expect("checked string").to_owned();
+                let home = crate::config::home_dir().map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                let expanded = expand_path(&display, &home, &diskdrift_platform::system_volume_root());
+                let native = diskdrift_platform::native_root(expanded.as_os_str()).map_err(serde::de::Error::custom)?;
+                (display, native, false)
+            }
+            Some(value) => {
+                let native = native_root_value(value).map_err(serde::de::Error::custom)?;
+                (native.path.display(), native, true)
+            }
+            None => (defaults.default_root.clone(), defaults.default_root_native.clone(), false),
+        };
+        Ok(Self { default_root, default_root_native, default_root_native_tagged, threads: wire.threads.unwrap_or(defaults.threads), stay_on_filesystem: wire.stay_on_filesystem.unwrap_or(defaults.stay_on_filesystem), follow_symlinks: wire.follow_symlinks.unwrap_or(defaults.follow_symlinks), exclude: wire.exclude.unwrap_or(defaults.exclude), auto_on_start: wire.auto_on_start.unwrap_or(defaults.auto_on_start), auto_max_age_hours: wire.auto_max_age_hours.unwrap_or(defaults.auto_max_age_hours), on_connect: wire.on_connect.unwrap_or(defaults.on_connect) })
+    }
+}
+
 impl Default for ScanConfig {
     fn default() -> Self {
+        let root = diskdrift_platform::system_volume_root();
+        let native_root = diskdrift_platform::native_root(root.as_os_str()).unwrap_or_else(|_| NativeRoot::posix(b"/".to_vec()));
         ScanConfig {
-            default_root: "/".into(),
+            default_root: root.display().to_string(),
+            default_root_native: native_root,
+            default_root_native_tagged: false,
             threads: 0,
             stay_on_filesystem: true,
             follow_symlinks: false,
@@ -183,7 +310,9 @@ pub struct Effective {
     pub config_path: Sourced<PathBuf>,
     pub config_exists: bool,
     pub storage_path: Sourced<PathBuf>,
+    pub storage_path_native: Sourced<NativePath>,
     pub default_root: Sourced<PathBuf>,
+    pub default_root_native: Sourced<NativeRoot>,
     pub threads: Sourced<usize>,
     pub stay_on_filesystem: Sourced<bool>,
     pub exclude: Sourced<Vec<String>>,
@@ -211,6 +340,24 @@ pub fn expand_path(p: &str, home: &Path, base: &Path) -> PathBuf {
     if expanded.is_absolute() { expanded } else { base.join(expanded) }
 }
 
+fn effective_native_path(path: &NativePath, display: &str, home: &Path, base: &Path) -> (NativePath, PathBuf) {
+    if display == "~" || display.starts_with("~/") || !is_absolute_display(display) {
+        let expanded = expand_path(display, home, base);
+        return (diskdrift_platform::native_path(expanded.as_os_str()), expanded);
+    }
+    let compatible = diskdrift_platform::path_from_native(path).unwrap_or_else(|_| PathBuf::from(display));
+    (path.clone(), compatible)
+}
+
+fn is_absolute_display(display: &str) -> bool {
+    Path::new(display).is_absolute()
+        || (display.len() >= 3
+            && display.as_bytes()[0].is_ascii_alphabetic()
+            && display.as_bytes()[1] == b':'
+            && matches!(display.as_bytes()[2], b'/' | b'\\'))
+        || display.starts_with(r"\\")
+}
+
 /// Parses config JSON, naming the offending field on error.
 pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
     let de = &mut serde_json::Deserializer::from_str(text);
@@ -236,8 +383,13 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
     if cfg.scan.follow_symlinks {
         return Err(invalid("scan.followSymlinks", "following symlinks is not supported in v0.1; set it to false".into()));
     }
-    if !cfg.scan.default_root.starts_with('/') && !cfg.scan.default_root.starts_with('~') {
-        return Err(invalid("scan.defaultRoot", "must be an absolute path".into()));
+    if !cfg.scan.default_root_native_tagged {
+        let root = if cfg.scan.default_root == "~" || cfg.scan.default_root.starts_with("~/") {
+            expand_path(&cfg.scan.default_root, &home_dir()?, &diskdrift_platform::system_volume_root())
+        } else {
+            PathBuf::from(&cfg.scan.default_root)
+        };
+        diskdrift_platform::native_root(root.as_os_str()).map_err(|e| invalid("scan.defaultRoot", e.to_string()))?;
     }
     if cfg.storage.path.as_deref() == Some("") {
         return Err(invalid("storage.path", "must not be empty".into()));
@@ -249,7 +401,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config, ConfigError> {
 /// file is normal; nothing is created.
 pub fn resolve(ov: &Overrides) -> Result<Effective, ConfigError> {
     let home = home_dir()?;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| diskdrift_platform::system_volume_root());
     resolve_with(ov, &home, &cwd)
 }
 
@@ -264,17 +416,31 @@ pub fn resolve_with(ov: &Overrides, home: &Path, cwd: &Path) -> Result<Effective
         Err(e) if e.kind() == io::ErrorKind::NotFound && config_path.source == Source::Default => (None, false),
         Err(source) => return Err(ConfigError::Read { path: config_path.value.clone(), source }),
     };
-    let cfg_dir = config_path.value.parent().unwrap_or(Path::new("/")).to_path_buf();
+    let system_root = diskdrift_platform::system_volume_root();
+    let cfg_dir = config_path.value.parent().unwrap_or(system_root.as_path()).to_path_buf();
     let file = |present: bool| if present { Source::ConfigFile } else { Source::Default };
     let defaults = Config::default();
     let c = cfg.as_ref().unwrap_or(&defaults);
 
-    let storage_path = if let Some(db) = &ov.db {
-        Sourced::new(expand_path(&db.to_string_lossy(), home, cwd), Source::CommandLine)
+    let (storage_path_native, storage_path) = if let Some(db) = &ov.db {
+        let display = db.to_string_lossy().into_owned();
+        let path = diskdrift_platform::native_path(db.as_os_str());
+        let (exact, expanded) = effective_native_path(&path, &display, home, cwd);
+        (Sourced::new(exact, Source::CommandLine), Sourced::new(expanded, Source::CommandLine))
     } else if let Some(p) = cfg.as_ref().and_then(|c| c.storage.path.as_deref()) {
-        Sourced::new(expand_path(p, home, &cfg_dir), Source::ConfigFile)
+        let fallback = diskdrift_platform::native_path(std::ffi::OsStr::new(p));
+        let exact = cfg.as_ref().and_then(|c| c.storage.path_native.as_ref()).unwrap_or(&fallback);
+        let (exact, expanded) = effective_native_path(exact, p, home, &cfg_dir);
+        (Sourced::new(exact, Source::ConfigFile), Sourced::new(expanded, Source::ConfigFile))
     } else {
-        Sourced::new(app_dir.join("data"), Source::Default)
+        let path = app_dir.join("data");
+        (Sourced::new(diskdrift_platform::native_path(path.as_os_str()), Source::Default), Sourced::new(path, Source::Default))
+    };
+    let root_source = file(exists && c.scan.default_root != defaults.scan.default_root);
+    let (default_root_native, default_root) = {
+        let (exact, path) = effective_native_path(&c.scan.default_root_native.path, &c.scan.default_root, home, &cfg_dir);
+        let root = NativeRoot { path: exact, root_kind: c.scan.default_root_native.root_kind, verbatim: c.scan.default_root_native.verbatim };
+        (Sourced::new(root, root_source), Sourced::new(path, root_source))
     };
     let threads = match ov.threads {
         Some(t) => Sourced::new(t, Source::CommandLine),
@@ -287,10 +453,8 @@ pub fn resolve_with(ov: &Overrides, home: &Path, cwd: &Path) -> Result<Effective
     Ok(Effective {
         home: home.to_path_buf(),
         config_exists: exists,
-        default_root: Sourced::new(
-            expand_path(&c.scan.default_root, home, &cfg_dir),
-            file(exists && c.scan.default_root != defaults.scan.default_root),
-        ),
+        default_root,
+        default_root_native,
         stay_on_filesystem: Sourced::new(
             c.scan.stay_on_filesystem,
             file(exists && c.scan.stay_on_filesystem != defaults.scan.stay_on_filesystem),
@@ -312,6 +476,7 @@ pub fn resolve_with(ov: &Overrides, home: &Path, cwd: &Path) -> Result<Effective
         },
         config_path,
         storage_path,
+        storage_path_native,
         threads,
         size_units,
     })
@@ -332,7 +497,7 @@ impl Effective {
 
     /// Resolves the settings again (after the config file was saved).
     pub fn reload(&self) -> Result<Effective, ConfigError> {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let cwd = std::env::current_dir().unwrap_or_else(|_| diskdrift_platform::system_volume_root());
         resolve_with(&self.overrides(), &self.home, &cwd)
     }
 }
@@ -447,11 +612,17 @@ impl Field {
         };
         let number = || v.parse::<usize>().map_err(|_| format!("{}: expected a whole number", self.key));
         match self.key {
-            "storage.path" => c.storage.path = (!v.is_empty()).then(|| v.to_string()),
+            "storage.path" => {
+                c.storage.path = (!v.is_empty()).then(|| v.to_string());
+                c.storage.path_native = None;
+            }
             "storage.keepLast" => c.storage.keep_last = number()?,
             "storage.keepWeekly" => c.storage.keep_weekly = number()?,
             "storage.keepMonthly" => c.storage.keep_monthly = number()?,
-            "scan.defaultRoot" => c.scan.default_root = v.to_string(),
+            "scan.defaultRoot" => {
+                c.scan.default_root = v.to_string();
+                c.scan.default_root_native_tagged = false;
+            }
             "scan.exclude" => c.scan.exclude = v.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
             "scan.stayOnFilesystem" => c.scan.stay_on_filesystem = flag()?,
             "scan.threads" => c.scan.threads = number()?,
@@ -535,6 +706,7 @@ impl Field {
 }
 
 /// Creates the user-only directory `dir` (and parents) if missing.
+#[cfg(unix)]
 pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if dir.is_dir() {
@@ -542,6 +714,15 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     }
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Creates the directory tree on targets without Unix permission APIs.
+#[cfg(not(unix))]
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::DirBuilder::new().recursive(true).create(dir)
 }
 
 /// `config init`: writes the template without overwriting an existing file.
@@ -588,6 +769,21 @@ mod tests {
     }
 
     #[test]
+    fn create_private_dir_creates_nested_directory() {
+        let t = TestDir::new("cfg-private-dir");
+        let dir = t.path().join("one/two");
+
+        create_private_dir(&dir).unwrap();
+
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dir).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+    }
+
+    #[test]
     fn precedence_cli_over_config_over_default() {
         let t = TestDir::new("cfg-precedence");
         let cfg = write(&t, r#"{"schemaVersion":1,"storage":{"path":"store"},"scan":{"threads":3},"output":{"sizeUnits":"binary"}}"#);
@@ -614,6 +810,95 @@ mod tests {
     }
 
     #[test]
+    fn legacy_string_roots_expand_before_native_validation() {
+        let t = TestDir::new("cfg-legacy-tilde-root");
+        for root in ["~", "~/Projects"] {
+            let cfg = write(&t, &format!(r#"{{"schemaVersion":1,"scan":{{"defaultRoot":"{root}"}}}}"#));
+            let effective = resolve_with(
+                &Overrides { config: Some(cfg), ..Default::default() },
+                Path::new("/Users/x"),
+                Path::new("/"),
+            )
+            .unwrap();
+            assert_eq!(effective.default_root.value, expand_path(root, Path::new("/Users/x"), t.path()));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn legacy_string_roots_stay_strings_when_saved() {
+        let t = TestDir::new("cfg-legacy-root-save");
+        for root in ["/", "/tmp"] {
+            let p = write(&t, &format!(r#"{{"schemaVersion":1,"scan":{{"defaultRoot":"{root}"}}}}"#));
+            let cfg = load_file(&p).unwrap();
+            save(&p, &cfg).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+            assert_eq!(value["scan"]["defaultRoot"], root);
+        }
+    }
+
+    #[test]
+    fn legacy_string_roots_reject_empty_and_relative_values() {
+        for root in ["", "relative"] {
+            let err = parse(
+                &format!(r#"{{"schemaVersion":1,"scan":{{"defaultRoot":"{root}"}}}}"#),
+                Path::new("config.json"),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{root:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn storage_path_rejects_a_native_root_object() {
+        let err = parse(
+            r#"{"schemaVersion":1,"storage":{"path":{"path":"/tmp","pathEncoding":"unix_bytes","rootKind":"posix"}}}"#,
+            Path::new("config.json"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn storage_path_rejects_explicit_null() {
+        for path in ["null", "42"] {
+            let err = parse(&format!(r#"{{"schemaVersion":1,"storage":{{"path":{path}}}}}"#), Path::new("config.json")).unwrap_err();
+            assert!(matches!(err, ConfigError::Invalid { .. }), "{path}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn posix_native_root_rejects_present_verbatim() {
+        let err = parse(
+            r#"{"schemaVersion":1,"scan":{"defaultRoot":{"path":"/tmp","pathEncoding":"unix_bytes","rootKind":"posix","verbatim":false}}}"#,
+            Path::new("config.json"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn scan_default_root_rejects_a_native_path_object() {
+        let err = parse(
+            r#"{"schemaVersion":1,"scan":{"defaultRoot":{"path":"/tmp","pathEncoding":"unix_bytes"}}}"#,
+            Path::new("config.json"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+    }
+
+    #[test]
+    fn tagged_native_config_schemas_reject_unknown_fields() {
+        for (text, field) in [
+            (r#"{"schemaVersion":1,"storage":{"path":{"path":"/tmp","pathEncoding":"unix_bytes","extra":true}}}"#, "storage.path"),
+            (r#"{"schemaVersion":1,"scan":{"defaultRoot":{"path":"/","pathEncoding":"unix_bytes","rootKind":"posix","extra":true}}}"#, "scan.defaultRoot"),
+        ] {
+            let err = parse(text, Path::new("config.json")).unwrap_err();
+            assert!(matches!(&err, ConfigError::Invalid { .. }), "{field}: {err:?}");
+        }
+    }
+
+    #[test]
     fn invalid_config_names_the_field() {
         let t = TestDir::new("cfg-invalid");
         for (text, field) in [
@@ -635,6 +920,82 @@ mod tests {
                 other => panic!("{text}: unexpected {other}"),
             }
         }
+    }
+
+    #[test]
+    fn exact_tagged_paths_are_accepted_in_config() {
+        let cfg = parse(
+            r#"{"schemaVersion":1,"scan":{"defaultRoot":{"path":"/tmp/�","pathEncoding":"unix_bytes","pathBytes":"L3RtcC//","rootKind":"posix"}}}"#,
+            Path::new("config.json"),
+        )
+        .unwrap();
+        assert_eq!(cfg.scan.default_root, "/tmp/�");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invalid_unix_bytes_survive_config_load_and_save() {
+        let t = TestDir::new("cfg-exact-unix");
+        let p = write(&t, r#"{"schemaVersion":1,"scan":{"defaultRoot":{"path":"/tmp/�","pathEncoding":"unix_bytes","pathBytes":"L3RtcC//","rootKind":"posix"}}}"#);
+        let cfg = load_file(&p).unwrap();
+        let effective = resolve_with(&Overrides { config: Some(p.clone()), ..Default::default() }, t.path(), Path::new("/")).unwrap();
+        assert_eq!(effective.default_root_native.value.path, NativePath::unix(b"/tmp/\xff".to_vec()));
+        assert_eq!(effective.default_root.value.as_os_str().as_encoded_bytes(), b"/tmp/\xff");
+        save(&p, &cfg).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(value["scan"]["defaultRoot"]["pathBytes"], "L3RtcC//");
+        assert_eq!(load_file(&p).unwrap(), cfg);
+    }
+
+    #[test]
+    fn lone_surrogates_survive_windows_config_load_and_save() {
+        let t = TestDir::new("cfg-exact-windows");
+        let p = write(&t, r#"{"schemaVersion":1,"scan":{"defaultRoot":{"path":"C:\\�","pathEncoding":"windows_utf16le","pathWide":"QwA6AFwAANg=","rootKind":"drive","verbatim":false}}}"#);
+        let cfg = load_file(&p).unwrap();
+        save(&p, &cfg).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(value["scan"]["defaultRoot"]["pathWide"], "QwA6AFwAANg=");
+        assert_eq!(load_file(&p).unwrap(), cfg);
+    }
+
+    #[test]
+    fn windows_config_roots_are_validated_without_posix_assumptions() {
+        let cfg = parse(
+            r#"{"schemaVersion":1,"scan":{"defaultRoot":{"path":"\\\\server\\share\\","pathEncoding":"windows_utf16le","pathWide":"XABcAHMAZQByAHYAZQByAFwAcwBoAGEAcgBlAFwA","rootKind":"unc","verbatim":false}}}"#,
+            Path::new("config.json"),
+        ).unwrap();
+        assert_eq!(cfg.scan.default_root, r#"\\server\share\"#);
+    }
+
+    #[test]
+    fn editing_storage_path_clears_stale_native_value() {
+        let field = FIELDS.iter().find(|f| f.key == "storage.path").unwrap();
+        let mut cfg = Config::default();
+        cfg.storage.path = Some(r#"C:\old"#.into());
+        cfg.storage.path_native = Some(NativePath::windows(r#"C:\old"#.encode_utf16().collect()));
+
+        field.set(&mut cfg, r#"C:\new"#).unwrap();
+
+        assert_eq!(cfg.storage.path.as_deref(), Some(r#"C:\new"#));
+        assert_eq!(cfg.storage.path_native, None);
+    }
+
+    #[test]
+    fn windows_drive_storage_paths_are_not_resolved_relative_to_config() {
+        let t = TestDir::new("cfg-windows-drive-path");
+        let p = write(&t, r#"{"schemaVersion":1,"storage":{"path":"C:\\store"}}"#);
+        let effective = resolve_with(&Overrides { config: Some(p), ..Default::default() }, t.path(), Path::new("/cwd")).unwrap();
+
+        assert_eq!(effective.storage_path.value, PathBuf::from(r#"C:\store"#));
+    }
+
+    #[test]
+    fn default_root_comes_from_the_platform_adapter() {
+        let root = diskdrift_platform::system_volume_root();
+        let cfg = Config::default();
+
+        assert_eq!(cfg.scan.default_root, root.display().to_string());
+        assert_eq!(cfg.scan.default_root_native.path, diskdrift_platform::native_path(root.as_os_str()));
     }
 
     #[test]
@@ -679,19 +1040,24 @@ mod tests {
 
         field("scan.defaultRoot").set(&mut c, "relative").unwrap();
         assert!(matches!(save(&p, &c), Err(ConfigError::Invalid { .. })), "invalid values are not written");
+        #[cfg(unix)]
         assert_eq!(load_file(&p).unwrap().scan.default_root, "/");
     }
 
     #[test]
     fn init_writes_template_once() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let t = TestDir::new("cfg-init");
         let p = t.path().join("app/config.json");
         init(&p).unwrap();
         let cfg = parse(&std::fs::read_to_string(&p).unwrap(), &p).unwrap();
         assert_eq!(cfg, Config::template());
-        let mode = std::fs::metadata(t.path().join("app")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
+        #[cfg(unix)]
+        {
+            let mode = std::fs::metadata(t.path().join("app")).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
         assert!(matches!(init(&p), Err(ConfigError::Exists(_))));
     }
 }

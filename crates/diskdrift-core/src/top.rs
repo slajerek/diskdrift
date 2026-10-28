@@ -153,7 +153,8 @@ pub fn top(stream: RecordStream<'_>, opts: &TopOptions) -> io::Result<TopReport>
 
     for rec in stream {
         let rec = rec?;
-        stack.set(rec.depth, &rec.name)?;
+        let name = rec.name.as_unix_bytes().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "portable top requires Unix names"))?;
+        stack.set(rec.depth, name)?;
         if let Some(p) = &opts.prefix
             && !stack.starts_with(p) {
                 continue;

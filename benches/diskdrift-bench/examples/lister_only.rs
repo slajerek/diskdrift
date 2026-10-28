@@ -13,7 +13,7 @@ fn rec(l: &dyn DirLister, p: &Path, dev: u64, n: &mut u64, buf: &mut Vec<diskdri
     *n += children.len() as u64;
     for c in children {
         if c.kind == Kind::Dir && c.dev == dev && !c.is_mount_point {
-            rec(l, &p.join(std::ffi::OsStr::new(std::str::from_utf8(&c.name).unwrap_or("?"))), dev, n, buf);
+            rec(l, &p.join(std::ffi::OsStr::new(std::str::from_utf8(c.name.as_unix_bytes().unwrap_or_default()).unwrap_or("?"))), dev, n, buf);
         }
     }
 }

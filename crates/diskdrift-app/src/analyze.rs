@@ -328,6 +328,7 @@ fn assemble(path: &Path, measured: Vec<(String, bool, MeasureStatus, Acc)>, clas
 
 /// The same analysis from the latest scan, without walking the folder: `None`
 /// when that scan is older than `max_age` seconds or does not contain `path`.
+#[cfg(unix)]
 pub fn analyze_from_scan(settings: &Effective, path: &Path, limit: usize, max_age: i64, now: i64) -> Result<Option<DirAnalysis>> {
     use diskdrift_core::paths::components_under;
     use std::os::unix::ffi::OsStrExt;
@@ -391,6 +392,11 @@ pub fn analyze_from_scan(settings: &Effective, path: &Path, limit: usize, max_ag
         sizes_from: Some(source),
         notes,
     }))
+}
+
+#[cfg(not(unix))]
+pub fn analyze_from_scan(_settings: &Effective, _path: &Path, _limit: usize, _max_age: i64, _now: i64) -> Result<Option<DirAnalysis>> {
+    Ok(None)
 }
 
 /// "3 days", "5 months", "2.1 years".

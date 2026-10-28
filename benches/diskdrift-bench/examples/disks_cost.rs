@@ -41,10 +41,16 @@ fn template(name: String, root: &str, disk: Option<&str>, v: u32) -> SnapshotMet
     }
 }
 
+#[cfg(unix)]
 fn rss_mb() -> f64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     ru.ru_maxrss as f64 / 1e6
+}
+
+#[cfg(not(unix))]
+fn rss_mb() -> f64 {
+    0.0
 }
 
 fn ms<T>(f: impl FnOnce() -> T) -> (T, f64) {
@@ -61,7 +67,7 @@ fn write(store: &Store, params: Params, v: u32, m: SnapshotMeta) -> f64 {
         let mut w = store.begin(lock, m, None).unwrap();
         for mut r in Gen::new(params, v) {
             if r.depth == 0 {
-                r.name.clone_from(&root);
+                r.name = diskdrift_core::native::NativeName::unix(root.clone());
             }
             w.push(&r).unwrap();
         }
@@ -179,7 +185,7 @@ fn main() {
                 for r in store.records(id).unwrap() {
                     let r = r.unwrap();
                     entries += 1;
-                    if String::from_utf8_lossy(&r.name).to_lowercase().contains(&q) {
+                    if String::from_utf8_lossy(r.name.as_unix_bytes().unwrap_or_default()).to_lowercase().contains(&q) {
                         n += 1;
                     }
                 }

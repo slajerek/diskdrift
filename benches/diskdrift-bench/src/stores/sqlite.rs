@@ -97,7 +97,7 @@ impl SqliteStore {
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
     Ok(Record {
         depth: row.get::<_, i64>(0)? as u16,
-        name: row.get(1)?,
+        name: diskdrift_core::native::NativeName::unix(row.get::<_, Vec<u8>>(1)?),
         kind: match row.get::<_, i64>(2)? {
             0 => Kind::File,
             1 => Kind::Dir,
@@ -108,10 +108,14 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
         size: row.get::<_, i64>(4)? as u64,
         alloc: row.get::<_, i64>(5)? as u64,
         mtime: row.get(6)?,
+        mtime_nanos: 0,
         btime: row.get(7)?,
+        btime_nanos: 0,
         ino: row.get::<_, i64>(8)? as u64,
         nlink: row.get::<_, i64>(9)? as u32,
         vol: row.get::<_, i64>(10)? as u16,
+        file_id: diskdrift_core::record::FileId { low: row.get::<_, i64>(8)? as u64, high: 0 },
+        available: diskdrift_core::record::EntryFields::KIND.union(diskdrift_core::record::EntryFields::LOGICAL_SIZE).union(diskdrift_core::record::EntryFields::ALLOCATED_SIZE).union(diskdrift_core::record::EntryFields::MTIME).union(diskdrift_core::record::EntryFields::FILE_ID).union(diskdrift_core::record::EntryFields::LINK_COUNT),
     })
 }
 
@@ -268,7 +272,7 @@ impl Store for SqliteStore {
                     seq,
                     parent,
                     r.depth,
-                    r.name,
+                    r.name.as_unix_bytes().unwrap_or_default(),
                     r.kind as u8,
                     r.flags,
                     r.size as i64,
@@ -315,7 +319,7 @@ impl Store for SqliteStore {
             let mut buf = Vec::new();
             for (seq, op) in ops.enumerate() {
                 buf.clear();
-                enc.encode(&op, &mut buf);
+                enc.encode(&op, &mut buf)?;
                 st.execute(params![id, seq as i64, buf]).map_err(err)?;
                 n += 1;
             }

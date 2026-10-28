@@ -171,7 +171,7 @@ mod tests {
         let mut other = template("b");
         other.root = "/elsewhere".into();
         let mut w = s.begin(lock, other, None).unwrap();
-        w.push(&Record { name: b"/elsewhere".to_vec(), kind: Kind::Dir, ..Default::default() }).unwrap();
+        w.push(&Record { name: diskdrift_core::native::NativeName::unix(b"/elsewhere".to_vec()), kind: Kind::Dir, ..Default::default() }).unwrap();
         let (_, rb) = w.commit_and_rebase(WalkReport::default(), None, "now".into()).unwrap();
         assert_eq!(rb.unwrap(), Rebase::Nothing);
     }
@@ -246,7 +246,7 @@ mod tests {
         let prefix = vec![b"/r".to_vec(), b"d17".to_vec()];
         let got: Vec<Record> = s.records_under(m.id, &prefix).unwrap().map(Result::unwrap).collect();
         assert_eq!(got.len(), 201);
-        assert_eq!(got[0].name, b"d17");
+        assert_eq!(got[0].name, diskdrift_core::native::NativeName::unix(b"d17".to_vec()));
         let none: Vec<Record> = s.records_under(m.id, &[b"/r".to_vec(), b"zz".to_vec()]).unwrap().map(Result::unwrap).collect();
         assert!(none.is_empty());
         let _ = boxed(Vec::new());
@@ -473,7 +473,7 @@ mod tests {
 
     fn rooted(recs: &[Record], root: &str) -> Vec<Record> {
         let mut v = recs.to_vec();
-        v[0].name = root.as_bytes().to_vec();
+        v[0].name = diskdrift_core::native::NativeName::unix(root.as_bytes().to_vec());
         v
     }
 

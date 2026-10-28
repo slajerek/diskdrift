@@ -106,7 +106,7 @@ fn fold(text: &[u8], lower: bool, out: &mut Vec<u8>) {
 }
 
 enum How {
-    Part(memchr::memmem::Finder<'static>),
+    Part(Box<memchr::memmem::Finder<'static>>),
     Re(Box<Regex>),
 }
 
@@ -192,7 +192,7 @@ impl Matcher {
             } else {
                 fold_into(pattern.as_bytes(), &mut folded);
             }
-            How::Part(memchr::memmem::Finder::new(&folded).into_owned())
+            How::Part(Box::new(memchr::memmem::Finder::new(&folded).into_owned()))
         };
         Ok(Matcher { how, on_path, exact: q.exact })
     }
@@ -519,11 +519,11 @@ fn search_snapshot(store: &Store, g: &Group, m: &SnapshotMeta, q: &Query, matche
             break;
         }
         found.entries += 1;
-        stack.set(r.depth, &r.name).map_err(|e| AppError::Runtime(e.to_string()))?;
+        stack.set(r.depth, r.name.as_unix_bytes().ok_or_else(|| AppError::Runtime("Windows names are not supported by DDS1 search".into()))?).map_err(|e| AppError::Runtime(e.to_string()))?;
         if r.depth == 0 || !passes(q, &r) {
             continue;
         }
-        let hit = if matcher.on_path() { matcher.is_match(&rel_path(stack.components()), &mut buf) } else { matcher.is_match(&r.name, &mut buf) };
+        let hit = if matcher.on_path() { matcher.is_match(&rel_path(stack.components()), &mut buf) } else { matcher.is_match(r.name.as_unix_bytes().ok_or_else(|| AppError::Runtime("Windows names are not supported by DDS1 search".into()))?, &mut buf) };
         if !hit {
             continue;
         }
@@ -729,15 +729,16 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
                 if op.record.depth == 0 {
                     continue;
                 }
+                let name = op.record.name.as_unix_bytes().ok_or_else(|| AppError::Runtime("Windows names are not supported by DDS1 search".into()))?;
                 let rel = || {
                     let mut r = rel_path(&op.parent);
                     if !r.is_empty() {
                         r.push(b'/');
                     }
-                    r.extend_from_slice(&op.record.name);
+                    r.extend_from_slice(name);
                     r
                 };
-                let hit = if matcher.on_path() { matcher.is_match(&rel(), &mut buf) } else { matcher.is_match(&op.record.name, &mut buf) };
+                let hit = if matcher.on_path() { matcher.is_match(&rel(), &mut buf) } else { matcher.is_match(name, &mut buf) };
                 if !hit || !(op.kind == OpKind::Remove || passes(q, &op.record)) {
                     continue;
                 }
@@ -771,7 +772,9 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
     let mut appeared: HashMap<(usize, usize, Vec<u8>), Vec<u8>> = HashMap::new();
     for ((gi, rel), evs) in &events {
         for e in evs.iter().filter(|e| e.kind == OpKind::Remove) {
-            appeared.entry((*gi, e.pair, e.record.name.clone())).or_insert_with(|| rel.clone());
+            if let Some(name) = e.record.name.as_unix_bytes() {
+                appeared.entry((*gi, e.pair, name.to_vec())).or_insert_with(|| rel.clone());
+            }
         }
     }
     let current_keys: HashSet<(String, Vec<u8>)> = cur
@@ -809,10 +812,10 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
             life.last_seen = ScanRef::of(older);
             life.gone_in = Some(ScanRef::of(newer));
             life.uncertain = uncertainty(older, newer, &rel);
-            life.moved_to = appeared
-                .get(&(gi, first.pair, first.record.name.clone()))
+            life.moved_to = first.record.name.as_unix_bytes().and_then(|name| appeared
+                .get(&(gi, first.pair, name.to_vec()))
                 .filter(|to| **to != rel)
-                .map(|to| String::from_utf8_lossy(&full_path(&newer.root, to)).into_owned());
+                .map(|to| String::from_utf8_lossy(&full_path(&newer.root, to)).into_owned()));
         }
         for e in evs.iter().skip(usize::from(!alive)) {
             match e.kind {
@@ -1034,10 +1037,10 @@ mod tests {
             };
             let lock = f.store.lock().unwrap();
             let mut w = f.store.begin(lock, template, None).unwrap();
-            w.push(&Record { depth: 0, name: root.as_bytes().to_vec(), kind: Kind::Dir, ..Default::default() }).unwrap();
+            w.push(&Record { depth: 0, name: diskdrift_core::native::NativeName::unix(root.as_bytes().to_vec()), kind: Kind::Dir, ..Default::default() }).unwrap();
             for (comps, kind, size) in &paths {
                 let name = comps.last().unwrap().clone();
-                w.push(&Record { depth: comps.len() as u16, name, kind: *kind, size: *size, alloc: *size, mtime: 1_700_000_000, ..Default::default() }).unwrap();
+                w.push(&Record { depth: comps.len() as u16, name: diskdrift_core::native::NativeName::unix(name), kind: *kind, size: *size, alloc: *size, mtime: 1_700_000_000, ..Default::default() }).unwrap();
             }
             let (m, _) = w.commit_and_rebase(WalkReport::default(), None, at.into()).unwrap();
             m.id

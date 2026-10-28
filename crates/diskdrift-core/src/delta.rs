@@ -33,7 +33,7 @@ impl DeltaOp {
         // Compare parent + [name] against comps without allocating.
         let own_len = self.parent.len() + 1;
         for (i, theirs) in comps.iter().enumerate().take(own_len) {
-            let mine: &[u8] = if i < self.parent.len() { &self.parent[i] } else { &self.record.name };
+            let mine: &[u8] = if i < self.parent.len() { &self.parent[i] } else { self.record.name.as_unix_bytes().expect("DDS1 delta requires Unix names") };
             match mine.cmp(theirs.as_slice()) {
                 Ordering::Equal => continue,
                 o => return o,
@@ -54,7 +54,7 @@ impl OpEncoder {
         Self::default()
     }
 
-    pub fn encode(&mut self, op: &DeltaOp, out: &mut Vec<u8>) {
+    pub fn encode(&mut self, op: &DeltaOp, out: &mut Vec<u8>) -> io::Result<()> {
         out.push(op.kind as u8);
         let shared = self.prev_parent.iter().zip(op.parent.iter()).take_while(|(a, b)| a == b).count();
         put_varint(out, shared as u64);
@@ -65,12 +65,16 @@ impl OpEncoder {
         }
         if op.kind == OpKind::Remove {
             put_varint(out, op.record.name.len() as u64);
-            out.extend_from_slice(&op.record.name);
+            let Some(name) = op.record.name.as_unix_bytes() else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "DDS1 only supports Unix-native names"));
+            };
+            out.extend_from_slice(name);
         } else {
-            op.record.encode(out);
+            op.record.encode_dds1(out)?;
         }
         self.prev_parent.truncate(shared);
         self.prev_parent.extend(op.parent[shared..].iter().cloned());
+        Ok(())
     }
 }
 
@@ -115,7 +119,7 @@ impl OpDecoder {
             if buf.len() < len {
                 return Err(corrupt("name length"));
             }
-            let r = Record { depth: self.prev_parent.len() as u16, name: buf[..len].to_vec(), ..Default::default() };
+            let r = Record { depth: self.prev_parent.len() as u16, name: crate::native::NativeName::unix(buf[..len].to_vec()), ..Default::default() };
             *buf = &buf[len..];
             r
         } else {
@@ -177,7 +181,7 @@ impl<'a> Apply<'a> {
     fn advance_base(&mut self) -> io::Result<()> {
         self.base_cur = self.base.next().transpose()?;
         if let Some(r) = &self.base_cur {
-            self.base_stack.set(r.depth, &r.name)?;
+            self.base_stack.set(r.depth, r.name.as_unix_bytes().ok_or_else(|| corrupt("Windows names are not valid in DDS1 deltas"))?)?;
         }
         Ok(())
     }
@@ -259,7 +263,7 @@ impl<'a> PushDelta<'a> {
     fn advance_base(&mut self) -> io::Result<()> {
         self.base_cur = self.base.next().transpose()?;
         if let Some(r) = &self.base_cur {
-            self.base_stack.set(r.depth, &r.name)?;
+            self.base_stack.set(r.depth, r.name.as_unix_bytes().ok_or_else(|| corrupt("Windows names are not valid in DDS1 deltas"))?)?;
         }
         Ok(())
     }
@@ -288,7 +292,7 @@ impl<'a> PushDelta<'a> {
             self.started = true;
             self.advance_base()?;
         }
-        self.new_stack.set(rec.depth, &rec.name)?;
+            self.new_stack.set(rec.depth, rec.name.as_unix_bytes().ok_or_else(|| corrupt("Windows names are not valid in DDS1 deltas"))?)?;
         loop {
             let Some(b) = &self.base_cur else {
                 return self.emit_new(OpKind::Add, rec, out);
@@ -338,9 +342,9 @@ pub fn compute(base: RecordStream<'_>, new: RecordStream<'_>) -> io::Result<Vec<
 /// Ordering helper used by stores to validate op streams.
 pub fn op_order(a: &DeltaOp, b: &DeltaOp) -> Ordering {
     let mut pa = a.parent.clone();
-    pa.push(a.record.name.clone());
+    pa.push(a.record.name.as_unix_bytes().expect("DDS1 delta requires Unix names").to_vec());
     let mut pb = b.parent.clone();
-    pb.push(b.record.name.clone());
+    pb.push(b.record.name.as_unix_bytes().expect("DDS1 delta requires Unix names").to_vec());
     compare_paths(&pa, &pb)
 }
 
@@ -358,7 +362,7 @@ mod tests {
         let mut enc = OpEncoder::new();
         let mut buf = Vec::new();
         for op in &ops {
-            enc.encode(op, &mut buf);
+            enc.encode(op, &mut buf).unwrap();
         }
         let mut dec = OpDecoder::new();
         let mut s = buf.as_slice();
@@ -391,9 +395,10 @@ mod tests {
         for r in new.iter_mut() {
             if let Some(b) = base.iter().find(|b| b.name == r.name && b.depth == r.depth) {
                 r.ino = b.ino;
+                r.file_id = b.file_id;
             }
         }
-        new.iter_mut().find(|r| r.name == b"x").unwrap().flags = flags::HARDLINK_DUP;
+        new.iter_mut().find(|r| r.name == crate::native::NativeName::unix(b"x".to_vec())).unwrap().flags = flags::HARDLINK_DUP;
         roundtrip(base.clone(), new);
         roundtrip(base.clone(), base.clone());
         roundtrip(base.clone(), stream(&[("", D, 0)]));
@@ -406,7 +411,7 @@ mod tests {
         let bad = DeltaOp {
             kind: OpKind::Add,
             parent: vec![b"/r".to_vec()],
-            record: Record { depth: 1, name: b"a".to_vec(), ..Default::default() },
+            record: Record { depth: 1, name: crate::native::NativeName::unix(b"a".to_vec()), ..Default::default() },
         };
         let r: io::Result<Vec<Record>> = Apply::new(boxed(base), Box::new(std::iter::once(Ok(bad)))).collect();
         assert!(r.is_err());
@@ -447,7 +452,7 @@ mod tests {
         t.iter()
             .map(|(comps, dir, size)| Record {
                 depth: (comps.len() - 1) as u16,
-                name: comps.last().unwrap().clone(),
+                name: crate::native::NativeName::unix(comps.last().unwrap().clone()),
                 kind: if *dir { D } else { F },
                 size: *size,
                 alloc: size.div_ceil(4096) * 4096,
@@ -465,7 +470,7 @@ mod tests {
             let (na, nb) = (rng.usize(1..60), rng.usize(1..60));
             let a = records(&random_tree(&mut rng, na));
             let b = records(&random_tree(&mut rng, nb));
-            let mut root = vec![Record { depth: 0, name: b"/r".to_vec(), kind: D, ..Default::default() }];
+            let mut root = vec![Record { depth: 0, name: crate::native::NativeName::unix(b"/r".to_vec()), kind: D, ..Default::default() }];
             let a: Vec<Record> = root.iter().cloned().chain(a).collect();
             root.extend(b);
             let b = root;
