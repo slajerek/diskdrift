@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Benchmark / profiling output
+/benches/results/
+/criterion/
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data*
+
+# Local DiskDrift data produced while testing (real snapshots stay out of git)
+.diskdrift/
+*.db
+*.db-wal
+*.db-shm
+*.mdb
+
+# Logs
+*.log
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude Code local state (settings.json is tracked)
+.claude/*
+!.claude/settings.json
+__pycache__/

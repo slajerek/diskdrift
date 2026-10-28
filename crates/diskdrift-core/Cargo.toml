@@ -1,0 +1,20 @@
+[package]
+name = "diskdrift-core"
+description = "Scanner, diff, accounting and models for DiskDrift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+fastrand.workspace = true
+
+[features]
+testutil = []
