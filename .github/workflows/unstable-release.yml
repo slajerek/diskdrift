@@ -11,14 +11,14 @@ permissions: {}
 jobs:
   prepare:
     name: resolve devel candidate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
     outputs:
       candidate_sha: ${{ steps.resolve.outputs.candidate_sha }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: devel
           fetch-depth: 1
@@ -79,9 +79,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest, windows-latest]
+        os: [macos-latest, ubuntu-24.04, windows-latest]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.prepare.outputs.candidate_sha }}
 
@@ -172,7 +172,7 @@ jobs:
 
       - name: Upload native release
         if: ${{ success() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: unstable-build-${{ matrix.os }}
           path: release/
@@ -182,7 +182,7 @@ jobs:
     name: publish unstable
     needs: [prepare, build]
     if: ${{ needs.prepare.result == 'success' && needs.build.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       pull-requests: read
@@ -190,7 +190,7 @@ jobs:
       group: unstable-release
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.prepare.outputs.candidate_sha }}
 
@@ -215,7 +215,7 @@ jobs:
           mkdir candidate
 
       - name: Download native releases
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           pattern: unstable-build-*
           path: candidate
