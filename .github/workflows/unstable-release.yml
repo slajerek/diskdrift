@@ -60,8 +60,8 @@ jobs:
             --paginate \
             --slurp \
             --header 'Accept: application/vnd.github+json' \
-            "repos/$REPO/commits/$candidate_sha/pulls?base=devel" \
-            --jq 'add | any(.[]; .base.ref == "devel" and (.merged_at != null))')"
+            "repos/$REPO/commits/$candidate_sha/pulls?base=devel" |
+            jq -r 'add | any(.[]; .base.ref == "devel" and (.merged_at != null))')"
           if [ "$merged_pr" != true ]; then
             echo "devel SHA is not associated with a merged PR targeting devel" >&2
             exit 1
