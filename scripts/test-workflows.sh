@@ -84,6 +84,8 @@ jobs = unstable.fetch("jobs")
   }, "#{job_name} permissions must be contents/read and pull-requests/read")
 end
 prepare = jobs.fetch("prepare")
+assert(prepare.fetch("runs-on") == "ubuntu-24.04",
+       "prepare must use the pinned Ubuntu 24.04 runner")
 prepare_checkout = prepare.fetch("steps").find do |step|
   step["uses"].to_s.start_with?("actions/checkout@")
 end
@@ -98,6 +100,8 @@ assert(prepare_run.include?("PUSH_SHA") &&
        prepare_run.include?("[ \"$EVENT_NAME\" = push ]"),
        "prepare must retain push SHA validation")
 publish = jobs.fetch("publish")
+assert(publish.fetch("runs-on") == "ubuntu-24.04",
+       "publish must use the pinned Ubuntu 24.04 runner")
 assert(publish.fetch("permissions") == {
   "contents" => "write",
   "pull-requests" => "read"
@@ -116,6 +120,10 @@ assert(publish.fetch("concurrency") == {
 }, "publish concurrency must serialize unstable releases without cancellation")
 
 build_job = jobs.fetch("build")
+assert(build_job.fetch("strategy").fetch("matrix").fetch("os").include?("ubuntu-24.04"),
+       "unstable builds must use the pinned Ubuntu 24.04 runner")
+assert(!unstable_text.include?("ubuntu-latest"),
+       "unstable workflow must not use the migrating ubuntu-latest label")
 build_text = build_job.to_s
 candidate_ref = "${{ needs.prepare.outputs.candidate_sha }}"
 %w[build publish].each do |job_name|
