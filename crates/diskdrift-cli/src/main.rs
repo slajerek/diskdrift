@@ -70,7 +70,11 @@ enum Units {
 enum Command {
     /// Open the full-screen terminal UI.
     Tui,
-    /// OS-reported space per volume, grouped by APFS container.
+    #[cfg_attr(
+        target_os = "macos",
+        doc = "OS-reported space per volume, grouped by APFS container."
+    )]
+    #[cfg_attr(not(target_os = "macos"), doc = "OS-reported space per volume.")]
     Usage {
         /// Include hidden system volumes.
         #[arg(long)]
@@ -78,7 +82,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Environment facts: APFS topology, permissions, configuration.
+    #[cfg_attr(
+        target_os = "macos",
+        doc = "Environment facts: APFS topology, permissions, configuration."
+    )]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        doc = "Environment facts: volume topology, permissions, configuration."
+    )]
     Info {
         #[arg(long)]
         json: bool,
@@ -439,9 +450,15 @@ impl From<ConfigError> for Failure {
 impl From<diskdrift_app::snapshots::AppError> for Failure {
     fn from(e: diskdrift_app::snapshots::AppError) -> Self {
         if let diskdrift_app::snapshots::AppError::DiskDoubt(why) = &e {
-            return Failure::Usage(format!("{why} Scan again with --disk same if it is that disk, or --disk new if it is another one."));
+            return Failure::Usage(format!(
+                "{why} Scan again with --disk same if it is that disk, or --disk new if it is another one."
+            ));
         }
-        if e.is_usage() { Failure::Usage(e.to_string()) } else { Failure::Runtime(e.to_string()) }
+        if e.is_usage() {
+            Failure::Usage(e.to_string())
+        } else {
+            Failure::Runtime(e.to_string())
+        }
     }
 }
 
@@ -495,7 +512,9 @@ fn init_logging(g: &Global) -> Result<(), String> {
         1 => "info",
         _ => "debug",
     };
-    let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_target(false);
+    let stderr = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_target(false);
     let file = match &g.log_file {
         Some(p) => {
             let f = std::fs::OpenOptions::new()
@@ -503,7 +522,11 @@ fn init_logging(g: &Global) -> Result<(), String> {
                 .append(true)
                 .open(p)
                 .map_err(|e| format!("cannot open log file {}: {e}", p.display()))?;
-            Some(tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f)))
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(std::sync::Mutex::new(f)),
+            )
         }
         None => None,
     };
@@ -570,7 +593,13 @@ fn find_cmd(g: &Global, args: FindArgs) -> Outcome {
         HistoryMode::Auto
     };
     let cancel = cancel_flag();
-    let cancelled = || if cancel.load(Ordering::SeqCst) { Err(Failure::Cancelled) } else { Ok(()) };
+    let cancelled = || {
+        if cancel.load(Ordering::SeqCst) {
+            Err(Failure::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
     if args.json {
         let r = search::find(&s, &q, mode, &cancel, &|_, _| {})?;
         print_json(&r)?;
@@ -590,13 +619,28 @@ fn find_cmd(g: &Global, args: FindArgs) -> Outcome {
         return cancelled();
     }
     if cur.total == 0 {
-        print_text(&format!("{}\n", diskdrift_app::text::search::SEARCHING_HISTORY))?;
+        print_text(&format!(
+            "{}\n",
+            diskdrift_app::text::search::SEARCHING_HISTORY
+        ))?;
     } else {
         print_text("\n")?;
     }
     let _ = std::io::stdout().flush();
-    let h = search::history(&s, &q, &cur, mode == HistoryMode::Always, &cancel, &|_, _| {})?;
-    print_text(&diskdrift_app::text::search::history(&h, cur.total > 0, u, now))?;
+    let h = search::history(
+        &s,
+        &q,
+        &cur,
+        mode == HistoryMode::Always,
+        &cancel,
+        &|_, _| {},
+    )?;
+    print_text(&diskdrift_app::text::search::history(
+        &h,
+        cur.total > 0,
+        u,
+        now,
+    ))?;
     cancelled()
 }
 
@@ -614,7 +658,10 @@ fn careful_cmd(g: &Global, args: CarefulArgs) -> Outcome {
     .map_err(|e| Failure::Runtime(format!("cannot start careful mode: {e}")))?;
     let cancel = cancel_flag();
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-    print_text(&format!("{}\nConnect the disks now. Ctrl-C ends careful mode (a running scan stops and its disk is ejected).\n", text::ON))?;
+    print_text(&format!(
+        "{}\nConnect the disks now. Ctrl-C ends careful mode (a running scan stops and its disk is ejected).\n",
+        text::ON
+    ))?;
     let choice = args.disk.map(|d| match d {
         DiskArg::Same => DiskChoice::Same,
         DiskArg::New => DiskChoice::New,
@@ -642,12 +689,16 @@ fn careful_cmd(g: &Global, args: CarefulArgs) -> Outcome {
         print_text(&format!("\n{}\n", text::held(&held, u, now_unix())))?;
         let action = if args.scan {
             if held.doubt.is_some() && choice.is_none() {
-                print_text("  Left held back: say with --disk same|new whether it is that disk, or scan it without --scan.\n")?;
+                print_text(
+                    "  Left held back: say with --disk same|new whether it is that disk, or scan it without --scan.\n",
+                )?;
                 continue;
             }
             "s".to_string()
         } else if interactive {
-            ask("  s scan it carefully · m mount read-only for Finder · e eject · Enter leave it held:")
+            ask(
+                "  s scan it carefully · m mount read-only for Finder · e eject · Enter leave it held:",
+            )
         } else {
             print_text("  Left held back (no terminal to ask on; --scan scans every disk).\n")?;
             continue;
@@ -656,7 +707,9 @@ fn careful_cmd(g: &Global, args: CarefulArgs) -> Outcome {
             "s" => {
                 let mut this = choice;
                 if held.doubt.is_some() && this.is_none() {
-                    this = match ask("  Is it that disk? s the same disk · n another disk:").as_str() {
+                    this = match ask("  Is it that disk? s the same disk · n another disk:")
+                        .as_str()
+                    {
                         "s" => Some(DiskChoice::Same),
                         "n" => Some(DiskChoice::New),
                         _ => {
@@ -673,7 +726,10 @@ fn careful_cmd(g: &Global, args: CarefulArgs) -> Outcome {
                 }
             }
             "m" => match careful::mount_for_finder(&guard, &held) {
-                Ok(at) => print_text(&format!("  Mounted read-only at {} (Finder shows it and cannot write to it). Eject it in Finder when done.\n", at.display()))?,
+                Ok(at) => print_text(&format!(
+                    "  Mounted read-only at {} (Finder shows it and cannot write to it). Eject it in Finder when done.\n",
+                    at.display()
+                ))?,
                 Err(e) => print_text(&format!("  {e}\n"))?,
             },
             "e" => match careful::eject(&guard, &held) {
@@ -690,18 +746,30 @@ fn careful_cmd(g: &Global, args: CarefulArgs) -> Outcome {
 }
 
 /// Lists what `sel` removes, asks (when `ask`), removes it.
-fn remove_selection(s: &Effective, sel: &diskdrift_app::prune::Selection, disk: Option<&str>, ask: bool, json: bool) -> Outcome {
+fn remove_selection(
+    s: &Effective,
+    sel: &diskdrift_app::prune::Selection,
+    disk: Option<&str>,
+    ask: bool,
+    json: bool,
+) -> Outcome {
     use diskdrift_app::prune;
     use diskdrift_app::text::prune as text;
     let u = s.size_units.value;
     let p = prune::propose(s, sel, disk)?;
     if p.snapshots.is_empty() {
-        return if json { print_json(&p) } else { print_text(&text::proposal(&p, u)) };
+        return if json {
+            print_json(&p)
+        } else {
+            print_text(&text::proposal(&p, u))
+        };
     }
     if ask {
         if json || !std::io::stdin().is_terminal() {
             eprint!("{}", text::proposal(&p, u));
-            return Err(Failure::Usage("nothing removed: run again with --yes to confirm".into()));
+            return Err(Failure::Usage(
+                "nothing removed: run again with --yes to confirm".into(),
+            ));
         }
         eprint!("{}Remove them? [y/N] ", text::proposal(&p, u));
         let mut answer = String::new();
@@ -712,7 +780,11 @@ fn remove_selection(s: &Effective, sel: &diskdrift_app::prune::Selection, disk: 
     }
     let ids: Vec<u64> = p.snapshots.iter().map(|r| r.meta.id).collect();
     let r = prune::remove(s, &ids, &cancel_flag())?;
-    if json { print_json(&r) } else { print_text(&text::removed(&r, u)) }
+    if json {
+        print_json(&r)
+    } else {
+        print_text(&text::removed(&r, u))
+    }
 }
 
 /// Cancellation flag set by Ctrl-C.
@@ -743,7 +815,9 @@ fn run(cli: Cli) -> Outcome {
     match command {
         Command::Tui => {
             if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-                return Err(Failure::Usage("the TUI needs an interactive terminal".into()));
+                return Err(Failure::Usage(
+                    "the TUI needs an interactive terminal".into(),
+                ));
             }
             let s = settings(g, None)?;
             diskdrift_tui::run(s).map_err(|e| Failure::Runtime(e.to_string()))
@@ -751,66 +825,131 @@ fn run(cli: Cli) -> Outcome {
         Command::Usage { all, json } => {
             let s = settings(g, None)?;
             let report = diskdrift_app::usage(all);
-            if json { print_json(&report) } else { print_text(&render::usage(&report, s.size_units.value)) }
+            if json {
+                print_json(&report)
+            } else {
+                print_text(&render::usage(&report, s.size_units.value))
+            }
         }
         Command::Info { json } => {
             let s = settings(g, None)?;
             let report = diskdrift_app::info::info(&s);
-            if json { print_json(&report) } else { print_text(&render::info(&report, s.size_units.value)) }
+            if json {
+                print_json(&report)
+            } else {
+                print_text(&render::info(&report, s.size_units.value))
+            }
         }
         Command::Doctor(args) => doctor_cmd(g, args),
         Command::Scan(args) => scan_cmd(g, args),
         Command::Recover { budget, json } => recover_cmd(g, budget, json),
-        Command::Browse { path, snapshot, compare, limit, json } => {
+        Command::Browse {
+            path,
+            snapshot,
+            compare,
+            limit,
+            json,
+        } => {
             let s = settings(g, None)?;
             let u = s.size_units.value;
             match compare {
                 Some(old) => {
-                    let r = diskdrift_app::snapshots::diff_browse(&s, &old, &snapshot, path.as_deref(), limit)?;
-                    if json { print_json(&r) } else { print_text(&render::diff_browse(&r, u)) }
+                    let r = diskdrift_app::snapshots::diff_browse(
+                        &s,
+                        &old,
+                        &snapshot,
+                        path.as_deref(),
+                        limit,
+                    )?;
+                    if json {
+                        print_json(&r)
+                    } else {
+                        print_text(&render::diff_browse(&r, u))
+                    }
                 }
                 None => {
-                    let r = diskdrift_app::snapshots::browse(&s, &snapshot, path.as_deref(), limit)?;
-                    if json { print_json(&r) } else { print_text(&render::browse(&r, u)) }
+                    let r =
+                        diskdrift_app::snapshots::browse(&s, &snapshot, path.as_deref(), limit)?;
+                    if json {
+                        print_json(&r)
+                    } else {
+                        print_text(&render::browse(&r, u))
+                    }
                 }
             }
         }
-        Command::Analyze { path, budget, limit, json } => analyze_cmd(g, &path, budget, limit, json),
+        Command::Analyze {
+            path,
+            budget,
+            limit,
+            json,
+        } => analyze_cmd(g, &path, budget, limit, json),
         Command::Disks { action, json } => disks_cmd(g, action, json),
         Command::Snapshots { action, disk, json } => {
             let s = settings(g, None)?;
             match action {
                 None => {
                     let l = diskdrift_app::snapshots::list_disk(&s, disk.as_deref())?;
-                    if json { print_json(&l) } else { print_text(&render::snapshot_list(&l, s.size_units.value)) }
+                    if json {
+                        print_json(&l)
+                    } else {
+                        print_text(&render::snapshot_list(&l, s.size_units.value))
+                    }
                 }
-                Some(SnapshotAction::Remove { snapshots, failed, before, yes }) => {
+                Some(SnapshotAction::Remove {
+                    snapshots,
+                    failed,
+                    before,
+                    yes,
+                }) => {
                     use diskdrift_app::prune::{Selection, parse_day};
                     let sel = match (snapshots.is_empty(), failed, before) {
                         (false, false, None) => Selection::Refs(snapshots),
                         (true, true, None) => Selection::Failed,
                         (true, false, Some(d)) => Selection::Before(parse_day(&d)?),
-                        (true, false, None) => return Err(Failure::Usage("say which snapshots: IDs or names, --failed or --before YYYY-MM-DD".into())),
-                        _ => return Err(Failure::Usage("give snapshots, --failed or --before, one of them".into())),
+                        (true, false, None) => return Err(Failure::Usage(
+                            "say which snapshots: IDs or names, --failed or --before YYYY-MM-DD"
+                                .into(),
+                        )),
+                        _ => {
+                            return Err(Failure::Usage(
+                                "give snapshots, --failed or --before, one of them".into(),
+                            ));
+                        }
                     };
                     // One snapshot named exactly is removed without asking, as before.
                     let ask = !yes && !matches!(&sel, Selection::Refs(r) if r.len() == 1);
                     remove_selection(&s, &sel, disk.as_deref(), ask, json)
                 }
-                Some(SnapshotAction::Prune { keep_last, keep_weekly, keep_monthly, yes }) => {
-                    let rules = if keep_last.is_some() || keep_weekly.is_some() || keep_monthly.is_some() {
-                        diskdrift_app::prune::Retention {
-                            keep_last: keep_last.unwrap_or(0),
-                            keep_weekly: keep_weekly.unwrap_or(0),
-                            keep_monthly: keep_monthly.unwrap_or(0),
-                        }
-                    } else {
-                        s.retention.value
-                    };
+                Some(SnapshotAction::Prune {
+                    keep_last,
+                    keep_weekly,
+                    keep_monthly,
+                    yes,
+                }) => {
+                    let rules =
+                        if keep_last.is_some() || keep_weekly.is_some() || keep_monthly.is_some() {
+                            diskdrift_app::prune::Retention {
+                                keep_last: keep_last.unwrap_or(0),
+                                keep_weekly: keep_weekly.unwrap_or(0),
+                                keep_monthly: keep_monthly.unwrap_or(0),
+                            }
+                        } else {
+                            s.retention.value
+                        };
                     if !json && !rules.is_off() {
-                        eprintln!("Retention: keep {} of each disk and folder (and always the newest).", rules.describe());
+                        eprintln!(
+                            "Retention: keep {} of each disk and folder (and always the newest).",
+                            rules.describe()
+                        );
                     }
-                    remove_selection(&s, &diskdrift_app::prune::Selection::Retention(rules), disk.as_deref(), !yes, json)
+                    remove_selection(
+                        &s,
+                        &diskdrift_app::prune::Selection::Retention(rules),
+                        disk.as_deref(),
+                        !yes,
+                        json,
+                    )
                 }
                 Some(SnapshotAction::Compact) => {
                     use diskdrift_app::text::prune as text;
@@ -824,15 +963,28 @@ fn run(cli: Cli) -> Outcome {
                     if interactive {
                         eprint!("\r\x1b[2K");
                     }
-                    let out = if json { print_json(&c) } else { print_text(&text::compaction(&c, s.size_units.value)) };
-                    if c.cancelled { Err(Failure::Cancelled) } else { out }
+                    let out = if json {
+                        print_json(&c)
+                    } else {
+                        print_text(&text::compaction_result(&c, s.size_units.value))
+                    };
+                    if c.compaction.cancelled {
+                        Err(Failure::Cancelled)
+                    } else {
+                        out
+                    }
                 }
                 Some(SnapshotAction::Verify { snapshot }) => {
                     let (m, n) = diskdrift_app::snapshots::verify(&s, &snapshot)?;
                     if json {
-                        print_json(&serde_json::json!({ "snapshot": m.id, "records": n, "ok": true }))
+                        print_json(
+                            &serde_json::json!({ "snapshot": m.id, "records": n, "ok": true }),
+                        )
                     } else {
-                        print_text(&format!("Snapshot {} '{}': {} records, all checksums valid.\n", m.id, m.name, n))
+                        print_text(&format!(
+                            "Snapshot {} '{}': {} records, all checksums valid.\n",
+                            m.id, m.name, n
+                        ))
                     }
                 }
             }
@@ -853,7 +1005,16 @@ fn run(cli: Cli) -> Outcome {
                 deepest: args.deepest,
             };
             let r = diskdrift_app::snapshots::top(&s, &args.snapshot, args.path.as_deref(), opts)?;
-            if args.json { print_json(&r) } else { print_text(&render::top(&r, s.size_units.value, !args.directories, !args.files)) }
+            if args.json {
+                print_json(&r)
+            } else {
+                print_text(&render::top(
+                    &r,
+                    s.size_units.value,
+                    !args.directories,
+                    !args.files,
+                ))
+            }
         }
         Command::Diff(args) => {
             let s = settings(g, None)?;
@@ -871,13 +1032,33 @@ fn run(cli: Cli) -> Outcome {
                 list_dirs: !args.files,
                 ..Default::default()
             };
-            let r = diskdrift_app::snapshots::diff(&s, &args.old, &args.new, args.path.as_deref(), args.allow_incompatible, opts)?;
-            if args.json { print_json(&r) } else { print_text(&render::diff(&r, s.size_units.value, !args.directories, !args.files)) }
+            let r = diskdrift_app::snapshots::diff(
+                &s,
+                &args.old,
+                &args.new,
+                args.path.as_deref(),
+                args.allow_incompatible,
+                opts,
+            )?;
+            if args.json {
+                print_json(&r)
+            } else {
+                print_text(&render::diff(
+                    &r,
+                    s.size_units.value,
+                    !args.directories,
+                    !args.files,
+                ))
+            }
         }
         Command::Config { action } => match action {
             ConfigAction::Show { json } => {
                 let s = settings(g, None)?;
-                if json { print_json(&s) } else { print_text(&render::config_show(&s)) }
+                if json {
+                    print_json(&s)
+                } else {
+                    print_text(&render::config_show(&s))
+                }
             }
             ConfigAction::Init => {
                 let path = match &g.config {
@@ -886,7 +1067,9 @@ fn run(cli: Cli) -> Outcome {
                         &config::home_dir()?,
                         &std::env::current_dir()?,
                     ),
-                    None => config::home_dir()?.join(config::APP_DIR).join("config.json"),
+                    None => config::home_dir()?
+                        .join(config::APP_DIR)
+                        .join("config.json"),
                 };
                 config::init(&path)?;
                 print_text(&format!("Created {}\n", path.display()))
@@ -903,7 +1086,11 @@ fn doctor_progress(interactive: bool) -> impl Fn(DoctorStep) {
         let msg = match step {
             DoctorStep::Volumes => "reading volumes…".to_string(),
             DoctorStep::Snapshots => "listing local snapshots…".to_string(),
-            DoctorStep::Measuring { label, index, total } => format!("measuring {label} ({}/{total})…", index + 1),
+            DoctorStep::Measuring {
+                label,
+                index,
+                total,
+            } => format!("measuring {label} ({}/{total})…", index + 1),
             DoctorStep::OpenFiles => "checking deleted-but-open files…".to_string(),
             DoctorStep::Measured { .. } | DoctorStep::FromScan { .. } => return,
         };
@@ -919,7 +1106,8 @@ fn doctor_cmd(g: &Global, args: DoctorArgs) -> Outcome {
     let progress = doctor_progress(interactive);
     let budget = Duration::from_secs(args.budget);
     if args.deep {
-        let r = diskdrift_app::investigate::deep(&s, args.reference_free, budget, &cancel, &progress);
+        let r =
+            diskdrift_app::investigate::deep(&s, args.reference_free, budget, &cancel, &progress);
         if interactive {
             eprint!("\r\x1b[2K");
         }
@@ -927,7 +1115,11 @@ fn doctor_cmd(g: &Global, args: DoctorArgs) -> Outcome {
             return Err(Failure::Cancelled);
         }
         let r = r?;
-        return if args.json { print_json(&r) } else { print_text(&render::deep(&r, s.size_units.value)) };
+        return if args.json {
+            print_json(&r)
+        } else {
+            print_text(&render::deep(&r, s.size_units.value))
+        };
     }
     let opts = DoctorOptions {
         home: s.home.clone(),
@@ -948,7 +1140,11 @@ fn doctor_cmd(g: &Global, args: DoctorArgs) -> Outcome {
     if cancel.load(Ordering::SeqCst) {
         return Err(Failure::Cancelled);
     }
-    if args.json { print_json(&report) } else { print_text(&render::doctor(&report, s.size_units.value)) }
+    if args.json {
+        print_json(&report)
+    } else {
+        print_text(&render::doctor(&report, s.size_units.value))
+    }
 }
 
 fn recover_cmd(g: &Global, budget: u64, json: bool) -> Outcome {
@@ -956,7 +1152,13 @@ fn recover_cmd(g: &Global, budget: u64, json: bool) -> Outcome {
     let cancel = cancel_flag();
     let interactive = std::io::stderr().is_terminal();
     let progress = doctor_progress(interactive);
-    let r = diskdrift_app::investigate::recover(&s, Duration::from_secs(budget), &cancel, None, &progress);
+    let r = diskdrift_app::investigate::recover(
+        &s,
+        Duration::from_secs(budget),
+        &cancel,
+        None,
+        &progress,
+    );
     if interactive {
         eprint!("\r\x1b[2K");
     }
@@ -964,7 +1166,11 @@ fn recover_cmd(g: &Global, budget: u64, json: bool) -> Outcome {
         return Err(Failure::Cancelled);
     }
     let r = r?;
-    if json { print_json(&r) } else { print_text(&render::recover(&r, s.size_units.value)) }
+    if json {
+        print_json(&r)
+    } else {
+        print_text(&render::recover(&r, s.size_units.value))
+    }
 }
 
 fn analyze_cmd(g: &Global, path: &str, budget: u64, limit: usize, json: bool) -> Outcome {
@@ -978,7 +1184,15 @@ fn analyze_cmd(g: &Global, path: &str, budget: u64, limit: usize, json: bool) ->
             eprint!("\r\x1b[2Kmeasured {name}…");
         }
     };
-    let r = analyze::analyze(&s, &dir, limit, Duration::from_secs(budget), &cancel, None, &step);
+    let r = analyze::analyze(
+        &s,
+        &dir,
+        limit,
+        Duration::from_secs(budget),
+        &cancel,
+        None,
+        &step,
+    );
     if interactive {
         eprint!("\r\x1b[2K");
     }
@@ -986,33 +1200,87 @@ fn analyze_cmd(g: &Global, path: &str, budget: u64, limit: usize, json: bool) ->
         return Err(Failure::Cancelled);
     }
     let r = r?;
-    if json { print_json(&r) } else { print_text(&render::analyze(&r, s.size_units.value)) }
+    if json {
+        print_json(&r)
+    } else {
+        print_text(&render::analyze(&r, s.size_units.value))
+    }
 }
 
 fn now_unix() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn disks_cmd(g: &Global, action: Option<DiskAction>, json: bool) -> Outcome {
     use diskdrift_app::disks::{self, Edit};
     let s = settings(g, None)?;
     let u = s.size_units.value;
-    let edited = |d: diskdrift_app::storage::Disk| if json { print_json(&d) } else { print_text(&render::disk_entry(&d)) };
+    let edited = |(d, migration): (
+        diskdrift_app::storage::Disk,
+        diskdrift_app::storage::MigrationOutcome,
+    )| {
+        if json {
+            let mut value =
+                serde_json::to_value(&d).map_err(|e| Failure::Runtime(e.to_string()))?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("migration".into(), serde_json::to_value(migration).unwrap());
+            }
+            print_json(&value)
+        } else {
+            let mut out = render::disk_entry(&d);
+            if let Some(notice) = migration.notice() {
+                out.push_str(notice);
+                out.push('\n');
+            }
+            print_text(&out)
+        }
+    };
     match action {
         None => {
             let l = disks::list(&s)?;
-            if json { print_json(&l) } else { print_text(&render::disk_list(&l, u, now_unix())) }
-        }
-        Some(DiskAction::Label { disk, label }) => edited(disks::edit(&s, &disk, Edit::Label(label.as_deref()))?),
-        Some(DiskAction::Describe { disk, text }) => edited(disks::edit(&s, &disk, Edit::Describe(text.as_deref()))?),
-        Some(DiskAction::Set { op: SetOp::Add, disk, set }) => edited(disks::edit(&s, &disk, Edit::AddToSet(&set))?),
-        Some(DiskAction::Set { op: SetOp::Remove, disk, set }) => edited(disks::edit(&s, &disk, Edit::RemoveFromSet(&set))?),
-        Some(DiskAction::Merge { from, into }) => {
-            let (d, moved) = disks::merge(&s, &from, &into)?;
             if json {
-                print_json(&serde_json::json!({ "disk": d, "moved": moved }))
+                print_json(&l)
             } else {
-                print_text(&format!("Joined {} snapshot(s) to disk {} ({}).\n", moved.len(), d.display_name(), d.id))
+                print_text(&render::disk_list(&l, u, now_unix()))
+            }
+        }
+        Some(DiskAction::Label { disk, label }) => {
+            edited(disks::edit(&s, &disk, Edit::Label(label.as_deref()))?)
+        }
+        Some(DiskAction::Describe { disk, text }) => {
+            edited(disks::edit(&s, &disk, Edit::Describe(text.as_deref()))?)
+        }
+        Some(DiskAction::Set {
+            op: SetOp::Add,
+            disk,
+            set,
+        }) => edited(disks::edit(&s, &disk, Edit::AddToSet(&set))?),
+        Some(DiskAction::Set {
+            op: SetOp::Remove,
+            disk,
+            set,
+        }) => edited(disks::edit(&s, &disk, Edit::RemoveFromSet(&set))?),
+        Some(DiskAction::Merge { from, into }) => {
+            let (d, moved, migration) = disks::merge(&s, &from, &into)?;
+            if json {
+                print_json(
+                    &serde_json::json!({ "disk": d, "moved": moved, "migration": migration }),
+                )
+            } else {
+                let mut out = format!(
+                    "Joined {} snapshot(s) to disk {} ({}).\n",
+                    moved.len(),
+                    d.display_name(),
+                    d.id
+                );
+                if let Some(notice) = migration.notice() {
+                    out.push_str(notice);
+                    out.push('\n');
+                }
+                print_text(&out)
             }
         }
         Some(DiskAction::Forget { disk, yes }) => {
@@ -1020,7 +1288,9 @@ fn disks_cmd(g: &Global, action: Option<DiskAction>, json: bool) -> Outcome {
             if !yes {
                 if json || !std::io::stdin().is_terminal() {
                     eprint!("{}", render::forget(&plan, u));
-                    return Err(Failure::Usage("not forgotten: run again with --yes to confirm".into()));
+                    return Err(Failure::Usage(
+                        "not forgotten: run again with --yes to confirm".into(),
+                    ));
                 }
                 eprint!("{}Forget it? [y/N] ", render::forget(&plan, u));
                 let mut answer = String::new();
@@ -1030,7 +1300,11 @@ fn disks_cmd(g: &Global, action: Option<DiskAction>, json: bool) -> Outcome {
                 }
             }
             let done = disks::forget(&s, &plan.disk.id, true)?;
-            if json { print_json(&done) } else { print_text(&render::forget(&done, u)) }
+            if json {
+                print_json(&done)
+            } else {
+                print_text(&render::forget(&done, u))
+            }
         }
     }
 }
@@ -1038,11 +1312,22 @@ fn disks_cmd(g: &Global, action: Option<DiskAction>, json: bool) -> Outcome {
 fn scan_cmd(g: &Global, args: ScanArgs) -> Outcome {
     use diskdrift_app::core::units::format_size;
     let s = settings(g, args.threads)?;
-    if let Some(root) = args.root.as_deref() {
-        platform::native_root(root).map_err(|e| Failure::Usage(format!("invalid scan root: {e}")))?;
-    }
+    let root_native = args
+        .root
+        .as_deref()
+        .map(|root| {
+            platform::native_root(root)
+                .map_err(|e| Failure::Usage(format!("invalid scan root: {e}")))
+        })
+        .transpose()?;
     let root = args.root.as_ref().map(PathBuf::from);
-    let mut req = diskdrift_app::snapshots::ScanRequest::from_settings(&s, root, args.name.clone(), &args.exclude);
+    let mut req = diskdrift_app::snapshots::ScanRequest::from_settings_with_native_root(
+        &s,
+        root,
+        root_native,
+        args.name.clone(),
+        &args.exclude,
+    );
     req.disk_choice = args.disk.map(|d| match d {
         DiskArg::Same => diskdrift_app::disks::DiskChoice::Same,
         DiskArg::New => diskdrift_app::disks::DiskChoice::New,
@@ -1068,8 +1353,25 @@ fn scan_cmd(g: &Global, args: ScanArgs) -> Outcome {
                 }
                 let n = progress.entries.load(Ordering::Relaxed);
                 let secs = started.elapsed().as_secs_f64().max(0.001);
-                let cur = progress.current.lock().map(|c| c.clone()).unwrap_or_default();
-                let cur: String = if cur.chars().count() > 60 { format!("…{}", cur.chars().rev().take(59).collect::<Vec<_>>().into_iter().rev().collect::<String>()) } else { cur };
+                let cur = progress
+                    .current
+                    .lock()
+                    .map(|c| c.clone())
+                    .unwrap_or_default();
+                let cur: String = if cur.chars().count() > 60 {
+                    format!(
+                        "…{}",
+                        cur.chars()
+                            .rev()
+                            .take(59)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<String>()
+                    )
+                } else {
+                    cur
+                };
                 eprint!(
                     "\r\x1b[2K{n} entries · {} · {:.0}k/s · {:.0}s · {cur}",
                     format_size(progress.bytes_alloc.load(Ordering::Relaxed), units),
@@ -1098,5 +1400,9 @@ fn scan_cmd(g: &Global, args: ScanArgs) -> Outcome {
     } else {
         print_text(&render::scan_outcome(&outcome, s.size_units.value))?;
     }
-    if outcome.cancelled { Err(Failure::Cancelled) } else { Ok(()) }
+    if outcome.cancelled {
+        Err(Failure::Cancelled)
+    } else {
+        Ok(())
+    }
 }

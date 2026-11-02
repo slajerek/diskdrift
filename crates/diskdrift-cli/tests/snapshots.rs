@@ -3,6 +3,7 @@
 
 #![cfg(not(windows))]
 
+use diskdrift_app::storage::Store;
 use diskdrift_core::testutil::TestDir;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -31,11 +32,18 @@ impl Env {
 
     fn run(&self, args: &[&str]) -> Output {
         let mut confirmed = Vec::new();
-        if args.first() == Some(&"scan") && self.t.path().join("store").exists() && !args.contains(&"--disk") {
+        if args.first() == Some(&"scan")
+            && self.t.path().join("store").exists()
+            && !args.contains(&"--disk")
+        {
             confirmed.extend(args.iter().copied());
             confirmed.extend(["--disk", "same"]);
         }
-        let args = if confirmed.is_empty() { args.to_vec() } else { confirmed };
+        let args = if confirmed.is_empty() {
+            args.to_vec()
+        } else {
+            confirmed
+        };
         Command::new(env!("CARGO_BIN_EXE_diskdrift"))
             .arg("--config")
             .arg(self.t.path().join("config.json"))
@@ -51,8 +59,13 @@ impl Env {
 
     fn json(&self, args: &[&str]) -> serde_json::Value {
         let o = self.run(args);
-        assert!(o.status.success(), "{args:?}: {}", String::from_utf8_lossy(&o.stderr));
-        serde_json::from_slice(&o.stdout).unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&o.stdout)))
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        serde_json::from_slice(&o.stdout)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&o.stdout)))
     }
 
     fn tree_str(&self) -> String {
@@ -75,7 +88,10 @@ fn scan_change_scan_diff() {
 
     let s1 = e.json(&["scan", &root, "--name", "baseline", "--json"]);
     assert_eq!(s1["snapshot"]["status"], "COMPLETED");
-    assert_eq!(s1["rebase"]["kind"], "nothing", "first snapshot: nothing to compact");
+    assert_eq!(
+        s1["rebase"]["kind"], "nothing",
+        "first snapshot: nothing to compact"
+    );
     assert!(!e.t.path().join("tree/.diskdrift").exists());
 
     // Changes: growth, new files, deletion, shrink, move.
@@ -84,11 +100,18 @@ fn scan_change_scan_diff() {
     std::fs::remove_dir_all(e.tree.join("gone")).unwrap();
     e.file("shrink/big.bin", 100_000);
     std::fs::create_dir_all(e.tree.join("move/to")).unwrap();
-    std::fs::rename(e.tree.join("move/from/video.mp4"), e.tree.join("move/to/video.mp4")).unwrap();
+    std::fs::rename(
+        e.tree.join("move/from/video.mp4"),
+        e.tree.join("move/to/video.mp4"),
+    )
+    .unwrap();
 
     let s2 = e.json(&["scan", &root, "--name", "followup", "--json"]);
     assert_eq!(s2["rebase"]["kind"], "converted", "{}", s2["rebase"]);
-    assert_eq!(s2["rebase"]["id"], 1, "the baseline becomes a delta against the new full snapshot");
+    assert_eq!(
+        s2["rebase"]["id"], 1,
+        "the baseline becomes a delta against the new full snapshot"
+    );
 
     let list = e.json(&["snapshots", "--json"]);
     assert_eq!(list["snapshots"].as_array().unwrap().len(), 2);
@@ -96,11 +119,27 @@ fn scan_change_scan_diff() {
 
     let d = e.json(&["diff", "baseline", "followup", "--json"]);
     let s = &d["summary"];
-    assert!(s["added"]["count"].as_u64().unwrap() >= 3, "new, new/dir, huge.dat: {s}");
-    assert!(s["deleted"]["count"].as_u64().unwrap() >= 2, "gone and old.log: {s}");
+    assert!(
+        s["added"]["count"].as_u64().unwrap() >= 3,
+        "new, new/dir, huge.dat: {s}"
+    );
+    assert!(
+        s["deleted"]["count"].as_u64().unwrap() >= 2,
+        "gone and old.log: {s}"
+    );
     assert_eq!(s["moved"], 1, "{s}");
-    assert_eq!(d["moves"][0]["to"].as_str().unwrap(), format!("{root}/move/to/video.mp4"));
-    let growing: Vec<String> = d["growingDirs"].as_array().unwrap().iter().map(path_of).collect();
+    assert_eq!(
+        d["moves"][0]["to"]["path"],
+        format!("{root}/move/to/video.mp4")
+    );
+    assert_eq!(d["moves"][0]["to"]["pathEncoding"], "unix_bytes");
+    assert_eq!(d["moves"][0]["certainty"], "definite");
+    let growing: Vec<String> = d["growingDirs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(path_of)
+        .collect();
     assert!(growing.contains(&format!("{root}/new")), "{growing:?}");
     let first_file = &d["files"][0];
     assert_eq!(path_of(first_file), format!("{root}/new/dir/huge.dat"));
@@ -108,16 +147,32 @@ fn scan_change_scan_diff() {
     assert!(d["space"]["freeConsumedBytes"].is_number());
 
     // --path restricts; --min-size filters listed entries.
-    let p = e.json(&["diff", "1", "2", "--path", &format!("{root}/keep"), "--json"]);
+    let p = e.json(&[
+        "diff",
+        "1",
+        "2",
+        "--path",
+        &format!("{root}/keep"),
+        "--json",
+    ]);
     assert_eq!(p["summary"]["grown"]["count"], 1);
-    assert!(p["unreconciledBytes"].is_null(), "not attributable for a sub-path");
+    assert!(
+        p["unreconciledBytes"].is_null(),
+        "not attributable for a sub-path"
+    );
     let m = e.json(&["diff", "1", "2", "--min-size", "4MB", "--files", "--json"]);
     assert_eq!(m["files"].as_array().unwrap().len(), 1);
 
     // Human output mentions the five accounting lines.
     let o = e.run(&["diff", "latest~1", "latest"]);
     let text = String::from_utf8_lossy(&o.stdout);
-    for line in ["OS free space change", "Tracked logical change", "Tracked allocated change", "Coverage changes", "Unreconciled difference"] {
+    for line in [
+        "OS free space change",
+        "Tracked logical change",
+        "Tracked allocated change",
+        "Coverage changes",
+        "Unreconciled difference",
+    ] {
         assert!(text.contains(line), "missing {line}:\n{text}");
     }
 
@@ -137,7 +192,10 @@ fn duplicate_name_and_unknown_snapshot_are_usage_errors() {
     e.file("x", 10);
     let root = e.tree_str();
     assert!(e.run(&["scan", &root, "--name", "a"]).status.success());
-    assert_eq!(e.run(&["scan", &root, "--name", "a"]).status.code(), Some(2));
+    assert_eq!(
+        e.run(&["scan", &root, "--name", "a"]).status.code(),
+        Some(2)
+    );
     assert_eq!(e.run(&["top", "--snapshot", "nope"]).status.code(), Some(2));
     assert_eq!(e.run(&["diff", "a", "missing"]).status.code(), Some(2));
 }
@@ -163,7 +221,12 @@ fn incompatible_snapshots_are_rejected_unless_allowed() {
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("not comparable"));
     let d = e.json(&["diff", "A", "B", "--allow-incompatible", "--json"]);
-    assert!(d["nonEquivalent"].as_str().unwrap().contains("different folders on the disk"));
+    assert!(
+        d["nonEquivalent"]
+            .as_str()
+            .unwrap()
+            .contains("different folders on the disk")
+    );
 }
 
 #[test]
@@ -179,11 +242,17 @@ fn exclusions_and_non_utf8_paths() {
     e.json(&["scan", &root, "--exclude", "node_modules", "--json"]);
     let t = e.json(&["top", "--files", "--limit", "10", "--json"]);
     let files = t["files"].as_array().unwrap();
-    assert!(!files.iter().any(|f| path_of(f).contains("index.js")), "excluded");
+    assert!(
+        !files.iter().any(|f| path_of(f).contains("index.js")),
+        "excluded"
+    );
     if !non_utf8 {
         return;
     }
-    let bad = files.iter().find(|f| f.get("pathBytes").is_some()).expect("non-UTF-8 path carries pathBytes");
+    let bad = files
+        .iter()
+        .find(|f| f.get("pathBytes").is_some())
+        .expect("non-UTF-8 path carries pathBytes");
     let bytes = base64_decode(bad["pathBytes"].as_str().unwrap());
     assert!(bytes.ends_with(b"/bad-\xff-name"));
 }
@@ -240,21 +309,37 @@ fn snapshots_remove_frees_store_space() {
     let r = e.json(&["snapshots", "remove", "two", "--json"]);
     assert_eq!(r["removed"], serde_json::json!([2]));
     assert_eq!(r["rewritten"], serde_json::json!([1]));
-    assert_eq!(e.json(&["snapshots", "verify", "one", "--json"])["ok"], true);
-    assert!(e.tree.join("x").exists() && e.tree.join("y").exists(), "scanned files untouched");
+    assert_eq!(
+        e.json(&["snapshots", "verify", "one", "--json"])["ok"],
+        true
+    );
+    assert!(
+        e.tree.join("x").exists() && e.tree.join("y").exists(),
+        "scanned files untouched"
+    );
     // Several: listed and refused without a terminal unless --yes.
     e.file("z", 10);
     e.json(&["scan", &root, "--name", "three", "--json"]);
     e.json(&["scan", &root, "--name", "four", "--json"]);
     let o = e.run(&["snapshots", "remove", "one", "three"]);
     assert_eq!(o.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("Removing 2 scans frees about"), "{o:?}");
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("Removing 2 scans frees about"),
+        "{o:?}"
+    );
     let r = e.json(&["snapshots", "remove", "one", "three", "--yes", "--json"]);
     assert_eq!(r["removed"].as_array().unwrap().len(), 2);
     let p = e.json(&["snapshots", "prune", "--keep-last", "1", "--yes", "--json"]);
-    assert_eq!(p["snapshots"], serde_json::json!([]), "only four is left: {p}");
+    assert_eq!(
+        p["snapshots"],
+        serde_json::json!([]),
+        "only four is left: {p}"
+    );
     let c = e.json(&["snapshots", "compact", "--json"]);
-    assert_eq!((c["checked"].as_u64(), c["cancelled"].as_bool()), (Some(1), Some(false)));
+    assert_eq!(
+        (c["checked"].as_u64(), c["cancelled"].as_bool()),
+        (Some(1), Some(false))
+    );
 }
 
 #[test]
@@ -262,7 +347,10 @@ fn scan_root_must_exist() {
     let e = Env::new("e2e-noroot");
     let o = e.run(&["scan", &e.t.path().join("does-not-exist").to_string_lossy()]);
     assert_eq!(o.status.code(), Some(2));
-    assert!(!Path::new(&e.t.path().join("store")).exists(), "nothing is created for a bad root");
+    assert!(
+        !Path::new(&e.t.path().join("store")).exists(),
+        "nothing is created for a bad root"
+    );
 }
 
 #[test]
@@ -285,15 +373,39 @@ fn write_failure_keeps_earlier_snapshots() {
         root
     );
     let o = Command::new("/bin/sh").arg("-c").arg(cmd).output().unwrap();
-    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
-    assert!(String::from_utf8_lossy(&o.stderr).contains("disk space"), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("disk space"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let l = e.json(&["snapshots", "--json"]);
     let snaps = l["snapshots"].as_array().unwrap();
     assert_eq!(snaps[0]["status"], "COMPLETED");
-    assert_eq!(snaps[1]["status"], "FAILED");
+    // The OS may reject the new snapshot before its in-progress metadata is
+    // published. In either case, no additional snapshot may be completed.
+    assert!(
+        snaps
+            .iter()
+            .skip(1)
+            .all(|snapshot| snapshot["status"] == "FAILED")
+    );
     assert_eq!(e.json(&["snapshots", "verify", "ok", "--json"])["ok"], true);
     assert!(
-        !std::fs::read_dir(e.t.path().join("store/snapshots")).unwrap().flatten().any(|f| f.path().extension().is_some_and(|x| x == "tmp")),
+        !std::fs::read_dir(
+            Store::open(&e.t.path().join("store"))
+                .unwrap()
+                .layout()
+                .metadata_dir()
+        )
+        .unwrap()
+        .flatten()
+        .any(|f| f.path().extension().is_some_and(|x| x == "tmp")),
         "no temporary data left behind"
     );
     // The store stays usable.
@@ -325,39 +437,91 @@ fn scans_record_their_disk_and_disks_can_be_labelled_and_referenced() {
     // Label, describe, sets; references through the label.
     let d = e.json(&["disks", "label", &disk[..5], "Robocze-2026", "--json"]);
     assert_eq!(d["label"], "Robocze-2026");
-    assert_eq!(e.run(&["disks", "label", &disk, "a:b"]).status.code(), Some(2), "invalid label");
-    e.json(&["disks", "describe", "robocze-2026", "the test tree", "--json"]);
+    assert_eq!(
+        e.run(&["disks", "label", &disk, "a:b"]).status.code(),
+        Some(2),
+        "invalid label"
+    );
+    e.json(&[
+        "disks",
+        "describe",
+        "robocze-2026",
+        "the test tree",
+        "--json",
+    ]);
     e.json(&["disks", "set", "add", "robocze-2026", "tests", "--json"]);
     let d = e.json(&["disks", "set", "add", "robocze-2026", "tmp", "--json"]);
     assert_eq!(d["sets"], serde_json::json!(["tests", "tmp"]));
     let d = e.json(&["disks", "set", "remove", "robocze-2026", "TMP", "--json"]);
     assert_eq!(d["sets"], serde_json::json!(["tests"]));
-    assert_eq!(e.json(&["browse", "--snapshot", "robocze-2026:latest~1", "--json"])["snapshot"]["name"], "one");
-    let diff = e.json(&["diff", "robocze-2026:latest~1", "robocze-2026:latest", "--json"]);
+    assert_eq!(
+        e.json(&["browse", "--snapshot", "robocze-2026:latest~1", "--json"])["snapshot"]["name"],
+        "one"
+    );
+    let diff = e.json(&[
+        "diff",
+        "robocze-2026:latest~1",
+        "robocze-2026:latest",
+        "--json",
+    ]);
     assert_eq!(diff["summary"]["added"]["count"], 1);
-    assert_eq!(e.run(&["top", "--snapshot", "nope:latest"]).status.code(), Some(2), "unknown disk");
+    assert_eq!(
+        e.run(&["top", "--snapshot", "nope:latest"]).status.code(),
+        Some(2),
+        "unknown disk"
+    );
     let only = e.json(&["snapshots", "--disk", "robocze-2026", "--json"]);
     assert_eq!(only["snapshots"].as_array().unwrap().len(), 2);
-    assert_eq!(e.run(&["snapshots", "--disk", "nope"]).status.code(), Some(2));
-    let files: Vec<String> = std::fs::read_dir(e.t.path().join("store/snapshots"))
-        .unwrap()
-        .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
-        .collect();
+    assert_eq!(
+        e.run(&["snapshots", "--disk", "nope"]).status.code(),
+        Some(2)
+    );
+    let files: Vec<String> = std::fs::read_dir(
+        Store::open(&e.t.path().join("store"))
+            .unwrap()
+            .layout()
+            .metadata_dir(),
+    )
+    .unwrap()
+    .map(|f| f.unwrap().file_name().to_string_lossy().into_owned())
+    .collect();
     assert!(files.iter().all(|f| f.starts_with(&disk)), "{files:?}");
 
     // Forget: refused without --yes when nobody can be asked, then done.
     let o = e.run(&["disks", "forget", "robocze-2026"]);
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("removes its 2 snapshots"));
-    assert_eq!(e.json(&["snapshots", "--json"])["snapshots"].as_array().unwrap().len(), 2, "nothing removed");
+    assert_eq!(
+        e.json(&["snapshots", "--json"])["snapshots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "nothing removed"
+    );
     let f = e.json(&["disks", "forget", "robocze-2026", "--yes", "--json"]);
     assert_eq!(f["done"], true);
     assert_eq!(f["snapshots"].as_array().unwrap().len(), 2);
-    assert!(e.json(&["snapshots", "--json"])["snapshots"].as_array().unwrap().is_empty());
+    assert!(
+        e.json(&["snapshots", "--json"])["snapshots"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     // The volume is still connected: it is listed again, as new (not in the store).
     let left = e.json(&["disks", "--json"]);
-    assert!(left["disks"].as_array().unwrap().iter().all(|d| d["known"] == false && d["snapshots"] == 0), "{left}");
-    assert!(e.tree.join("a/y").exists(), "scanned files are never touched");
+    assert!(
+        left["disks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["known"] == false && d["snapshots"] == 0),
+        "{left}"
+    );
+    assert!(
+        e.tree.join("a/y").exists(),
+        "scanned files are never touched"
+    );
 }
 
 #[test]
@@ -365,7 +529,10 @@ fn disk_listings_do_not_create_a_store() {
     let e = Env::new("e2e-disks-nostore");
     let l = e.json(&["disks", "--json"]);
     assert_eq!(l["storeExists"], false);
-    assert_eq!(e.run(&["disks", "label", "dabc", "x"]).status.code(), Some(2));
+    assert_eq!(
+        e.run(&["disks", "label", "dabc", "x"]).status.code(),
+        Some(2)
+    );
     assert!(!e.t.path().join("store").exists());
 }
 
@@ -390,20 +557,38 @@ fn find_searches_the_latest_scan_then_the_history() {
     let o = e.run(&["find", "wazna"]);
     assert!(o.status.success());
     let text = String::from_utf8_lossy(&o.stdout);
-    assert!(text.contains("Not on any disk as of the latest scans"), "{text}");
-    assert!(text.contains("Searching the history for deleted files…"), "{text}");
-    assert!(text.contains("last seen in scan #1") && text.contains("gone in scan #2"), "{text}");
+    assert!(
+        text.contains("Not on any disk as of the latest scans"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Searching the history for deleted files…"),
+        "{text}"
+    );
+    assert!(
+        text.contains("last seen in scan #1") && text.contains("gone in scan #2"),
+        "{text}"
+    );
     let r = e.json(&["find", "wazna", "--json"]);
     let gone = &r["history"]["gone"][0];
     assert_eq!(path_of(gone), format!("{root}/Docs/Ważna sprawa 10.txt"));
-    assert_eq!((gone["lastSeen"]["id"].as_u64(), gone["goneIn"]["id"].as_u64()), (Some(1), Some(2)));
+    assert_eq!(
+        (
+            gone["lastSeen"]["id"].as_u64(),
+            gone["goneIn"]["id"].as_u64()
+        ),
+        (Some(1), Some(2))
+    );
     assert_eq!(gone["size"].as_u64().map(|s| s >= 12_000), Some(true));
 
     // Never: the history is not searched; a glob and a bad regex.
     assert!(e.json(&["find", "wazna", "--no-history", "--json"])["history"].is_null());
     assert_eq!(e.json(&["find", "*.TXT", "--json"])["total"], 1);
     assert_eq!(e.run(&["find", "--regex", "("]).status.code(), Some(2));
-    assert_eq!(e.run(&["find", "x", "--disk", "nope"]).status.code(), Some(2));
+    assert_eq!(
+        e.run(&["find", "x", "--disk", "nope"]).status.code(),
+        Some(2)
+    );
 }
 
 #[test]
@@ -430,8 +615,18 @@ fn a_careful_scan_is_marked_and_sets_limit_find() {
     let text = String::from_utf8_lossy(&e.run(&["snapshots"]).stdout).into_owned();
     assert!(text.contains("complete, careful"), "{text}");
     // Sets: none yet is a usage error; then the disk's set finds it.
-    assert_eq!(e.run(&["find", "plan", "--set", "stare"]).status.code(), Some(2));
+    assert_eq!(
+        e.run(&["find", "plan", "--set", "stare"]).status.code(),
+        Some(2)
+    );
     let disk = s["disk"]["disk"]["id"].as_str().unwrap().to_string();
-    assert!(e.run(&["disks", "set", "add", &disk, "stare"]).status.success());
-    assert_eq!(e.json(&["find", "plan", "--set", "stare", "--json"])["total"], 1);
+    assert!(
+        e.run(&["disks", "set", "add", &disk, "stare"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        e.json(&["find", "plan", "--set", "stare", "--json"])["total"],
+        1
+    );
 }

@@ -19,15 +19,23 @@ fn measure(label: &str, recs: &[Record]) {
             if col {
                 let mut e = columnar::Encoder::new(level);
                 for r in recs {
-                    if let Some(b) = e.push(r).unwrap() { blocks_out.push(b); }
+                    if let Some(b) = e.push(r).unwrap() {
+                        blocks_out.push(b);
+                    }
                 }
-                if let Some(b) = e.finish().unwrap() { blocks_out.push(b); }
+                if let Some(b) = e.finish().unwrap() {
+                    blocks_out.push(b);
+                }
             } else {
                 let mut e = RecordBlockEncoder::new(level);
                 for r in recs {
-                    if let Some(b) = e.push(r).unwrap() { blocks_out.push(b); }
+                    if let Some(b) = e.push(r).unwrap() {
+                        blocks_out.push(b);
+                    }
                 }
-                if let Some(b) = e.finish().unwrap() { blocks_out.push(b); }
+                if let Some(b) = e.finish().unwrap() {
+                    blocks_out.push(b);
+                }
             }
             let enc = t.elapsed().as_secs_f64();
             let bytes: usize = blocks_out.iter().map(|b| b.data.len()).sum();
@@ -36,7 +44,11 @@ fn measure(label: &str, recs: &[Record]) {
             for b in &blocks_out {
                 let raw = blocks::decompress(&b.data, b.raw_len, b.crc).unwrap();
                 let mut v = Vec::new();
-                if col { columnar::decode(&raw, b.count, &mut v).unwrap(); } else { blocks::decode_records(&raw, b.count, &mut v).unwrap(); }
+                if col {
+                    columnar::decode(&raw, b.count, &mut v).unwrap();
+                } else {
+                    blocks::decode_records(&raw, b.count, &mut v).unwrap();
+                }
                 n += v.len();
             }
             let dec = t.elapsed().as_secs_f64();
@@ -53,13 +65,36 @@ fn measure(label: &str, recs: &[Record]) {
 }
 
 fn main() {
-    let synth: Vec<Record> = Gen::new(Params { entries: 1_000_000, seed: 7, change: 0.01, horizon: 100 }, 0).collect();
+    let synth: Vec<Record> = Gen::new(
+        Params {
+            entries: 1_000_000,
+            seed: 7,
+            change: 0.01,
+            horizon: 100,
+        },
+        0,
+    )
+    .collect();
     measure("synthetic", &synth);
     let root = std::env::args().nth(1).unwrap_or("/Applications".into());
     let mut real = Vec::new();
     let l = diskdrift_bench::jobs::lister_by_name("bulk");
     let cancel = AtomicBool::new(false);
-    let mut sink = |r: &Record, _: &Path| { real.push(r.clone()); Ok(()) };
-    walk::walk(Path::new(&root), l.as_ref(), &WalkOptions { threads: 8, ..Default::default() }, &mut sink, &cancel, None).unwrap();
+    let mut sink = |r: &Record, _: &Path| {
+        real.push(r.clone());
+        Ok(())
+    };
+    walk::walk(
+        Path::new(&root),
+        l.as_ref(),
+        &WalkOptions {
+            threads: 8,
+            ..Default::default()
+        },
+        &mut sink,
+        &cancel,
+        None,
+    )
+    .unwrap();
     measure("real", &real);
 }

@@ -1,8 +1,7 @@
 # ADR 0003: Portable records, paths and store version 4
 
-- Status: **accepted; wire layout provisional until the format-freeze gate**
-  (2026-10-26). No DDS2 writer may ship before that gate appends golden bytes
-  and benchmark results to this ADR.
+- Status: **accepted; wire layout frozen** (2026-10-31). DDS2 schema 1 is
+  released with store v4; future incompatible layouts require a new schema.
 - Scope: the portable record/store contract used by baseline and later Linux
   and Windows diagnostics.
 - Related decisions: ADR 0001 (binary reverse-delta store) and ADR 0002 (disk
@@ -118,10 +117,13 @@ ordering for Unix or numeric-`u16` ordering for Windows; they never compare
 UTF-16LE payload bytes. Delta files use the same path encoding and record schema
 as their lineage. A reader rejects a delta/base edge whose descriptors differ.
 
-The format-freeze gate appends exact schema-1 column transforms and golden byte
-fixtures to this ADR after Windows names/file IDs and publication behavior are
-validated and footprint/RSS benchmarks pass. No DDS2 writer ships before that
-gate.
+Schema-1 transforms and golden byte fixtures are enforced by
+`dds2_golden.rs`. The 2026-10-31 macOS full release benchmark gate (one million
+records, five trials) recorded DDS2 at 17,903,616 bytes versus DDS1 at
+27,942,912 bytes, 54,296,576 bytes peak RSS versus 68,960,256 bytes, 478.04 ms
+import versus 478.40 ms, and 199.02 ms read versus 176.05 ms. Those results
+pass the 110% footprint/RSS and 115% time limits; native Windows evidence is
+enforced by the portability workflow before release publication.
 Future incompatible layouts receive a new record-schema number and never
 reinterpret schema 1.
 

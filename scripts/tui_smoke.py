@@ -99,8 +99,15 @@ if os.path.isdir(store):
 keys = [b"s"] + [b"\x7f"] * 40 + [tree.encode(), b"\t", b"tui-scan", b"\r", b"\r"]
 
 
+def metadata_paths():
+    paths = []
+    for directory in ("snapshots-v4", "snapshots"):
+        paths.extend(glob.glob(os.path.join(store, directory, "*.json")))
+    return paths
+
+
 def scan_completed():
-    for path in glob.glob(os.path.join(store, "snapshots", "*.json")):
+    for path in metadata_paths():
         try:
             meta = json.load(open(path))
         except (OSError, ValueError):
@@ -112,7 +119,7 @@ def scan_completed():
 
 out, status = run(keys + [b"", b"h", b"t", b"\t", b"d"], settle=0.05, wait_for=scan_completed, after_wait=[b"q"])
 check("scan from the TUI", out, status)
-metas = [json.load(open(p)) for p in glob.glob(os.path.join(store, "snapshots", "*.json"))]
+metas = [json.load(open(p)) for p in metadata_paths()]
 assert any(m["name"] == "tui-scan" and m["status"] == "COMPLETED" for m in metas), metas
 print("ok  snapshot written by the TUI is COMPLETED")
 # Cancel a running scan: a large read-only tree, Esc + y after a moment.
@@ -120,7 +127,7 @@ keys = [b"s"] + [b"\x7f"] * 120 + [b"/Applications", b"\t", b"tui-cancel", b"\r"
 
 
 def scan_settled():
-    for path in glob.glob(os.path.join(store, "snapshots", "*.json")):
+    for path in metadata_paths():
         try:
             meta = json.load(open(path))
         except (OSError, ValueError):
@@ -132,9 +139,12 @@ def scan_settled():
 
 out, status = run(keys + [b"", b"\x1b", b"y", b""], settle=0.05, wait_for=scan_settled, after_wait=[b"q"])
 check("cancel a running scan", out, status)
-metas = [json.load(open(p)) for p in glob.glob(os.path.join(store, "snapshots", "*.json"))]
+metas = [json.load(open(p)) for p in metadata_paths()]
 m = [m for m in metas if m["name"] == "tui-cancel"]
 assert m and m[0]["status"] in ("CANCELLED", "COMPLETED", "PARTIAL"), metas
-assert not glob.glob(os.path.join(store, "snapshots", "*.tmp")), "no temporary data left"
+assert not any(
+    glob.glob(os.path.join(store, directory, "*.tmp"))
+    for directory in ("snapshots-v4", "snapshots")
+), "no temporary data left"
 print(f"ok  cancelled scan recorded as {m[0]['status']}")
 print("TUI smoke test passed")

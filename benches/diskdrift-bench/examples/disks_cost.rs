@@ -9,6 +9,8 @@
 //!   disks_cost search <dir> <query>               name search without an index: the newest snapshot, then every one
 use diskdrift_bench::synth::{Gen, Params};
 use diskdrift_core::diff::{self, DiffOptions, with_root_name};
+use diskdrift_core::native::{NativePath, NativeRoot};
+use diskdrift_core::record::{FileIdScheme, TimestampResolution};
 use diskdrift_core::walk::WalkReport;
 use diskdrift_storage::{ScanOptions, SnapshotMeta, Status, Store, VolumeIdentity, meta};
 use std::path::Path;
@@ -19,19 +21,43 @@ use std::time::Instant;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn template(name: String, root: &str, disk: Option<&str>, v: u32) -> SnapshotMeta {
+    let mut descriptor = meta::VolumeDescriptor::new(
+        0,
+        "linux",
+        FileIdScheme::PosixInode64,
+        meta::FileIdScope::Volume,
+        meta::AllocationSemantics::FilesystemReported,
+        TimestampResolution::Seconds,
+        meta::Provenance::Observed("synthetic fixture".into()),
+    );
+    descriptor.identity = NativePath::unix(b"bench".to_vec());
+    descriptor.mount_key = NativePath::unix(root.as_bytes().to_vec());
+    descriptor.identity_strength = "uuid".into();
     SnapshotMeta {
         format_version: meta::META_FORMAT_VERSION,
         id: 0,
         name,
         root: root.into(),
+        root_native: Some(NativeRoot::posix(root.as_bytes().to_vec())),
         disk: disk.map(String::from),
         root_in_volume: disk.map(|_| "/".into()),
+        root_in_volume_native: disk.map(|_| NativePath::unix(b"/".to_vec())),
         status: Status::InProgress,
         // One scan a day, so every snapshot gets its own time stem.
         started_at: format!("2026-{:02}-{:02}T10:00:00+02:00", 1 + v / 28, 1 + v % 28),
         finished_at: None,
-        volume: VolumeIdentity { uuid: Some("bench".into()), fs_type: "apfs".into(), mount_point: root.into(), ..Default::default() },
-        options: ScanOptions { stay_on_filesystem: true, ..Default::default() },
+        volume: VolumeIdentity {
+            uuid: Some("bench".into()),
+            fs_type: "apfs".into(),
+            descriptor: Some(descriptor.clone()),
+            mount_point: root.into(),
+            ..Default::default()
+        },
+        volumes: meta::complete_volume_table(&descriptor),
+        options: ScanOptions {
+            stay_on_filesystem: true,
+            ..Default::default()
+        },
         space_before: None,
         space_after: None,
         storage: Default::default(),
@@ -63,7 +89,7 @@ fn write(store: &Store, params: Params, v: u32, m: SnapshotMeta) -> f64 {
     // A scan's root record is named after the root it scanned (the generator always says /synthetic).
     let root = m.root.as_bytes().to_vec();
     ms(|| {
-        let lock = store.lock().unwrap();
+        let (lock, _) = store.lock().unwrap();
         let mut w = store.begin(lock, m, None).unwrap();
         for mut r in Gen::new(params, v) {
             if r.depth == 0 {
@@ -71,7 +97,10 @@ fn write(store: &Store, params: Params, v: u32, m: SnapshotMeta) -> f64 {
             }
             w.push(&r).unwrap();
         }
-        w.commit_and_rebase(WalkReport::default(), None, String::new()).unwrap().1.unwrap()
+        w.commit_and_rebase(WalkReport::default(), None, String::new())
+            .unwrap()
+            .1
+            .unwrap()
     })
     .1
 }
@@ -88,31 +117,61 @@ fn downgrade(store: &Store) {
         old.root_in_volume = None;
         old.storage.stem = Some(v2(&stem));
         if let Some(data) = &m.storage.data_file {
-            let name = match m.storage.base.and_then(|b| metas.iter().find(|x| x.id == b)) {
-                Some(b) => format!("{}.r{}.dds", v2(&stem), v2(b.storage.stem.as_ref().unwrap())),
+            let name = match m
+                .storage
+                .base
+                .and_then(|b| metas.iter().find(|x| x.id == b))
+            {
+                Some(b) => format!(
+                    "{}.r{}.dds",
+                    v2(&stem),
+                    v2(b.storage.stem.as_ref().unwrap())
+                ),
                 None => format!("{}.dds", v2(&stem)),
             };
             std::fs::rename(dir.join(data), dir.join(&name)).unwrap();
             old.storage.data_file = Some(name);
         }
         std::fs::remove_file(dir.join(format!("{stem}.json"))).unwrap();
-        std::fs::write(dir.join(format!("{}.json", v2(&stem))), serde_json::to_vec(&old).unwrap()).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", v2(&stem))),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
     }
     let _ = std::fs::remove_file(store.path().join("disks.json"));
-    std::fs::write(store.path().join("store.json"), br#"{"format":"diskdrift-snapshots","version":2}"#).unwrap();
+    std::fs::write(
+        store.path().join("store.json"),
+        br#"{"format":"diskdrift-snapshots","version":2}"#,
+    )
+    .unwrap();
 }
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let out = match a[1].as_str() {
         "build" => {
-            let (n, versions, dir) = (a[2].parse().unwrap(), a[3].parse::<u32>().unwrap(), Path::new(&a[4]));
+            let (n, versions, dir) = (
+                a[2].parse().unwrap(),
+                a[3].parse::<u32>().unwrap(),
+                Path::new(&a[4]),
+            );
             let _ = std::fs::remove_dir_all(dir);
             let store = Store::create(dir).unwrap();
-            let params = Params { entries: n, seed: 13, change: 0.01, horizon: versions };
+            let params = Params {
+                entries: n,
+                seed: 13,
+                change: 0.01,
+                horizon: versions,
+            };
             let (_, total) = ms(|| {
                 for v in 0..versions {
-                    write(&store, params, v, template(format!("v{v}"), "/synthetic", None, v));
+                    write(
+                        &store,
+                        params,
+                        v,
+                        template(format!("v{v}"), "/synthetic", None, v),
+                    );
                 }
             });
             downgrade(&store);
@@ -130,30 +189,60 @@ fn main() {
             let (first, last) = (all.first().unwrap(), all.last().unwrap());
             let (n_first, t_first) = ms(|| store.verify(first.id).unwrap());
             let (n_last, t_last) = ms(|| store.verify(last.id).unwrap());
-            let named = all.iter().all(|m| m.disk.is_some() && m.storage.stem.as_deref().unwrap().starts_with(m.disk.as_deref().unwrap()));
+            let named = all.iter().all(|m| {
+                m.disk.is_some()
+                    && m.storage
+                        .stem
+                        .as_deref()
+                        .unwrap()
+                        .starts_with(m.disk.as_deref().unwrap())
+            });
             serde_json::json!({ "step": "verify", "oldestRecords": n_first, "oldestMs": t_first, "newestRecords": n_last, "newestMs": t_last, "allNamedAfterTheirDisk": named, "peakRssMb": rss_mb() })
         }
         "adapter" => {
             let (n, dir) = (a[2].parse().unwrap(), Path::new(&a[3]));
-            let params = Params { entries: n, seed: 17, change: 0.01, horizon: 100 };
+            let params = Params {
+                entries: n,
+                seed: 17,
+                change: 0.01,
+                horizon: 100,
+            };
             // Rebase: the second scan of one disk at the same mount point, then at another.
             let mut rebase = Vec::new();
             for (case, second_root) in [("sameRoot", "/Volumes/X"), ("otherRoot", "/Volumes/X 1")] {
                 let d = dir.join(case);
                 let _ = std::fs::remove_dir_all(&d);
                 let store = Store::create(&d).unwrap();
-                write(&store, params, 0, template("a".into(), "/Volumes/X", Some("dbench"), 0));
-                let t = write(&store, params, 1, template("b".into(), second_root, Some("dbench"), 1));
+                write(
+                    &store,
+                    params,
+                    0,
+                    template("a".into(), "/Volumes/X", Some("dbench"), 0),
+                );
+                let t = write(
+                    &store,
+                    params,
+                    1,
+                    template("b".into(), second_root, Some("dbench"), 1),
+                );
                 let delta_items = store.list().unwrap()[0].storage.items;
                 rebase.push(serde_json::json!({ "case": case, "commitAndRebaseMs": t, "deltaItems": delta_items }));
                 if case == "otherRoot" {
                     // Diff of the adjacent pair: as stored, and with the adapter on both sides.
                     let all = store.list().unwrap();
                     let (old, new) = (all[0].id, all[1].id);
-                    let (r1, plain) = ms(|| diff::diff(store.records(old).unwrap(), store.records(new).unwrap(), DiffOptions::default()).unwrap());
+                    let (r1, plain) = ms(|| {
+                        diff::diff(
+                            store.records(old).unwrap(),
+                            store.records(new).unwrap(),
+                            DiffOptions::default(),
+                        )
+                        .unwrap()
+                    });
                     let (r2, adapted) = ms(|| {
-                        let a = store.records_as(old, "/Volumes/X 1").unwrap();
-                        let b = with_root_name(store.records(new).unwrap(), b"/Volumes/X 1".to_vec());
+                        let root = NativePath::unix(b"/Volumes/X 1".to_vec());
+                        let a = store.records_as(old, &root).unwrap();
+                        let b = with_root_name(store.records(new).unwrap(), root.clone());
                         diff::diff(a, b, DiffOptions::default()).unwrap()
                     });
                     rebase.push(serde_json::json!({
@@ -170,7 +259,15 @@ fn main() {
             let store = Store::open(Path::new(&a[2])).unwrap();
             let all = store.list().unwrap();
             let (old, new) = (&all[all.len() - 2], all.last().unwrap());
-            let (r, t) = ms(|| diff::diff(store.records_as(old.id, &new.root).unwrap(), store.records(new.id).unwrap(), DiffOptions::default()).unwrap());
+            let root = diskdrift_platform::native_path(std::ffi::OsStr::new(&new.root));
+            let (r, t) = ms(|| {
+                diff::diff(
+                    store.records_as(old.id, &root).unwrap(),
+                    store.records(new.id).unwrap(),
+                    DiffOptions::default(),
+                )
+                .unwrap()
+            });
             serde_json::json!({ "step": "diff", "ms": t, "changed": r.summary.added.count + r.summary.deleted.count, "peakRssMb": rss_mb() })
         }
         "search" => {
@@ -178,14 +275,22 @@ fn main() {
             // index costs today (ROADMAP 3.2, search-index.md E1/E7 baseline).
             let store = Store::open(Path::new(&a[2])).unwrap();
             let q = a[3].to_lowercase();
-            let all: Vec<_> = store.list().unwrap().into_iter().filter(|m| m.status.is_usable()).collect();
+            let all: Vec<_> = store
+                .list()
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.status.is_usable())
+                .collect();
             let hits = |id: u64| {
                 let mut n = 0u64;
                 let mut entries = 0u64;
                 for r in store.records(id).unwrap() {
                     let r = r.unwrap();
                     entries += 1;
-                    if String::from_utf8_lossy(r.name.as_unix_bytes().unwrap_or_default()).to_lowercase().contains(&q) {
+                    if String::from_utf8_lossy(r.name.as_unix_bytes().unwrap_or_default())
+                        .to_lowercase()
+                        .contains(&q)
+                    {
                         n += 1;
                     }
                 }

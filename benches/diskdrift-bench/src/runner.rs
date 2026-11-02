@@ -1,8 +1,9 @@
 //! Benchmark suites: which jobs run, in what order, how often.
 
-use crate::jobs::{self, Job, Measured, Strategy};
+use crate::jobs::{self, Job, Measured, ProductionFormat, Strategy};
 use crate::stores::{self, Backend};
 use crate::synth::{Gen, Params};
+use diskdrift_core::native::NativeName;
 use diskdrift_core::paths::PathStack;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -75,7 +76,11 @@ impl Suite {
             change_rates: vec![0.01],
             history_n: 100_000,
             history_versions: 12,
-            history_strategies: vec![Strategy::Full, Strategy::Cumulative { k: 10 }, Strategy::Chain { k: 10 }],
+            history_strategies: vec![
+                Strategy::Full,
+                Strategy::Cumulative { k: 10 },
+                Strategy::Chain { k: 10 },
+            ],
             history_backends: Vec::new(),
             robustness_n: 200_000,
             scan_roots: vec![PathBuf::from("/System/Library/Frameworks")],
@@ -104,7 +109,11 @@ impl Suite {
             ],
             history_backends: Vec::new(),
             robustness_n: 1_000_000,
-            scan_roots: vec![PathBuf::from("/System/Library"), PathBuf::from("/Applications"), home.join("Library")],
+            scan_roots: vec![
+                PathBuf::from("/System/Library"),
+                PathBuf::from("/Applications"),
+                home.join("Library"),
+            ],
             scan_threads: vec![1, 2, 4, 6, 8, 12, 16],
             scan_trials: 3,
         }
@@ -118,7 +127,15 @@ pub struct Runner {
 }
 
 impl Runner {
-    fn record(&mut self, group: &str, backend: &str, n: u64, param: &str, trial: usize, m: Measured) -> Measured {
+    fn record(
+        &mut self,
+        group: &str,
+        backend: &str,
+        n: u64,
+        param: &str,
+        trial: usize,
+        m: Measured,
+    ) -> Measured {
         let r = &m.result;
         if self.log {
             eprintln!(
@@ -126,7 +143,11 @@ impl Runner {
                 r.elapsed_ms,
                 m.max_rss as f64 / 1e6,
                 r.footprint as f64 / 1e6,
-                if r.ok { "" } else { r.error.as_deref().unwrap_or("FAILED") }
+                if r.ok {
+                    ""
+                } else {
+                    r.error.as_deref().unwrap_or("FAILED")
+                }
             );
         }
         self.rows.push(Row {
@@ -147,9 +168,21 @@ impl Runner {
         m
     }
 
-    fn run(&mut self, group: &str, backend: &str, n: u64, param: &str, trial: usize, job: Job) -> Measured {
+    fn run(
+        &mut self,
+        group: &str,
+        backend: &str,
+        n: u64,
+        param: &str,
+        trial: usize,
+        job: Job,
+    ) -> Measured {
         let m = jobs::run_child(&job).unwrap_or_else(|e| Measured {
-            result: jobs::JobResult { ok: false, error: Some(e.to_string()), ..Default::default() },
+            result: jobs::JobResult {
+                ok: false,
+                error: Some(e.to_string()),
+                ..Default::default()
+            },
             max_rss: 0,
             wall_ms: 0.0,
         });
@@ -180,31 +213,176 @@ impl Runner {
         if want("robustness") {
             self.robustness(s);
         }
+        if want("production") {
+            self.production(s);
+        }
         let _ = std::fs::remove_dir_all(&self.work);
+    }
+
+    fn production(&mut self, s: &Suite) {
+        let n = s.history_n;
+        let params = Params {
+            entries: n,
+            seed: 13,
+            change: 0.01,
+            horizon: s.history_versions,
+        };
+        let trials = (s.trials)(n);
+        for trial in 0..trials {
+            for &format in production_formats(cfg!(windows)) {
+                let dir = self.fresh(&format!("production-{}-{trial}", format.label()));
+                let measured = jobs::run_child(&Job::ProductionStore {
+                    dir: dir.clone(),
+                    params,
+                    format,
+                })
+                .unwrap_or_else(|error| Measured {
+                    result: jobs::JobResult {
+                        ok: false,
+                        error: Some(error.to_string()),
+                        ..Default::default()
+                    },
+                    max_rss: 0,
+                    wall_ms: 0.0,
+                });
+                for (_, param) in production_row_keys(cfg!(windows))
+                    .iter()
+                    .copied()
+                    .filter(|(row_format, _)| *row_format == format)
+                {
+                    let (ms, items, footprint) = if param == "import" {
+                        (
+                            measured.result.extra["importMs"]
+                                .as_f64()
+                                .unwrap_or(measured.result.elapsed_ms),
+                            measured.result.items,
+                            measured.result.extra["footprint"]
+                                .as_u64()
+                                .unwrap_or(measured.result.footprint),
+                        )
+                    } else {
+                        (
+                            measured.result.extra["readMs"]
+                                .as_f64()
+                                .unwrap_or(measured.result.elapsed_ms),
+                            measured.result.extra["readItems"].as_u64().unwrap_or(0),
+                            0,
+                        )
+                    };
+                    let mut result = measured.result.clone();
+                    result.elapsed_ms = ms;
+                    result.items = items;
+                    result.footprint = footprint;
+                    self.record(
+                        "production-store",
+                        format.label(),
+                        n,
+                        param,
+                        trial,
+                        Measured {
+                            result,
+                            max_rss: measured.max_rss,
+                            wall_ms: measured.wall_ms,
+                        },
+                    );
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
     }
 
     fn ops(&mut self, s: &Suite) {
         for &n in &s.sizes {
-            let params = Params { entries: n, seed: 7, change: 0.01, horizon: 100 };
+            let params = Params {
+                entries: n,
+                seed: 7,
+                change: 0.01,
+                horizon: 100,
+            };
             eprintln!("== ops n={n}");
             let trials = (s.trials)(n);
             for t in 0..trials {
-                self.run("gen", "-", n, "generator only", t, Job::Gen { params, version: 0 });
+                self.run(
+                    "gen",
+                    "-",
+                    n,
+                    "generator only",
+                    t,
+                    Job::Gen { params, version: 0 },
+                );
             }
             let prefix = prefix_target(params);
             for &b in &s.backends {
                 for t in 0..trials {
                     let dir = self.fresh(&format!("{}-{n}-{t}", b.name()));
-                    let m = self.run("import", b.name(), n, "", t, Job::Import { backend: b, dir: dir.clone(), params, version: 0, id: 0 });
+                    let m = self.run(
+                        "import",
+                        b.name(),
+                        n,
+                        "",
+                        t,
+                        Job::Import {
+                            backend: b,
+                            dir: dir.clone(),
+                            params,
+                            version: 0,
+                            id: 0,
+                        },
+                    );
                     if !m.result.ok {
                         continue;
                     }
-                    self.run("read", b.name(), n, "", t, Job::Read { backend: b, dir: dir.clone(), id: 0 });
-                    self.run("top", b.name(), n, "stream top-100 files+dirs", t, Job::Top { backend: b, dir: dir.clone(), id: 0 });
+                    self.run(
+                        "read",
+                        b.name(),
+                        n,
+                        "",
+                        t,
+                        Job::Read {
+                            backend: b,
+                            dir: dir.clone(),
+                            id: 0,
+                        },
+                    );
+                    self.run(
+                        "top",
+                        b.name(),
+                        n,
+                        "stream top-100 files+dirs",
+                        t,
+                        Job::Top {
+                            backend: b,
+                            dir: dir.clone(),
+                            id: 0,
+                        },
+                    );
                     if b == Backend::SqliteIndexed {
-                        self.run("top-native", b.name(), n, "SQL ORDER BY alloc LIMIT 100", t, Job::NativeTop { backend: b, dir: dir.clone(), id: 0 });
+                        self.run(
+                            "top-native",
+                            b.name(),
+                            n,
+                            "SQL ORDER BY alloc LIMIT 100",
+                            t,
+                            Job::NativeTop {
+                                backend: b,
+                                dir: dir.clone(),
+                                id: 0,
+                            },
+                        );
                     }
-                    self.run("prefix", b.name(), n, &format!("~{} entries", prefix.1), t, Job::Prefix { backend: b, dir: dir.clone(), id: 0, prefix: prefix.0.clone() });
+                    self.run(
+                        "prefix",
+                        b.name(),
+                        n,
+                        &format!("~{} entries", prefix.1),
+                        t,
+                        Job::Prefix {
+                            backend: b,
+                            dir: dir.clone(),
+                            id: 0,
+                            prefix: prefix.0.clone(),
+                        },
+                    );
                     let _ = std::fs::remove_dir_all(&dir);
                 }
             }
@@ -215,26 +393,95 @@ impl Runner {
         let n = s.change_n;
         for &c in &s.change_rates {
             eprintln!("== change n={n} rate={c}");
-            let params = Params { entries: n, seed: 11, change: c, horizon: 1 };
+            let params = Params {
+                entries: n,
+                seed: 11,
+                change: c,
+                horizon: 1,
+            };
             for &b in &s.backends {
                 for t in 0..(s.trials)(n).min(3) {
                     let dir = self.fresh(&format!("chg-{}-{t}", b.name()));
-                    let base = self.run("change-import", b.name(), n, &format!("{c}"), t, Job::Import { backend: b, dir: dir.clone(), params, version: 0, id: 0 });
+                    let base = self.run(
+                        "change-import",
+                        b.name(),
+                        n,
+                        &format!("{c}"),
+                        t,
+                        Job::Import {
+                            backend: b,
+                            dir: dir.clone(),
+                            params,
+                            version: 0,
+                            id: 0,
+                        },
+                    );
                     if !base.result.ok {
                         continue;
                     }
                     let before = base.result.footprint;
-                    let d = self.run("delta-write", b.name(), n, &format!("{c}"), t, Job::Delta { backend: b, dir: dir.clone(), params, version: 1, id: 1, base: 0 });
+                    let d = self.run(
+                        "delta-write",
+                        b.name(),
+                        n,
+                        &format!("{c}"),
+                        t,
+                        Job::Delta {
+                            backend: b,
+                            dir: dir.clone(),
+                            params,
+                            version: 1,
+                            id: 1,
+                            base: 0,
+                        },
+                    );
                     let after_delta = d.result.footprint;
                     if let Some(row) = self.rows.last_mut() {
                         row.extra = serde_json::json!({ "addedBytes": after_delta.saturating_sub(before), "ops": d.result.items });
                     }
-                    let f = self.run("full-write", b.name(), n, &format!("{c}"), t, Job::Import { backend: b, dir: dir.clone(), params, version: 1, id: 2 });
+                    let f = self.run(
+                        "full-write",
+                        b.name(),
+                        n,
+                        &format!("{c}"),
+                        t,
+                        Job::Import {
+                            backend: b,
+                            dir: dir.clone(),
+                            params,
+                            version: 1,
+                            id: 2,
+                        },
+                    );
                     if let Some(row) = self.rows.last_mut() {
                         row.extra = serde_json::json!({ "addedBytes": f.result.footprint.saturating_sub(after_delta) });
                     }
-                    self.run("diff-via-delta", b.name(), n, &format!("{c}"), t, Job::Diff { backend: b, dir: dir.clone(), a: 0, b: 1 });
-                    self.run("diff-full-full", b.name(), n, &format!("{c}"), t, Job::Diff { backend: b, dir: dir.clone(), a: 0, b: 2 });
+                    self.run(
+                        "diff-via-delta",
+                        b.name(),
+                        n,
+                        &format!("{c}"),
+                        t,
+                        Job::Diff {
+                            backend: b,
+                            dir: dir.clone(),
+                            a: 0,
+                            b: 1,
+                        },
+                    );
+                    self.run(
+                        "diff-full-full",
+                        b.name(),
+                        n,
+                        &format!("{c}"),
+                        t,
+                        Job::Diff {
+                            backend: b,
+                            dir: dir.clone(),
+                            a: 0,
+                            b: 2,
+                        },
+                    );
                     let _ = std::fs::remove_dir_all(&dir);
                 }
             }
@@ -243,7 +490,12 @@ impl Runner {
 
     fn history(&mut self, s: &Suite) {
         let n = s.history_n;
-        let params = Params { entries: n, seed: 13, change: 0.01, horizon: s.history_versions };
+        let params = Params {
+            entries: n,
+            seed: 13,
+            change: 0.01,
+            horizon: s.history_versions,
+        };
         let last = s.history_versions - 1;
         for &strategy in &s.history_strategies {
             for &b in &s.backends {
@@ -252,21 +504,84 @@ impl Runner {
                 }
                 // A full history of row-per-entry engines only multiplies the one-snapshot
                 // footprint (measured in `ops`); skip it to save disk and time.
-                if strategy == Strategy::Full && !matches!(b, Backend::Binary | Backend::BinaryColumnar | Backend::SqliteBlocks) {
+                if strategy == Strategy::Full
+                    && !matches!(
+                        b,
+                        Backend::Binary | Backend::BinaryColumnar | Backend::SqliteBlocks
+                    )
+                {
                     continue;
                 }
                 eprintln!("== history {} {}", strategy.label(), b.name());
                 let dir = self.fresh(&format!("hist-{}", b.name()));
                 let label = strategy.label();
-                let h = self.run("history-write", b.name(), n, &label, 0, Job::History { backend: b, dir: dir.clone(), params, versions: s.history_versions, strategy });
+                let h = self.run(
+                    "history-write",
+                    b.name(),
+                    n,
+                    &label,
+                    0,
+                    Job::History {
+                        backend: b,
+                        dir: dir.clone(),
+                        params,
+                        versions: s.history_versions,
+                        strategy,
+                    },
+                );
                 if !h.result.ok {
                     continue;
                 }
                 for t in 0..3 {
-                    self.run("history-diff-distant", b.name(), n, &label, t, Job::Diff { backend: b, dir: dir.clone(), a: 0, b: last });
-                    self.run("history-diff-adjacent", b.name(), n, &label, t, Job::Diff { backend: b, dir: dir.clone(), a: last - 1, b: last });
-                    self.run("history-read-latest", b.name(), n, &label, t, Job::Read { backend: b, dir: dir.clone(), id: last });
-                    self.run("history-list", b.name(), n, &label, t, Job::List { backend: b, dir: dir.clone() });
+                    self.run(
+                        "history-diff-distant",
+                        b.name(),
+                        n,
+                        &label,
+                        t,
+                        Job::Diff {
+                            backend: b,
+                            dir: dir.clone(),
+                            a: 0,
+                            b: last,
+                        },
+                    );
+                    self.run(
+                        "history-diff-adjacent",
+                        b.name(),
+                        n,
+                        &label,
+                        t,
+                        Job::Diff {
+                            backend: b,
+                            dir: dir.clone(),
+                            a: last - 1,
+                            b: last,
+                        },
+                    );
+                    self.run(
+                        "history-read-latest",
+                        b.name(),
+                        n,
+                        &label,
+                        t,
+                        Job::Read {
+                            backend: b,
+                            dir: dir.clone(),
+                            id: last,
+                        },
+                    );
+                    self.run(
+                        "history-list",
+                        b.name(),
+                        n,
+                        &label,
+                        t,
+                        Job::List {
+                            backend: b,
+                            dir: dir.clone(),
+                        },
+                    );
                 }
                 let _ = std::fs::remove_dir_all(&dir);
             }
@@ -277,50 +592,196 @@ impl Runner {
         #[cfg(not(unix))]
         {
             let _ = s;
-            eprintln!("== robustness unsupported: crash and disk-full jobs require Unix process/resource limits");
+            eprintln!(
+                "== robustness unsupported: crash and disk-full jobs require Unix process/resource limits"
+            );
         }
 
         #[cfg(unix)]
         {
-        let n = s.robustness_n;
-        let params = Params { entries: n, seed: 17, change: 0.01, horizon: 100 };
-        for &b in &s.backends {
-            eprintln!("== robustness {}", b.name());
-            // Crash during ingest.
-            let dir = self.fresh(&format!("crash-{}", b.name()));
-            let first = self.run("crash-setup", b.name(), n, "import snapshot 0", 0, Job::Import { backend: b, dir: dir.clone(), params, version: 0, id: 0 });
-            let kill_at = (first.result.elapsed_ms * 0.5).max(50.0) as u64;
-            let m = match jobs::run_child_with(&Job::Import { backend: b, dir: dir.clone(), params, version: 1, id: 1 }, Some(kill_at)) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("  crash-kill unsupported: {e}");
-                    let _ = std::fs::remove_dir_all(&dir);
-                    continue;
-                }
+            let n = s.robustness_n;
+            let params = Params {
+                entries: n,
+                seed: 17,
+                change: 0.01,
+                horizon: 100,
             };
-            self.record("crash-kill", b.name(), n, &format!("SIGKILL after {kill_at} ms"), 0, m);
-            let v = self.run("crash-verify", b.name(), n, "snapshot 0 intact after kill", 0, Job::Verify { backend: b, dir: dir.clone(), id: 0, params, version: 0 });
-            let listed_partial = v.result.extra["snapshots"].as_array().is_some_and(|a| a.iter().any(|x| x == 1));
-            if listed_partial {
-                // A listed snapshot 1 must then be complete and correct.
-                self.run("crash-verify-partial", b.name(), n, "snapshot 1 listed: must be complete", 0, Job::Verify { backend: b, dir: dir.clone(), id: 1, params, version: 1 });
-            }
-            self.run("crash-reuse", b.name(), n, "write snapshot 2 after crash", 0, Job::Import { backend: b, dir: dir.clone(), params, version: 1, id: 2 });
-            self.run("crash-verify-2", b.name(), n, "snapshot 2 correct", 0, Job::Verify { backend: b, dir: dir.clone(), id: 2, params, version: 1 });
-            let _ = std::fs::remove_dir_all(&dir);
+            for &b in &s.backends {
+                eprintln!("== robustness {}", b.name());
+                // Crash during ingest.
+                let dir = self.fresh(&format!("crash-{}", b.name()));
+                let first = self.run(
+                    "crash-setup",
+                    b.name(),
+                    n,
+                    "import snapshot 0",
+                    0,
+                    Job::Import {
+                        backend: b,
+                        dir: dir.clone(),
+                        params,
+                        version: 0,
+                        id: 0,
+                    },
+                );
+                let kill_at = (first.result.elapsed_ms * 0.5).max(50.0) as u64;
+                let m = match jobs::run_child_with(
+                    &Job::Import {
+                        backend: b,
+                        dir: dir.clone(),
+                        params,
+                        version: 1,
+                        id: 1,
+                    },
+                    Some(kill_at),
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("  crash-kill unsupported: {e}");
+                        let _ = std::fs::remove_dir_all(&dir);
+                        continue;
+                    }
+                };
+                self.record(
+                    "crash-kill",
+                    b.name(),
+                    n,
+                    &format!("SIGKILL after {kill_at} ms"),
+                    0,
+                    m,
+                );
+                let v = self.run(
+                    "crash-verify",
+                    b.name(),
+                    n,
+                    "snapshot 0 intact after kill",
+                    0,
+                    Job::Verify {
+                        backend: b,
+                        dir: dir.clone(),
+                        id: 0,
+                        params,
+                        version: 0,
+                    },
+                );
+                let listed_partial = v.result.extra["snapshots"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == 1));
+                if listed_partial {
+                    // A listed snapshot 1 must then be complete and correct.
+                    self.run(
+                        "crash-verify-partial",
+                        b.name(),
+                        n,
+                        "snapshot 1 listed: must be complete",
+                        0,
+                        Job::Verify {
+                            backend: b,
+                            dir: dir.clone(),
+                            id: 1,
+                            params,
+                            version: 1,
+                        },
+                    );
+                }
+                self.run(
+                    "crash-reuse",
+                    b.name(),
+                    n,
+                    "write snapshot 2 after crash",
+                    0,
+                    Job::Import {
+                        backend: b,
+                        dir: dir.clone(),
+                        params,
+                        version: 1,
+                        id: 2,
+                    },
+                );
+                self.run(
+                    "crash-verify-2",
+                    b.name(),
+                    n,
+                    "snapshot 2 correct",
+                    0,
+                    Job::Verify {
+                        backend: b,
+                        dir: dir.clone(),
+                        id: 2,
+                        params,
+                        version: 1,
+                    },
+                );
+                let _ = std::fs::remove_dir_all(&dir);
 
-            // Write failure (file size limit as a disk-full stand-in).
-            let dir = self.fresh(&format!("full-{}", b.name()));
-            self.run("diskfull-setup", b.name(), n, "import snapshot 0", 0, Job::Import { backend: b, dir: dir.clone(), params, version: 0, id: 0 });
-            // The write must fail part-way: below one snapshot's size for a file-per-
-            // snapshot store, a quarter of a snapshot's growth for single-file stores.
-            let largest = largest_file(&dir);
-            let limit = if matches!(b, Backend::Binary | Backend::BinaryColumnar) { largest / 2 } else { largest + stores::footprint(&dir) / 4 };
-            self.run("diskfull-write", b.name(), n, &format!("RLIMIT_FSIZE={} MB", limit / 1_000_000), 0, Job::LimitedImport { backend: b, dir: dir.clone(), params, id: 1, limit_bytes: limit });
-            self.run("diskfull-verify", b.name(), n, "snapshot 0 intact after failed write", 0, Job::Verify { backend: b, dir: dir.clone(), id: 0, params, version: 0 });
-            self.run("diskfull-reuse", b.name(), n, "write snapshot 2 afterwards", 0, Job::Import { backend: b, dir: dir.clone(), params, version: 1, id: 2 });
-            let _ = std::fs::remove_dir_all(&dir);
-        }
+                // Write failure (file size limit as a disk-full stand-in).
+                let dir = self.fresh(&format!("full-{}", b.name()));
+                self.run(
+                    "diskfull-setup",
+                    b.name(),
+                    n,
+                    "import snapshot 0",
+                    0,
+                    Job::Import {
+                        backend: b,
+                        dir: dir.clone(),
+                        params,
+                        version: 0,
+                        id: 0,
+                    },
+                );
+                // The write must fail part-way: below one snapshot's size for a file-per-
+                // snapshot store, a quarter of a snapshot's growth for single-file stores.
+                let largest = largest_file(&dir);
+                let limit = if matches!(b, Backend::Binary | Backend::BinaryColumnar) {
+                    largest / 2
+                } else {
+                    largest + stores::footprint(&dir) / 4
+                };
+                self.run(
+                    "diskfull-write",
+                    b.name(),
+                    n,
+                    &format!("RLIMIT_FSIZE={} MB", limit / 1_000_000),
+                    0,
+                    Job::LimitedImport {
+                        backend: b,
+                        dir: dir.clone(),
+                        params,
+                        id: 1,
+                        limit_bytes: limit,
+                    },
+                );
+                self.run(
+                    "diskfull-verify",
+                    b.name(),
+                    n,
+                    "snapshot 0 intact after failed write",
+                    0,
+                    Job::Verify {
+                        backend: b,
+                        dir: dir.clone(),
+                        id: 0,
+                        params,
+                        version: 0,
+                    },
+                );
+                self.run(
+                    "diskfull-reuse",
+                    b.name(),
+                    n,
+                    "write snapshot 2 afterwards",
+                    0,
+                    Job::Import {
+                        backend: b,
+                        dir: dir.clone(),
+                        params,
+                        version: 1,
+                        id: 2,
+                    },
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 
@@ -332,12 +793,38 @@ impl Runner {
             let r = root.display().to_string();
             eprintln!("== scan {r}");
             // First touch in this session; cache state is not controllable without root.
-            self.run("scan-first", "getattrlistbulk", 0, &r, 0, Job::Scan { root: root.clone(), lister: "bulk".into(), threads: 8 });
+            self.run(
+                "scan-first",
+                "getattrlistbulk",
+                0,
+                &r,
+                0,
+                Job::Scan {
+                    root: root.clone(),
+                    lister: "bulk".into(),
+                    threads: 8,
+                },
+            );
             for lister in ["bulk", "readdir"] {
                 for &threads in &s.scan_threads {
                     for t in 0..s.scan_trials {
-                        let name = if lister == "bulk" { "getattrlistbulk" } else { "readdir+lstat" };
-                        self.run("scan", name, 0, &format!("{r} threads={threads}"), t, Job::Scan { root: root.clone(), lister: lister.into(), threads });
+                        let name = if lister == "bulk" {
+                            "getattrlistbulk"
+                        } else {
+                            "readdir+lstat"
+                        };
+                        self.run(
+                            "scan",
+                            name,
+                            0,
+                            &format!("{r} threads={threads}"),
+                            t,
+                            Job::Scan {
+                                root: root.clone(),
+                                lister: lister.into(),
+                                threads,
+                            },
+                        );
                     }
                 }
             }
@@ -347,7 +834,20 @@ impl Runner {
                 }
                 for t in 0..s.scan_trials.min(2) {
                     let dir = self.fresh(&format!("e2e-{}", b.name()));
-                    self.run("scan-store", b.name(), 0, &format!("{r} threads=8"), t, Job::ScanStore { root: root.clone(), lister: "bulk".into(), threads: 8, backend: b, dir: dir.clone() });
+                    self.run(
+                        "scan-store",
+                        b.name(),
+                        0,
+                        &format!("{r} threads=8"),
+                        t,
+                        Job::ScanStore {
+                            root: root.clone(),
+                            lister: "bulk".into(),
+                            threads: 8,
+                            backend: b,
+                            dir: dir.clone(),
+                        },
+                    );
                     let _ = std::fs::remove_dir_all(&dir);
                 }
             }
@@ -374,18 +874,22 @@ fn largest_file(dir: &Path) -> u64 {
 }
 
 /// A directory (depth >= 2) whose subtree holds about 1% of all entries.
-pub fn prefix_target(params: Params) -> (Vec<Vec<u8>>, u64) {
+pub fn prefix_target(params: Params) -> (Vec<NativeName>, u64) {
     let target = (params.entries / 100).max(10);
     let mut stack = PathStack::new();
-    let mut open: Vec<(Vec<Vec<u8>>, u64)> = Vec::new();
-    let mut best: Option<(Vec<Vec<u8>>, u64)> = None;
-    let consider = |p: Vec<Vec<u8>>, c: u64, best: &mut Option<(Vec<Vec<u8>>, u64)>| {
-        if p.len() >= 3 && best.as_ref().is_none_or(|(_, bc)| c.abs_diff(target) < bc.abs_diff(target)) {
+    let mut open: Vec<(Vec<NativeName>, u64)> = Vec::new();
+    let mut best: Option<(Vec<NativeName>, u64)> = None;
+    let consider = |p: Vec<NativeName>, c: u64, best: &mut Option<(Vec<NativeName>, u64)>| {
+        if p.len() >= 3
+            && best
+                .as_ref()
+                .is_none_or(|(_, bc)| c.abs_diff(target) < bc.abs_diff(target))
+        {
             *best = Some((p, c));
         }
     };
     for r in Gen::new(params, 0) {
-        stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default()).unwrap();
+        stack.set(r.depth, &r.name).unwrap();
         while open.last().is_some_and(|(p, _)| p.len() > r.depth as usize) {
             let (p, c) = open.pop().unwrap();
             if let Some(parent) = open.last_mut() {
@@ -406,7 +910,10 @@ pub fn prefix_target(params: Params) -> (Vec<Vec<u8>>, u64) {
         }
         consider(p, c, &mut best);
     }
-    best.unwrap_or((vec![b"/synthetic".to_vec()], params.entries))
+    best.unwrap_or((
+        vec![NativeName::unix(b"/synthetic".to_vec())],
+        params.entries,
+    ))
 }
 
 fn sysctl(name: &str) -> String {
@@ -418,7 +925,9 @@ fn sysctl(name: &str) -> String {
 }
 
 pub fn machine(work: &Path) -> Machine {
-    let fs = diskdrift_platform::statfs_path(work.parent().unwrap_or(work)).map(|m| m.fs_type).unwrap_or_default();
+    let fs = diskdrift_platform::statfs_path(work.parent().unwrap_or(work))
+        .map(|m| m.fs_type)
+        .unwrap_or_default();
     let info = |target: &str| {
         std::process::Command::new("/usr/sbin/diskutil")
             .args(["info", target])
@@ -442,7 +951,11 @@ pub fn machine(work: &Path) -> Machine {
         get(&phys, "Solid State"),
         get(&phys, "Protocol")
     );
-    let rustc = std::process::Command::new("rustc").arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    let rustc = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
     Machine {
         model: sysctl("hw.model"),
         cpu: sysctl("machdep.cpu.brand_string"),
@@ -459,3 +972,52 @@ pub fn machine(work: &Path) -> Machine {
 }
 
 pub use stores::footprint;
+
+fn production_formats(windows: bool) -> &'static [ProductionFormat] {
+    if windows {
+        &[ProductionFormat::Dds2]
+    } else {
+        &[ProductionFormat::Dds1, ProductionFormat::Dds2]
+    }
+}
+
+fn production_row_keys(windows: bool) -> &'static [(ProductionFormat, &'static str)] {
+    if windows {
+        &[
+            (ProductionFormat::Dds2, "import"),
+            (ProductionFormat::Dds2, "read"),
+        ]
+    } else {
+        &[
+            (ProductionFormat::Dds1, "import"),
+            (ProductionFormat::Dds1, "read"),
+            (ProductionFormat::Dds2, "import"),
+            (ProductionFormat::Dds2, "read"),
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_row_keys_cover_both_unix_formats_and_windows_dds2() {
+        assert_eq!(
+            production_row_keys(false),
+            [
+                (ProductionFormat::Dds1, "import"),
+                (ProductionFormat::Dds1, "read"),
+                (ProductionFormat::Dds2, "import"),
+                (ProductionFormat::Dds2, "read"),
+            ]
+        );
+        assert_eq!(
+            production_row_keys(true),
+            [
+                (ProductionFormat::Dds2, "import"),
+                (ProductionFormat::Dds2, "read"),
+            ]
+        );
+    }
+}

@@ -3,10 +3,15 @@
 //! macOS is the implemented target. Other Unix systems get a portable fallback
 //! (std listing, `statvfs` without volume-group handling).
 
+use diskdrift_core::measurement::Envelope;
+#[cfg(unix)]
+use diskdrift_core::native::RootKind;
+use diskdrift_core::native::{ForeignEncoding, NativePath, NativeRoot};
+use diskdrift_core::record::{FileIdScheme, FileIdScope, TimestampResolution};
 use diskdrift_core::walk::DirLister;
-use diskdrift_core::native::{ForeignEncoding, NativePath, NativeRoot, RootKind};
-use std::ffi::OsStr;
+use serde::Serializer;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 pub fn native_path(value: &OsStr) -> NativePath {
@@ -23,19 +28,15 @@ pub fn native_path(value: &OsStr) -> NativePath {
 }
 
 pub fn native_root(value: &OsStr) -> Result<NativeRoot, diskdrift_core::native::NativeError> {
+    #[cfg(unix)]
     let path = native_path(value);
     #[cfg(unix)]
-    { NativeRoot::new(path, RootKind::Posix, false) }
+    {
+        NativeRoot::new(path, RootKind::Posix, false)
+    }
     #[cfg(windows)]
     {
-        let units = match &path { NativePath::Windows(v) => v, NativePath::Unix(_) => unreachable!() };
-        let text = String::from_utf16_lossy(units);
-        let (kind, verbatim) = if text.starts_with(r"\\?\Volume{") { (RootKind::VolumeGuid, true) }
-        else if text.starts_with(r"\\?\UNC\") { (RootKind::Unc, true) }
-        else if text.starts_with(r"\\?\") { (RootKind::Drive, true) }
-        else if text.starts_with(r"\\") { (RootKind::Unc, false) }
-        else { (RootKind::Drive, false) };
-        NativeRoot::new(path, kind, verbatim)
+        windows::native_root(value)
     }
 }
 
@@ -64,6 +65,35 @@ pub fn system_volume_root() -> PathBuf {
                 root
             })
             .unwrap_or_else(|| PathBuf::from(r"C:\"))
+    }
+}
+
+/// Whether a mount is a platform-managed helper volume that should not be
+/// presented as a user disk by default.
+pub fn is_hidden_system_mount(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        path.starts_with("/System/Volumes")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether a mount is one of the platform's default system roots.
+pub fn is_default_system_mount(path: &Path) -> bool {
+    if path == system_volume_root() {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        path == Path::new("/System/Volumes/Data")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 
@@ -110,7 +140,9 @@ pub fn path_from_native(value: &NativePath) -> Result<PathBuf, ForeignEncoding> 
     {
         use std::os::unix::ffi::OsStringExt;
         match value {
-            NativePath::Unix(bytes) => Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()))),
+            NativePath::Unix(bytes) => {
+                Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.clone())))
+            }
             NativePath::Windows(_) => Err(ForeignEncoding::WindowsOnUnix),
         }
     }
@@ -126,6 +158,8 @@ pub fn path_from_native(value: &NativePath) -> Result<PathBuf, ForeignEncoding> 
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
 /// One mounted filesystem.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -148,20 +182,53 @@ pub struct MountInfo {
     pub dev: u64,
 }
 
+/// Mounted volumes that were usable, plus per-volume discovery failures.
+/// A failed volume must not hide volumes that were successfully inspected.
+#[derive(Debug, Clone, Default)]
+pub struct MountInventory {
+    pub mounts: Vec<MountInfo>,
+    pub errors: Vec<String>,
+}
+
 /// Capacity values for the volume containing a path. Every field is optional: the
 /// OS may not provide a value for a given volume.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeCapacity {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub total_bytes: Option<u64>,
-    /// Strictly free space.
+    /// Total free space in the capacity domain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
+    /// Space available to the caller.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub available_bytes: Option<u64>,
     /// Space available for important (user-initiated) writes, including purgeable.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub available_important_bytes: Option<u64>,
     /// Space available for opportunistic (background) writes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub available_opportunistic_bytes: Option<u64>,
     pub volume_name: Option<String>,
     pub volume_uuid: Option<String>,
+    pub domain: Option<String>,
+    pub scope: Option<String>,
+    pub observed_at: Option<String>,
+    pub quality: MeasurementQuality,
+    pub provenance: Option<String>,
+    pub timestamp_resolution: TimestampResolution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeasurementQuality {
+    #[default]
+    Unknown,
+    Observed,
+    Estimated,
+    LowerBound,
+    Unsupported,
+    NotApplicable,
 }
 
 impl VolumeCapacity {
@@ -174,16 +241,41 @@ impl VolumeCapacity {
     }
 }
 
-/// Capacity values for the volume containing `path` (all `None` where unsupported).
-pub fn volume_capacity(path: &Path) -> VolumeCapacity {
+/// Capacity values for the volume containing `path`.
+pub fn volume_capacity(path: &Path) -> std::io::Result<VolumeCapacity> {
     #[cfg(target_os = "macos")]
     {
         macos::space::volume_capacity(path)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::space::volume_capacity(path)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mount = statfs_path(path)?;
+        Ok(VolumeCapacity {
+            total_bytes: Some(mount.total_bytes),
+            free_bytes: Some(mount.free_bytes),
+            available_bytes: Some(mount.available_bytes),
+            domain: Some("filesystem".into()),
+            scope: Some("mount".into()),
+            observed_at: Some(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            quality: MeasurementQuality::Observed,
+            provenance: Some("statfs".into()),
+            timestamp_resolution: TimestampResolution::Seconds,
+            ..VolumeCapacity::default()
+        })
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = path;
-        VolumeCapacity::default()
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "volume capacity is not implemented on this target",
+        ))
     }
 }
 
@@ -198,6 +290,7 @@ pub struct DeviceInfo {
     pub bus: Option<String>,
     pub serial: Option<String>,
     /// Size of the whole medium in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_bytes: Option<u64>,
     pub internal: Option<bool>,
     pub removable: Option<bool>,
@@ -208,8 +301,7 @@ pub struct DeviceInfo {
 
 /// What disk the volume holding a path is: the facts a disk identity is built
 /// from (ADR 0002). Read-only.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DiskInfo {
     pub mount_point: PathBuf,
     pub fs_type: String,
@@ -220,6 +312,66 @@ pub struct DiskInfo {
     /// BSD name of the volume (`disk4s1`).
     pub bsd_name: Option<String>,
     pub device: DeviceInfo,
+    pub native_identity: Option<NativePath>,
+    pub native_mount_path: Option<NativePath>,
+    pub native_aliases: Vec<NativePath>,
+    pub file_id_scheme: FileIdScheme,
+    pub file_id_scope: FileIdScope,
+    pub allocation_semantics: String,
+    pub allocation_provenance: Option<String>,
+    pub timestamp_resolution: TimestampResolution,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskInfoWire<'a> {
+    mount_point: &'a PathBuf,
+    fs_type: &'a str,
+    volume_name: &'a Option<String>,
+    volume_uuid: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capacity_bytes: Option<u64>,
+    bsd_name: &'a Option<String>,
+    device: &'a DeviceInfo,
+    native_identity: &'a Option<NativePath>,
+    native_mount_path: &'a Option<NativePath>,
+    native_aliases: &'a [NativePath],
+    file_id_scheme: FileIdScheme,
+    file_id_scope: FileIdScope,
+    allocation_semantics: &'a str,
+    allocation_provenance: &'a Option<String>,
+    timestamp_resolution: TimestampResolution,
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl serde::Serialize for DiskInfo {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        DiskInfoWire {
+            mount_point: &self.mount_point,
+            fs_type: &self.fs_type,
+            volume_name: &self.volume_name,
+            volume_uuid: &self.volume_uuid,
+            capacity_bytes: self.capacity_bytes,
+            bsd_name: &self.bsd_name,
+            device: &self.device,
+            native_identity: &self.native_identity,
+            native_mount_path: &self.native_mount_path,
+            native_aliases: &self.native_aliases,
+            file_id_scheme: self.file_id_scheme,
+            file_id_scope: self.file_id_scope,
+            allocation_semantics: &self.allocation_semantics,
+            allocation_provenance: &self.allocation_provenance,
+            timestamp_resolution: self.timestamp_resolution,
+            measurement: self
+                .capacity_bytes
+                .map(|_| {
+                    Envelope::observed("filesystem", "volume capacity", "platform volume adapter")
+                })
+                .unwrap_or_default(),
+        }
+        .serialize(serializer)
+    }
 }
 
 /// The disk holding `path`: mount point and filesystem from `statfs`, name and
@@ -233,28 +385,41 @@ pub struct DiskInfo {
 /// sealed snapshot whose UUID changes with every macOS update, and the macOS
 /// system disk is one disk (ADR 0002).
 pub fn disk_info(path: &Path) -> std::io::Result<DiskInfo> {
-    let mount = statfs_path(path)?;
-    let cap = volume_capacity(&mount.mount_point);
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut info = DiskInfo {
-        fs_type: mount.fs_type.clone(),
-        volume_name: cap.volume_name,
-        volume_uuid: cap.volume_uuid,
-        capacity_bytes: cap.total_bytes.or(Some(mount.total_bytes).filter(|&b| b > 0)),
-        mount_point: mount.mount_point,
-        ..DiskInfo::default()
-    };
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
     {
-        let data = Path::new("/System/Volumes/Data");
-        let described = if info.mount_point == Path::new("/") && data.is_dir() { data } else { info.mount_point.as_path() };
-        if let Some(da) = macos::disk::describe(described) {
-            info.volume_uuid = da.volume_uuid.or(info.volume_uuid);
-            info.bsd_name = da.bsd_name;
-            info.device = da.device;
-        }
+        windows::volumes::disk_info(path)
     }
-    Ok(info)
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mount = statfs_path(path)?;
+        let cap = volume_capacity(&mount.mount_point)?;
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut info = DiskInfo {
+            fs_type: mount.fs_type.clone(),
+            volume_name: cap.volume_name,
+            volume_uuid: cap.volume_uuid,
+            capacity_bytes: cap
+                .total_bytes
+                .or(Some(mount.total_bytes).filter(|&b| b > 0)),
+            mount_point: mount.mount_point,
+            ..DiskInfo::default()
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let data = Path::new("/System/Volumes/Data");
+            let described = if info.mount_point == Path::new("/") && data.is_dir() {
+                data
+            } else {
+                info.mount_point.as_path()
+            };
+            if let Some(da) = macos::disk::describe(described) {
+                info.volume_uuid = da.volume_uuid.or(info.volume_uuid);
+                info.bsd_name = da.bsd_name;
+                info.device = da.device;
+            }
+        }
+        Ok(info)
+    }
 }
 
 /// A volume whose automatic mount careful mode refused (spec 3C): not
@@ -306,13 +471,22 @@ pub struct MountGuard;
 #[cfg(not(target_os = "macos"))]
 impl MountGuard {
     pub fn start(_events: Box<dyn Fn(GuardEvent) + Send>) -> std::io::Result<MountGuard> {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "careful mode needs macOS"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "careful mode needs macOS",
+        ))
     }
     pub fn mount_read_only(&self, _bsd: &str, _browse: bool) -> Result<PathBuf, DaError> {
-        Err(DaError { status: 0, message: Some("careful mode needs macOS".into()) })
+        Err(DaError {
+            status: 0,
+            message: Some("careful mode needs macOS".into()),
+        })
     }
     pub fn unmount_and_eject(&self, _bsd: &str) -> Result<(), DaError> {
-        Err(DaError { status: 0, message: Some("careful mode needs macOS".into()) })
+        Err(DaError {
+            status: 0,
+            message: Some("careful mode needs macOS".into()),
+        })
     }
 }
 
@@ -323,6 +497,15 @@ pub struct ScanLayout {
     pub alias_paths: HashSet<PathBuf>,
     /// The root is part of the macOS System+Data volume group.
     pub volume_group: bool,
+    /// Exact Windows volume identity and mount aliases, when running on Windows.
+    pub windows_identity: Option<NativePath>,
+    pub windows_mount_key: Option<NativePath>,
+    pub windows_aliases: Vec<NativePath>,
+    pub windows_file_id_scheme: FileIdScheme,
+    pub windows_file_id_scope: FileIdScope,
+    pub windows_allocation_semantics: String,
+    pub windows_allocation_provenance: Option<String>,
+    pub windows_timestamp_resolution: TimestampResolution,
 }
 
 /// Selectable directory listing backends.
@@ -349,29 +532,50 @@ pub fn lister(kind: ListerKind) -> Box<dyn DirLister> {
         ListerKind::ReadDir => Box::new(diskdrift_core::walk::StdLister),
         #[cfg(target_os = "macos")]
         ListerKind::Auto | ListerKind::Bulk => Box::new(macos::bulk::BulkLister),
+        #[cfg(target_os = "windows")]
+        ListerKind::Auto | ListerKind::Bulk | ListerKind::ReadDir => {
+            Box::new(windows::lister::WideLister)
+        }
         #[cfg(all(unix, not(target_os = "macos")))]
         ListerKind::Auto | ListerKind::Bulk => Box::new(diskdrift_core::walk::StdLister),
-        #[cfg(not(unix))]
-        ListerKind::Auto | ListerKind::Bulk | ListerKind::ReadDir => Box::new(diskdrift_core::walk::StdLister),
+        #[cfg(not(any(unix, target_os = "windows")))]
+        ListerKind::Auto | ListerKind::Bulk | ListerKind::ReadDir => {
+            Box::new(diskdrift_core::walk::StdLister)
+        }
     }
 }
 
-pub fn mounts() -> std::io::Result<Vec<MountInfo>> {
+pub fn mounts() -> std::io::Result<MountInventory> {
     #[cfg(target_os = "macos")]
     {
-        macos::mounts()
+        Ok(MountInventory {
+            mounts: macos::mounts()?,
+            errors: Vec::new(),
+        })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::volumes::mounts()
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         #[cfg(target_os = "linux")]
         {
             let text = std::fs::read_to_string("/proc/self/mountinfo")?;
             let mut out = Vec::new();
             for line in text.lines() {
-                let Some((left, right)) = line.split_once(" - ") else { continue };
+                let Some((left, right)) = line.split_once(" - ") else {
+                    continue;
+                };
                 let fields: Vec<_> = left.split_whitespace().collect();
-                let Some(raw_mount) = fields.get(4) else { continue };
-                let mount = raw_mount.replace(r"\040", " ").replace(r"\011", "\t").replace(r"\012", "\n").replace(r"\134", "\\");
+                let Some(raw_mount) = fields.get(4) else {
+                    continue;
+                };
+                let mount = raw_mount
+                    .replace(r"\040", " ")
+                    .replace(r"\011", "\t")
+                    .replace(r"\012", "\n")
+                    .replace(r"\134", "\\");
                 let mount_point = PathBuf::from(mount);
                 if out.iter().any(|m: &MountInfo| m.mount_point == mount_point) {
                     continue;
@@ -383,11 +587,17 @@ pub fn mounts() -> std::io::Result<Vec<MountInfo>> {
                 info.device = details.get(1).copied().unwrap_or_default().into();
                 out.push(info);
             }
-            Ok(out)
+            Ok(MountInventory {
+                mounts: out,
+                errors: Vec::new(),
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "mount listing is not implemented on this target"))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mount listing is not implemented on this target",
+            ))
         }
     }
 }
@@ -397,11 +607,16 @@ pub fn statfs_path(path: &Path) -> std::io::Result<MountInfo> {
     {
         macos::statfs_path(path)
     }
+    #[cfg(target_os = "windows")]
+    {
+        windows::volumes::statfs_path(path)
+    }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::OsStrExt;
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
         let mut stats = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
         if unsafe { libc::statvfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -415,12 +630,22 @@ pub fn statfs_path(path: &Path) -> std::io::Result<MountInfo> {
         let mut fs_type = "unknown".to_string();
         if let Ok(mounts) = std::fs::read_to_string("/proc/self/mountinfo") {
             for line in mounts.lines() {
-                let Some((left, right)) = line.split_once(" - ") else { continue };
+                let Some((left, right)) = line.split_once(" - ") else {
+                    continue;
+                };
                 let fields: Vec<_> = left.split_whitespace().collect();
-                let Some(raw_mount) = fields.get(4) else { continue };
-                let mount = raw_mount.replace(r"\040", " ").replace(r"\011", "\t").replace(r"\012", "\n").replace(r"\134", "\\");
+                let Some(raw_mount) = fields.get(4) else {
+                    continue;
+                };
+                let mount = raw_mount
+                    .replace(r"\040", " ")
+                    .replace(r"\011", "\t")
+                    .replace(r"\012", "\n")
+                    .replace(r"\134", "\\");
                 let candidate = Path::new(&mount);
-                if path.starts_with(candidate) && candidate.as_os_str().len() > mount_point.as_os_str().len() {
+                if path.starts_with(candidate)
+                    && candidate.as_os_str().len() > mount_point.as_os_str().len()
+                {
                     mount_point = candidate.to_path_buf();
                     let details: Vec<_> = right.split_whitespace().collect();
                     fs_type = details.first().copied().unwrap_or("unknown").into();
@@ -441,33 +666,39 @@ pub fn statfs_path(path: &Path) -> std::io::Result<MountInfo> {
             dev,
         })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        std::fs::metadata(path)?;
-        Ok(MountInfo {
-            mount_point: path.to_path_buf(),
-            device: String::new(),
-            fs_type: "unknown".into(),
-            total_bytes: 0,
-            free_bytes: 0,
-            available_bytes: 0,
-            read_only: false,
-            local: true,
-            browsable: true,
-            dev: 0,
-        })
+        {
+            std::fs::metadata(path)?;
+            Ok(MountInfo {
+                mount_point: path.to_path_buf(),
+                device: String::new(),
+                fs_type: "unknown".into(),
+                total_bytes: 0,
+                free_bytes: 0,
+                available_bytes: 0,
+                read_only: false,
+                local: true,
+                browsable: true,
+                dev: 0,
+            })
+        }
     }
 }
 
-pub fn scan_layout(root: &Path) -> ScanLayout {
+pub fn scan_layout(root: &Path) -> std::io::Result<ScanLayout> {
     #[cfg(target_os = "macos")]
     {
         macos::scan_layout(root)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        windows::volumes::scan_layout(root)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = root;
-        ScanLayout::default()
+        Ok(ScanLayout::default())
     }
 }
 
@@ -499,7 +730,10 @@ mod disk_tests {
         let root = disk_info(Path::new("/")).unwrap();
         let home = disk_info(&std::env::home_dir().unwrap()).unwrap();
         assert_eq!(root.mount_point, Path::new("/"));
-        assert_eq!(root.volume_uuid, home.volume_uuid, "/ is identified by the Data volume, as the home folder is");
+        assert_eq!(
+            root.volume_uuid, home.volume_uuid,
+            "/ is identified by the Data volume, as the home folder is"
+        );
         assert_eq!(root.bsd_name, home.bsd_name);
     }
 }

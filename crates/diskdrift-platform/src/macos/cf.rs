@@ -24,9 +24,19 @@ unsafe extern "C" {
         len: CFIndex,
         is_directory: Boolean,
     ) -> CFURLRef;
-    fn CFURLGetFileSystemRepresentation(url: CFURLRef, resolve: Boolean, buffer: *mut u8, max: CFIndex) -> Boolean;
+    fn CFURLGetFileSystemRepresentation(
+        url: CFURLRef,
+        resolve: Boolean,
+        buffer: *mut u8,
+        max: CFIndex,
+    ) -> Boolean;
     fn CFURLGetTypeID() -> CFTypeID;
-    fn CFURLCopyResourcePropertyForKey(url: CFURLRef, key: CFStringRef, value: *mut CFTypeRef, error: *mut CFTypeRef) -> Boolean;
+    fn CFURLCopyResourcePropertyForKey(
+        url: CFURLRef,
+        key: CFStringRef,
+        value: *mut CFTypeRef,
+        error: *mut CFTypeRef,
+    ) -> Boolean;
     pub fn CFRelease(cf: CFTypeRef);
     fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
     fn CFNumberGetTypeID() -> CFTypeID;
@@ -36,8 +46,17 @@ unsafe extern "C" {
     fn CFDictionaryGetTypeID() -> CFTypeID;
     fn CFNumberGetValue(number: CFTypeRef, the_type: CFIndex, value_ptr: *mut c_void) -> Boolean;
     fn CFBooleanGetValue(boolean: CFTypeRef) -> Boolean;
-    fn CFStringGetCString(s: CFStringRef, buffer: *mut c_char, size: CFIndex, encoding: u32) -> Boolean;
-    pub fn CFStringCreateWithCString(alloc: CFAllocatorRef, c_str: *const c_char, encoding: u32) -> CFStringRef;
+    fn CFStringGetCString(
+        s: CFStringRef,
+        buffer: *mut c_char,
+        size: CFIndex,
+        encoding: u32,
+    ) -> Boolean;
+    pub fn CFStringCreateWithCString(
+        alloc: CFAllocatorRef,
+        c_str: *const c_char,
+        encoding: u32,
+    ) -> CFStringRef;
     fn CFUUIDCreateString(alloc: CFAllocatorRef, uuid: CFTypeRef) -> CFStringRef;
     fn CFDictionaryGetValue(dict: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
 }
@@ -62,7 +81,9 @@ impl Owned {
 /// A CFString from Rust text, owned.
 pub fn cfstr(s: &str) -> Owned {
     let c = std::ffi::CString::new(s).expect("no NUL in keys");
-    Owned(unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8) })
+    Owned(unsafe {
+        CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), K_CF_STRING_ENCODING_UTF8)
+    })
 }
 
 /// `v` as text: a CFString, or a CFUUID in its canonical form.
@@ -80,10 +101,19 @@ pub fn string_of(v: CFTypeRef) -> Option<String> {
             return None;
         }
         let mut buf = [0 as c_char; 1024];
-        if CFStringGetCString(v, buf.as_mut_ptr(), buf.len() as CFIndex, K_CF_STRING_ENCODING_UTF8) == 0 {
+        if CFStringGetCString(
+            v,
+            buf.as_mut_ptr(),
+            buf.len() as CFIndex,
+            K_CF_STRING_ENCODING_UTF8,
+        ) == 0
+        {
             return None;
         }
-        let s = CStr::from_ptr(buf.as_ptr()).to_string_lossy().trim().to_string();
+        let s = CStr::from_ptr(buf.as_ptr())
+            .to_string_lossy()
+            .trim()
+            .to_string();
         (!s.is_empty()).then_some(s)
     }
 }
@@ -97,7 +127,9 @@ pub fn number_of(v: CFTypeRef) -> Option<u64> {
             return None;
         }
         let mut out: i64 = 0;
-        (CFNumberGetValue(v, K_CF_NUMBER_SINT64_TYPE, (&mut out as *mut i64).cast()) != 0 && out >= 0).then_some(out as u64)
+        (CFNumberGetValue(v, K_CF_NUMBER_SINT64_TYPE, (&mut out as *mut i64).cast()) != 0
+            && out >= 0)
+            .then_some(out as u64)
     }
 }
 
@@ -127,12 +159,15 @@ pub fn path_of_url(v: CFTypeRef) -> Option<std::path::PathBuf> {
         return None;
     }
     let mut buf = vec![0u8; 4096];
-    let ok = unsafe { CFURLGetFileSystemRepresentation(v, 1, buf.as_mut_ptr(), buf.len() as CFIndex) };
+    let ok =
+        unsafe { CFURLGetFileSystemRepresentation(v, 1, buf.as_mut_ptr(), buf.len() as CFIndex) };
     if ok == 0 {
         return None;
     }
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..end])))
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+        &buf[..end],
+    )))
 }
 
 /// A file URL for `path`.
@@ -141,13 +176,22 @@ pub struct Url(pub Owned);
 impl Url {
     pub fn new(path: &Path, is_dir: bool) -> Option<Url> {
         let bytes = path.as_os_str().as_bytes();
-        let r = unsafe { CFURLCreateFromFileSystemRepresentation(std::ptr::null(), bytes.as_ptr(), bytes.len() as CFIndex, is_dir as Boolean) };
+        let r = unsafe {
+            CFURLCreateFromFileSystemRepresentation(
+                std::ptr::null(),
+                bytes.as_ptr(),
+                bytes.len() as CFIndex,
+                is_dir as Boolean,
+            )
+        };
         Owned::new(r).map(Url)
     }
 
     fn copy(&self, key: CFStringRef) -> Option<Owned> {
         let mut value: CFTypeRef = std::ptr::null();
-        let ok = unsafe { CFURLCopyResourcePropertyForKey(self.0.0, key, &mut value, std::ptr::null_mut()) };
+        let ok = unsafe {
+            CFURLCopyResourcePropertyForKey(self.0.0, key, &mut value, std::ptr::null_mut())
+        };
         if ok == 0 { None } else { Owned::new(value) }
     }
 

@@ -7,6 +7,7 @@ pub mod apps;
 pub mod classify;
 pub mod command;
 pub mod doctor;
+pub mod measurement;
 pub mod openfiles;
 pub mod suspects;
 pub mod usage;

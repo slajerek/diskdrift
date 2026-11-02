@@ -1,9 +1,9 @@
 //! Directory listing with `getattrlistbulk(2)`: names and metadata for many entries
 //! per system call, without a separate `lstat` per entry.
 
-use diskdrift_core::record::Kind;
 use diskdrift_core::native::NativeName;
-use diskdrift_core::record::{EntryFields, FileId};
+use diskdrift_core::record::Kind;
+use diskdrift_core::record::{EntryFields, FileId, FileIdScheme, TimestampResolution};
 use diskdrift_core::walk::{DirLister, RawEntry, StdLister};
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -41,7 +41,12 @@ impl DirLister for BulkLister {
     fn list(&self, dir: &Path, out: &mut Vec<RawEntry>) -> io::Result<()> {
         let cpath = CString::new(dir.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -107,7 +112,10 @@ fn rd_i64(b: &[u8], at: usize) -> io::Result<i64> {
 }
 
 fn bad(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("getattrlistbulk: {what}"))
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("getattrlistbulk: {what}"),
+    )
 }
 
 /// Parses `count` packed entries. Field order follows getattrlist(2): the returned
@@ -126,7 +134,12 @@ fn parse_entries(b: &[u8], count: usize, out: &mut Vec<RawEntry>) -> io::Result<
         let fileattr = rd_u32(b, f + 12)?;
         f += 20; // attribute_set_t
 
-        let mut e = RawEntry { nlink: 1, ..RawEntry::default() };
+        let mut e = RawEntry {
+            nlink: 1,
+            file_id_scheme: FileIdScheme::PosixInode64,
+            timestamp_resolution: TimestampResolution::Nanoseconds,
+            ..RawEntry::default()
+        };
         let mut available = EntryFields::empty();
         if common & ATTR_CMN_ERROR != 0 {
             let errno = rd_u32(b, f)?;
@@ -139,7 +152,9 @@ fn parse_entries(b: &[u8], count: usize, out: &mut Vec<RawEntry>) -> io::Result<
             let off = rd_u32(b, f)? as i32;
             let nlen = rd_u32(b, f + 4)? as usize;
             let start = (f as isize + off as isize) as usize;
-            let name = b.get(start..start + nlen).ok_or_else(|| bad("name out of range"))?;
+            let name = b
+                .get(start..start + nlen)
+                .ok_or_else(|| bad("name out of range"))?;
             let name = name.strip_suffix(&[0]).unwrap_or(name);
             e.name = NativeName::unix(name.to_vec());
             f += 8;
@@ -161,19 +176,30 @@ fn parse_entries(b: &[u8], count: usize, out: &mut Vec<RawEntry>) -> io::Result<
         if common & libc::ATTR_CMN_CRTIME != 0 {
             e.btime = rd_i64(b, f)?;
             e.btime_nanos = rd_i64(b, f + 8)? as u32;
-            available = available.union(EntryFields::BIRTH_TIME).union(EntryFields::BIRTH_TIME_NANOS);
+            available = available
+                .union(EntryFields::BIRTH_TIME)
+                .union(EntryFields::BIRTH_TIME_NANOS);
             f += 16;
         }
         if common & libc::ATTR_CMN_MODTIME != 0 {
             e.mtime = rd_i64(b, f)?;
             e.mtime_nanos = rd_i64(b, f + 8)? as u32;
-            available = available.union(EntryFields::MTIME).union(EntryFields::MTIME_NANOS);
+            available = available
+                .union(EntryFields::MTIME)
+                .union(EntryFields::MTIME_NANOS);
             f += 16;
         }
         if common & libc::ATTR_CMN_FILEID != 0 {
             e.ino = rd_i64(b, f)? as u64;
-            e.file_id = FileId { low: e.ino, high: 0 };
-            available = available.union(EntryFields::FILE_ID);
+            e.file_id = FileId {
+                low: e.ino,
+                high: 0,
+            };
+            // A zero file ID cannot support stable identity. Keep the raw inode
+            // for diagnostics but do not claim the unavailable field is observed.
+            if e.file_id != FileId::ZERO {
+                available = available.union(EntryFields::FILE_ID);
+            }
             f += 8;
         }
         if dirattr & libc::ATTR_DIR_MOUNTSTATUS != 0 {
@@ -214,6 +240,25 @@ mod tests {
     use diskdrift_core::testutil::TestDir;
 
     #[test]
+    fn zero_file_id_is_not_available() {
+        let mut bytes = vec![0u8; 48];
+        bytes[0..4].copy_from_slice(&48u32.to_ne_bytes());
+        bytes[4..8].copy_from_slice(
+            &(libc::ATTR_CMN_NAME | libc::ATTR_CMN_FILEID)
+                .to_ne_bytes(),
+        );
+        bytes[24..28].copy_from_slice(&16u32.to_ne_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_ne_bytes());
+        bytes[40..42].copy_from_slice(b"x\0");
+
+        let mut entries = Vec::new();
+        parse_entries(&bytes, 1, &mut entries).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].available.contains(EntryFields::FILE_ID));
+    }
+
+    #[test]
     fn matches_std_lister() {
         let t = TestDir::new("bulk-vs-std");
         t.file("small", 10);
@@ -250,7 +295,11 @@ mod tests {
     fn large_directory_spans_multiple_calls() {
         let t = TestDir::new("bulk-large");
         for i in 0..5000 {
-            std::fs::write(t.path().join(format!("file-with-a-longish-name-{i:05}")), b"").unwrap();
+            std::fs::write(
+                t.path().join(format!("file-with-a-longish-name-{i:05}")),
+                b"",
+            )
+            .unwrap();
         }
         let mut out = Vec::new();
         BulkLister.list(t.path(), &mut out).unwrap();
@@ -261,9 +310,14 @@ mod tests {
     fn detects_mount_points() {
         // /System/Volumes/Data is a mount point on every APFS system since 10.15.
         let mut out = Vec::new();
-        if BulkLister.list(Path::new("/System/Volumes"), &mut out).is_ok()
-            && let Some(data) = out.iter().find(|e| e.name == NativeName::unix(b"Data".to_vec())) {
-                assert!(data.is_mount_point);
-            }
+        if BulkLister
+            .list(Path::new("/System/Volumes"), &mut out)
+            .is_ok()
+            && let Some(data) = out
+                .iter()
+                .find(|e| e.name == NativeName::unix(b"Data".to_vec()))
+        {
+            assert!(data.is_mount_point);
+        }
     }
 }

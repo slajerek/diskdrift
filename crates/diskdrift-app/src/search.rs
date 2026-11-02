@@ -9,12 +9,13 @@ use crate::config::Effective;
 use crate::disks::Volume;
 use crate::snapshots::{AppError, Result, open_store};
 use diskdrift_core::delta::{self, OpKind};
-use diskdrift_core::paths::PathStack;
-use diskdrift_core::pathser::NativePath;
-use diskdrift_core::record::{Kind, Record};
-use diskdrift_storage::{OpStream, Registry, SnapshotMeta, Store};
+use diskdrift_core::native::{NativeName, NativePath};
+use diskdrift_core::paths::{PathStack, components_under, join_components};
+use diskdrift_core::record::{EntryFields, Kind, Record, flags};
+use diskdrift_diagnostics::measurement::Envelope;
+use diskdrift_storage::{OpStream, Registry, RootValue, SnapshotMeta, Store};
 use regex_automata::meta::Regex;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -43,7 +44,16 @@ pub struct Query {
 
 impl Query {
     pub fn new(pattern: &str) -> Query {
-        Query { pattern: pattern.into(), regex: false, exact: false, kind: None, min_size: 0, disk: None, set: None, limit: 100 }
+        Query {
+            pattern: pattern.into(),
+            regex: false,
+            exact: false,
+            kind: None,
+            min_size: 0,
+            disk: None,
+            set: None,
+            limit: 100,
+        }
     }
 }
 
@@ -67,15 +77,22 @@ pub fn fold_into(text: &[u8], out: &mut Vec<u8>) {
 
 fn fold(text: &[u8], lower: bool, out: &mut Vec<u8>) {
     if text.is_ascii() {
-        out.extend(text.iter().map(|b| if lower { b.to_ascii_lowercase() } else { *b }));
+        out.extend(
+            text.iter()
+                .map(|b| if lower { b.to_ascii_lowercase() } else { *b }),
+        );
         return;
     }
     let Ok(s) = std::str::from_utf8(text) else {
-        out.extend(text.iter().map(|b| if lower { b.to_ascii_lowercase() } else { *b }));
+        out.extend(
+            text.iter()
+                .map(|b| if lower { b.to_ascii_lowercase() } else { *b }),
+        );
         return;
     };
     let mut buf = [0u8; 4];
-    let mut push = |c: char, out: &mut Vec<u8>| out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    let mut push =
+        |c: char, out: &mut Vec<u8>| out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
     for c in s.nfd() {
         if is_combining_mark(c) {
             continue;
@@ -98,7 +115,10 @@ fn fold(text: &[u8], lower: bool, out: &mut Vec<u8>) {
             _ => None,
         };
         match mapped {
-            Some(m) => out.extend(m.bytes().map(|b| if lower { b.to_ascii_lowercase() } else { b })),
+            Some(m) => out.extend(
+                m.bytes()
+                    .map(|b| if lower { b.to_ascii_lowercase() } else { b }),
+            ),
             None if lower => c.to_lowercase().for_each(|l| push(l, out)),
             None => push(c, out),
         }
@@ -171,20 +191,37 @@ impl Matcher {
             return Err(AppError::Usage("the search pattern is empty".into()));
         }
         let on_path = pattern.contains('/');
-        let pattern = if on_path { pattern.trim_start_matches('/') } else { pattern };
+        let pattern = if on_path {
+            pattern.trim_start_matches('/')
+        } else {
+            pattern
+        };
         let mut folded = Vec::new();
         let glob = !regex && pattern.contains(['*', '?', '[']);
         let how = if regex || glob {
             // A regex keeps its case (`\D` is not `\d`) and matches case-insensitively.
             fold(pattern.as_bytes(), glob && !q.exact, &mut folded);
-            let mut text = if q.exact { pattern.to_string() } else { String::from_utf8_lossy(&folded).into_owned() };
+            let mut text = if q.exact {
+                pattern.to_string()
+            } else {
+                String::from_utf8_lossy(&folded).into_owned()
+            };
             if glob {
                 text = glob_to_regex(&text, on_path);
             }
             let re = Regex::builder()
-                .syntax(regex_automata::util::syntax::Config::new().case_insensitive(!q.exact).utf8(false))
+                .syntax(
+                    regex_automata::util::syntax::Config::new()
+                        .case_insensitive(!q.exact)
+                        .utf8(false),
+                )
                 .build(&text)
-                .map_err(|e| AppError::Usage(format!("invalid {}: {e}", if glob { "glob" } else { "regular expression" })))?;
+                .map_err(|e| {
+                    AppError::Usage(format!(
+                        "invalid {}: {e}",
+                        if glob { "glob" } else { "regular expression" }
+                    ))
+                })?;
             How::Re(Box::new(re))
         } else {
             if q.exact {
@@ -194,7 +231,11 @@ impl Matcher {
             }
             How::Part(Box::new(memchr::memmem::Finder::new(&folded).into_owned()))
         };
-        Ok(Matcher { how, on_path, exact: q.exact })
+        Ok(Matcher {
+            how,
+            on_path,
+            exact: q.exact,
+        })
     }
 
     pub fn on_path(&self) -> bool {
@@ -231,7 +272,11 @@ pub struct ScanRef {
 
 impl ScanRef {
     fn of(m: &SnapshotMeta) -> ScanRef {
-        ScanRef { id: m.id, name: m.name.clone(), started_at: m.started_at.clone() }
+        ScanRef {
+            id: m.id,
+            name: m.name.clone(),
+            started_at: m.started_at.clone(),
+        }
     }
 }
 
@@ -251,34 +296,34 @@ pub struct Place {
 }
 
 /// A match in the newest scan of a disk and folder.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct Hit {
     /// Full path as scanned.
-    #[serde(flatten)]
     pub path: NativePath,
     pub kind: Kind,
     /// Allocated bytes ("on disk").
     pub size: u64,
     pub logical_size: u64,
     pub mtime: i64,
+    #[doc(hidden)]
+    pub available: EntryFields,
+    pub measurement: Envelope,
     pub scan: ScanRef,
-    #[serde(flatten)]
     pub place: Place,
 }
 
 /// What the history says about one path.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct Lifetime {
     /// Full path as last scanned.
-    #[serde(flatten)]
     pub path: NativePath,
     pub kind: Kind,
     /// Last known allocated size and modification time.
     pub size: u64,
     pub mtime: i64,
-    #[serde(flatten)]
+    #[doc(hidden)]
+    pub available: EntryFields,
+    pub measurement: Envelope,
     pub place: Place,
     /// Newest scan that has it.
     pub last_seen: ScanRef,
@@ -294,6 +339,118 @@ pub struct Lifetime {
     pub uncertain: Option<String>,
     /// The same name appeared elsewhere in `gone_in` (by name only).
     pub moved_to: Option<String>,
+}
+
+fn field_available(available: EntryFields, field: EntryFields) -> bool {
+    available.contains(field)
+}
+
+fn record_envelope(record: &Record, fields: EntryFields) -> Envelope {
+    if record.has(flags::STAT_ERROR) {
+        Envelope::default()
+    } else {
+        let requested = [
+            EntryFields::LOGICAL_SIZE,
+            EntryFields::ALLOCATED_SIZE,
+            EntryFields::MTIME,
+        ]
+        .into_iter()
+        .filter(|field| fields.contains(*field));
+        let requested = requested.collect::<Vec<_>>();
+        let any = requested
+            .iter()
+            .any(|field| record.available.contains(*field));
+        let complete = requested
+            .iter()
+            .all(|field| record.available.contains(*field));
+        if !any {
+            Envelope::default()
+        } else if !complete || record.has(flags::CONTENTS_UNKNOWN) {
+            Envelope::lower_bound("filesystem", "snapshot record", "partial snapshot coverage")
+        } else {
+            Envelope::observed("filesystem", "snapshot record", "canonical snapshot record")
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HitWire<'a> {
+    #[serde(flatten)]
+    path: &'a NativePath,
+    kind: Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mtime: Option<i64>,
+    #[serde(flatten)]
+    measurement: &'a Envelope,
+    scan: &'a ScanRef,
+    #[serde(flatten)]
+    place: &'a Place,
+}
+
+impl Serialize for Hit {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        HitWire {
+            path: &self.path,
+            kind: self.kind,
+            size: field_available(self.available, EntryFields::ALLOCATED_SIZE).then_some(self.size),
+            logical_size: field_available(self.available, EntryFields::LOGICAL_SIZE)
+                .then_some(self.logical_size),
+            mtime: field_available(self.available, EntryFields::MTIME).then_some(self.mtime),
+            measurement: &self.measurement,
+            scan: &self.scan,
+            place: &self.place,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LifetimeWire<'a> {
+    #[serde(flatten)]
+    path: &'a NativePath,
+    kind: Kind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mtime: Option<i64>,
+    #[serde(flatten)]
+    measurement: &'a Envelope,
+    #[serde(flatten)]
+    place: &'a Place,
+    last_seen: &'a ScanRef,
+    gone_in: &'a Option<ScanRef>,
+    appeared_in: &'a Option<ScanRef>,
+    oldest: &'a ScanRef,
+    changes: u32,
+    uncertain: &'a Option<String>,
+    moved_to: &'a Option<String>,
+}
+
+impl Serialize for Lifetime {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        LifetimeWire {
+            path: &self.path,
+            kind: self.kind,
+            size: field_available(self.available, EntryFields::ALLOCATED_SIZE).then_some(self.size),
+            mtime: field_available(self.available, EntryFields::MTIME).then_some(self.mtime),
+            measurement: &self.measurement,
+            place: &self.place,
+            last_seen: &self.last_seen,
+            gone_in: &self.gone_in,
+            appeared_in: &self.appeared_in,
+            oldest: &self.oldest,
+            changes: self.changes,
+            uncertain: &self.uncertain,
+            moved_to: &self.moved_to,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// The newest scans and what matched in them.
@@ -315,7 +472,7 @@ pub struct Current {
     #[serde(skip)]
     plan: Plan,
     #[serde(skip)]
-    keys: Option<HashSet<(String, Vec<u8>)>>,
+    keys: Option<HashSet<(String, SearchPathKey)>>,
 }
 
 impl Current {
@@ -385,11 +542,17 @@ pub struct FindResult {
 #[derive(Debug, Clone)]
 struct Group {
     disk_key: String,
-    root_in_volume: String,
+    root_in_volume: RootValue,
     scans: Vec<SnapshotMeta>,
     place: Place,
     /// A newer scan of an enclosing folder on the same disk (group index).
     covered_by: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SearchPathKey {
+    Exact(NativePath),
+    LegacyDisplayOnly(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -397,24 +560,51 @@ struct Plan {
     groups: Vec<Group>,
 }
 
-fn inside(inner: &str, outer: &str) -> bool {
-    outer == "/" || inner == outer || inner.strip_prefix(outer).is_some_and(|r| r.starts_with('/'))
+fn inside(inner: &RootValue, outer: &RootValue) -> Result<bool> {
+    match (inner, outer) {
+        (RootValue::Exact(inner), RootValue::Exact(outer)) => components_under(outer, inner)
+            .map(|components| components.is_some())
+            .map_err(|e| AppError::Store(diskdrift_storage::StoreError::PathOrder(e))),
+        (RootValue::LegacyDisplayOnly(inner), RootValue::LegacyDisplayOnly(outer)) => Ok(outer
+            == "/"
+            || inner == outer
+            || inner
+                .strip_prefix(outer)
+                .is_some_and(|r| r.starts_with('/'))),
+        _ => Ok(false),
+    }
 }
 
-fn plan(store: &Store, reg: &Registry, mounted: &[Volume], only: Option<&[String]>) -> Result<Plan> {
+fn plan(
+    store: &Store,
+    reg: &Registry,
+    mounted: &[Volume],
+    only: Option<&[String]>,
+) -> Result<Plan> {
     let mut groups: Vec<Group> = Vec::new();
     let metas = store.list()?;
     for m in metas.iter().rev().filter(|m| m.status.is_usable()) {
         if only.is_some_and(|ids| !m.disk.as_ref().is_some_and(|d| ids.contains(d))) {
             continue;
         }
-        let disk_key = m.disk.clone().unwrap_or_else(|| format!("{}|{}", m.volume.uuid.as_deref().unwrap_or("-"), m.root));
-        let riv = m.derived_root_in_volume();
-        match groups.iter_mut().find(|g| g.disk_key == disk_key && g.root_in_volume == riv) {
+        let disk_key = m.disk.clone().unwrap_or_else(|| {
+            format!(
+                "{}|{}",
+                m.volume.uuid.as_deref().unwrap_or("-"),
+                m.volume.fs_type
+            )
+        });
+        let riv = m.derived_root_in_volume_value();
+        match groups
+            .iter_mut()
+            .find(|g| g.disk_key == disk_key && g.root_in_volume == riv)
+        {
             Some(g) => g.scans.push(m.clone()),
             None => {
                 let known = m.disk.as_deref().and_then(|id| reg.get(id));
-                let at = known.and_then(|d| mounted.iter().find(|v| v.identity == d.identity)).map(|v| v.mount_point.clone());
+                let at = known
+                    .and_then(|d| mounted.iter().find(|v| v.identity == d.identity))
+                    .map(|v| v.mount_point.clone());
                 let place = Place {
                     disk: m.disk.clone(),
                     disk_name: crate::disks::disk_name(reg, m).unwrap_or_else(|| m.root.clone()),
@@ -422,72 +612,172 @@ fn plan(store: &Store, reg: &Registry, mounted: &[Volume], only: Option<&[String
                     mount_point: at,
                     root: m.root.clone(),
                 };
-                groups.push(Group { disk_key, root_in_volume: riv, scans: vec![m.clone()], place, covered_by: None });
+                groups.push(Group {
+                    disk_key,
+                    root_in_volume: riv,
+                    scans: vec![m.clone()],
+                    place,
+                    covered_by: None,
+                });
             }
         }
     }
     // Groups are in order of their newest scan, newest first: an enclosing
     // folder scanned later covers this one.
     for i in 0..groups.len() {
-        groups[i].covered_by = (0..i).find(|&j| {
-            groups[j].disk_key == groups[i].disk_key
+        for j in 0..i {
+            if groups[j].disk_key == groups[i].disk_key
                 && groups[j].covered_by.is_none()
-                && inside(&groups[i].root_in_volume, &groups[j].root_in_volume)
                 && groups[j].scans[0].started_at > groups[i].scans[0].started_at
-        });
+                && inside(&groups[i].root_in_volume, &groups[j].root_in_volume)?
+            {
+                groups[i].covered_by = Some(j);
+                break;
+            }
+        }
     }
     Ok(Plan { groups })
 }
 
-/// Path below the scan root, `/`-separated (empty for the root itself).
-fn rel_path(comps: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (i, c) in comps.iter().enumerate().skip(1) {
-        if i > 1 {
-            out.push(b'/');
-        }
-        out.extend_from_slice(c);
-    }
-    out
+fn rel_path(comps: &[NativeName]) -> Vec<NativeName> {
+    comps.iter().skip(1).cloned().collect()
 }
 
 /// The same path as a key that is equal across scans of different folders of one disk.
-fn volume_key(g: &Group, rel: &[u8]) -> (String, Vec<u8>) {
-    let mut p = g.root_in_volume.trim_end_matches('/').as_bytes().to_vec();
-    if !rel.is_empty() {
-        p.push(b'/');
-        p.extend_from_slice(rel);
-    }
-    (g.disk_key.clone(), p)
+fn volume_key(g: &Group, rel: &[NativeName]) -> Result<(String, SearchPathKey)> {
+    let key = match &g.root_in_volume {
+        RootValue::Exact(root) => SearchPathKey::Exact(full_path(root, rel)?),
+        RootValue::LegacyDisplayOnly(root) => {
+            let relative = rel
+                .iter()
+                .map(NativeName::display)
+                .collect::<Vec<_>>()
+                .join("/");
+            let path = if relative.is_empty() {
+                root.clone()
+            } else {
+                format!("{}/{}", root.trim_end_matches(['/', '\\']), relative)
+            };
+            SearchPathKey::LegacyDisplayOnly(path)
+        }
+    };
+    Ok((g.disk_key.clone(), key))
 }
 
 /// The path below `root` of a full path of a scan with that root.
-fn rel_of<'a>(root: &str, path: &'a [u8]) -> &'a [u8] {
-    match path.strip_prefix(root.as_bytes()) {
-        Some(r) => r.strip_prefix(b"/").unwrap_or(r),
-        None => path,
+fn rel_of(root: &NativePath, path: &NativePath) -> Result<Vec<NativeName>> {
+    let Some(components) = components_under(root, path)
+        .map_err(|e| AppError::Store(diskdrift_storage::StoreError::PathOrder(e)))?
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(components.into_iter().skip(1).collect())
+}
+
+fn full_path(root: &NativePath, rel: &[NativeName]) -> Result<NativePath> {
+    let root = match root {
+        NativePath::Unix(bytes) => NativeName::unix(bytes.clone()),
+        NativePath::Windows(units) => NativeName::windows(units.clone()),
+    };
+    let mut components = Vec::with_capacity(rel.len() + 1);
+    components.push(root);
+    components.extend_from_slice(rel);
+    join_components(&components)
+        .map_err(|e| AppError::Store(diskdrift_storage::StoreError::PathOrder(e)))
+}
+
+fn core_error(error: std::io::Error) -> AppError {
+    if let Some(path) = error
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<diskdrift_core::paths::PathOrderError>())
+    {
+        AppError::Store(diskdrift_storage::StoreError::PathOrder(*path))
+    } else {
+        AppError::Runtime(error.to_string())
     }
 }
 
-fn full_path(root: &str, rel: &[u8]) -> Vec<u8> {
-    let mut p = root.as_bytes().to_vec();
-    if !rel.is_empty() {
-        if p.last() != Some(&b'/') {
-            p.push(b'/');
-        }
-        p.extend_from_slice(rel);
+fn scan_root(store: &Store, meta: &SnapshotMeta) -> Result<NativePath> {
+    if let Some(root) = &meta.root_native {
+        return Ok(root.path.clone());
     }
-    p
+    let mut records = store.records(meta.id)?;
+    let first = records
+        .next()
+        .transpose()
+        .map_err(|e| AppError::Runtime(format!("reading scan #{}: {e}", meta.id)))?
+        .ok_or_else(|| AppError::Runtime(format!("scan #{} has no root record", meta.id)))?;
+    join_components(std::slice::from_ref(&first.name))
+        .map_err(|e| AppError::Store(diskdrift_storage::StoreError::PathOrder(e)))
+}
+
+/// A lossless, query-facing representation of a native component. It is never
+/// used as an identity key: callers retain `NativeName`/`NativePath` values.
+/// Lone UTF-16 surrogates use an ASCII escape so they cannot collide with a
+/// real U+FFFD in the display text.
+fn search_bytes(name: &NativeName, out: &mut Vec<u8>) {
+    match name {
+        NativeName::Unix(bytes) => out.extend_from_slice(bytes),
+        NativeName::Windows(units) => {
+            for value in char::decode_utf16(units.iter().copied()) {
+                match value {
+                    Ok(value) => {
+                        if value == '\\' {
+                            // A component cannot contain a Windows separator, but
+                            // this non-UTF-8 sentinel keeps synthetic/offline data
+                            // distinct from the ASCII surrogate escape below.
+                            out.push(0x80);
+                            continue;
+                        }
+                        let mut utf8 = [0u8; 4];
+                        out.extend_from_slice(value.encode_utf8(&mut utf8).as_bytes());
+                    }
+                    Err(error) => out.extend_from_slice(
+                        format!("\\u{{{:04x}}}", error.unpaired_surrogate()).as_bytes(),
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn search_components(components: &[NativeName], include_root: bool) -> Vec<u8> {
+    let start = usize::from(!include_root);
+    let mut bytes = Vec::new();
+    for (index, component) in components.iter().skip(start).enumerate() {
+        if index > 0 {
+            bytes.push(b'/');
+        }
+        search_bytes(component, &mut bytes);
+    }
+    bytes
+}
+
+fn match_name(matcher: &Matcher, name: &NativeName, buf: &mut Vec<u8>) -> bool {
+    let mut text = Vec::new();
+    search_bytes(name, &mut text);
+    matcher.is_match(&text, buf)
+}
+
+fn match_path(matcher: &Matcher, components: &[NativeName], buf: &mut Vec<u8>) -> bool {
+    matcher.is_match(&search_components(components, false), buf)
 }
 
 fn passes(q: &Query, r: &Record) -> bool {
-    q.kind.is_none_or(|k| k == r.kind) && r.alloc >= q.min_size
+    let allocated_known =
+        !r.has(flags::STAT_ERROR) && r.available.contains(EntryFields::ALLOCATED_SIZE);
+    q.kind.is_none_or(|k| k == r.kind)
+        && (allocated_known && r.alloc >= q.min_size || !allocated_known && q.min_size == 0)
 }
 
 /// Runs `f` over `items` on up to one thread per core.
 fn par_each<T: Sync>(items: &[T], f: impl Fn(usize, &T) + Sync) {
     let next = AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(items.len()).max(1);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(items.len())
+        .max(1);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| {
@@ -503,14 +793,27 @@ fn par_each<T: Sync>(items: &[T], f: impl Fn(usize, &T) + Sync) {
 
 struct Found {
     hits: Vec<Hit>,
-    keys: Vec<(String, Vec<u8>)>,
+    keys: Vec<(String, SearchPathKey)>,
     total: u64,
     entries: u64,
 }
 
 /// Streams one snapshot and collects its matches.
-fn search_snapshot(store: &Store, g: &Group, m: &SnapshotMeta, q: &Query, matcher: &Matcher, want_keys: bool, cancel: &AtomicBool) -> Result<Found> {
-    let mut found = Found { hits: Vec::new(), keys: Vec::new(), total: 0, entries: 0 };
+fn search_snapshot(
+    store: &Store,
+    g: &Group,
+    m: &SnapshotMeta,
+    q: &Query,
+    matcher: &Matcher,
+    want_keys: bool,
+    cancel: &AtomicBool,
+) -> Result<Found> {
+    let mut found = Found {
+        hits: Vec::new(),
+        keys: Vec::new(),
+        total: 0,
+        entries: 0,
+    };
     let mut stack = PathStack::new();
     let mut buf = Vec::new();
     for (n, r) in store.records(m.id)?.enumerate() {
@@ -519,25 +822,45 @@ fn search_snapshot(store: &Store, g: &Group, m: &SnapshotMeta, q: &Query, matche
             break;
         }
         found.entries += 1;
-        stack.set(r.depth, r.name.as_unix_bytes().ok_or_else(|| AppError::Runtime("Windows names are not supported by DDS1 search".into()))?).map_err(|e| AppError::Runtime(e.to_string()))?;
+        stack.set(r.depth, &r.name).map_err(core_error)?;
         if r.depth == 0 || !passes(q, &r) {
             continue;
         }
-        let hit = if matcher.on_path() { matcher.is_match(&rel_path(stack.components()), &mut buf) } else { matcher.is_match(r.name.as_unix_bytes().ok_or_else(|| AppError::Runtime("Windows names are not supported by DDS1 search".into()))?, &mut buf) };
+        let hit = if matcher.on_path() {
+            match_path(matcher, &rel_path(stack.components()), &mut buf)
+        } else {
+            match_name(matcher, &r.name, &mut buf)
+        };
         if !hit {
             continue;
         }
         found.total += 1;
         if want_keys {
-            found.keys.push(volume_key(g, &rel_path(stack.components())));
+            found
+                .keys
+                .push(volume_key(g, &rel_path(stack.components()))?);
         }
         if found.hits.len() < q.limit {
+            let available = if r.has(flags::STAT_ERROR) {
+                EntryFields::empty()
+            } else {
+                r.available
+            };
             found.hits.push(Hit {
-                path: NativePath(stack.path_bytes()),
+                path: stack
+                    .path()
+                    .map_err(|e| AppError::Store(diskdrift_storage::StoreError::PathOrder(e)))?,
                 kind: r.kind,
                 size: r.alloc,
                 logical_size: r.size,
                 mtime: r.mtime,
+                available,
+                measurement: record_envelope(
+                    &r,
+                    EntryFields::ALLOCATED_SIZE
+                        .union(EntryFields::LOGICAL_SIZE)
+                        .union(EntryFields::MTIME),
+                ),
                 scan: ScanRef::of(m),
                 place: g.place.clone(),
             });
@@ -552,7 +875,12 @@ pub fn current(settings: &Effective, q: &Query, mounted: Option<&[Volume]>) -> R
     current_cancellable(settings, q, mounted, &AtomicBool::new(false))
 }
 
-pub fn current_cancellable(settings: &Effective, q: &Query, mounted: Option<&[Volume]>, cancel: &AtomicBool) -> Result<Current> {
+pub fn current_cancellable(
+    settings: &Effective,
+    q: &Query,
+    mounted: Option<&[Volume]>,
+    cancel: &AtomicBool,
+) -> Result<Current> {
     let start = std::time::Instant::now();
     let matcher = Matcher::new(q)?;
     let store_path = settings.storage_path.value.clone();
@@ -572,21 +900,32 @@ pub fn current_cancellable(settings: &Effective, q: &Query, mounted: Option<&[Vo
         });
     };
     let reg = store.registry()?;
-    let disk = q.disk.as_deref().map(|d| crate::disks::resolve(&store, d)).transpose()?;
+    let disk = q
+        .disk
+        .as_deref()
+        .map(|d| crate::disks::resolve(&store, d))
+        .transpose()?;
     let read;
     let mounted = match mounted {
         Some(v) => v,
         None => {
-            read = crate::disks::volumes();
+            read = crate::disks::volumes()?.volumes;
             &read
         }
     };
     let only: Option<Vec<String>> = match (&disk, &q.set) {
         (Some(d), _) => Some(vec![d.id.clone()]),
         (None, Some(set)) => {
-            let ids: Vec<String> = reg.disks.iter().filter(|d| d.sets.iter().any(|x| x.eq_ignore_ascii_case(set))).map(|d| d.id.clone()).collect();
+            let ids: Vec<String> = reg
+                .disks
+                .iter()
+                .filter(|d| d.sets.iter().any(|x| x.eq_ignore_ascii_case(set)))
+                .map(|d| d.id.clone())
+                .collect();
             if ids.is_empty() {
-                return Err(AppError::Usage(format!("no disk is in the set '{set}' (see `diskdrift disks`)")));
+                return Err(AppError::Usage(format!(
+                    "no disk is in the set '{set}' (see `diskdrift disks`)"
+                )));
             }
             Some(ids)
         }
@@ -594,8 +933,13 @@ pub fn current_cancellable(settings: &Effective, q: &Query, mounted: Option<&[Vo
     };
     let plan = plan(&store, &reg, mounted, only.as_deref())?;
     let want_keys = plan.groups.iter().any(|g| g.covered_by.is_some());
-    let live: Vec<&Group> = plan.groups.iter().filter(|g| g.covered_by.is_none()).collect();
-    let results: Mutex<Vec<Option<Result<Found>>>> = Mutex::new((0..live.len()).map(|_| None).collect());
+    let live: Vec<&Group> = plan
+        .groups
+        .iter()
+        .filter(|g| g.covered_by.is_none())
+        .collect();
+    let results: Mutex<Vec<Option<Result<Found>>>> =
+        Mutex::new((0..live.len()).map(|_| None).collect());
     par_each(&live, |i, g| {
         let r = search_snapshot(&store, g, &g.scans[0], q, &matcher, want_keys, cancel);
         results.lock().expect("not poisoned")[i] = Some(r);
@@ -604,14 +948,19 @@ pub fn current_cancellable(settings: &Effective, q: &Query, mounted: Option<&[Vo
     let mut total = 0;
     let mut searched = Vec::new();
     let mut keys = want_keys.then(HashSet::new);
-    let mut seen: HashSet<(String, Vec<u8>)> = HashSet::new();
+    let mut seen: HashSet<(String, SearchPathKey)> = HashSet::new();
     for (g, r) in live.iter().zip(results.into_inner().expect("not poisoned")) {
         let found = r.expect("every group searched")?;
-        searched.push(SearchedScan { scan: ScanRef::of(&g.scans[0]), place: g.place.clone(), entries: found.entries });
+        searched.push(SearchedScan {
+            scan: ScanRef::of(&g.scans[0]),
+            place: g.place.clone(),
+            entries: found.entries,
+        });
         total += found.total;
         for h in found.hits {
             // One path in two scans of the same disk (overlapping folders): the newer one.
-            if seen.insert(volume_key(g, rel_of(&g.place.root, &h.path))) {
+            let root = scan_root(&store, &g.scans[0])?;
+            if seen.insert(volume_key(g, &rel_of(&root, &h.path)?)?) {
                 hits.push(h);
             } else {
                 total -= 1;
@@ -631,7 +980,9 @@ pub fn current_cancellable(settings: &Effective, q: &Query, mounted: Option<&[Vo
         hits,
         total,
         truncated,
-        disk: disk.map(|d| d.display_name().to_string()).or_else(|| q.set.as_ref().map(|s| format!("set {s}"))),
+        disk: disk
+            .map(|d| d.display_name().to_string())
+            .or_else(|| q.set.as_ref().map(|s| format!("set {s}"))),
         elapsed_ms: start.elapsed().as_millis() as u64,
         plan,
         keys,
@@ -648,49 +999,89 @@ struct Event {
 }
 
 /// The matching ops of each path, by group and path below the root.
-type Events = HashMap<(usize, Vec<u8>), Vec<Event>>;
+type Events = HashMap<(usize, Vec<NativeName>), Vec<Event>>;
 
 /// What a pair of adjacent scans says about one name: the ops between them.
 fn pair_ops(store: &Store, older: &SnapshotMeta, newer: &SnapshotMeta) -> Result<OpStream> {
-    let err = |e: std::io::Error| AppError::Runtime(format!("comparing scans #{} and #{}: {e}", older.id, newer.id));
+    let err = |e: std::io::Error| match core_error(e) {
+        AppError::Store(error) => AppError::Store(error),
+        AppError::Runtime(error) => AppError::Runtime(format!(
+            "comparing scans #{} and #{}: {error}",
+            older.id, newer.id
+        )),
+        other => other,
+    };
     if older.storage.base == Some(newer.id)
         && let Some((_, ops)) = store.delta_ops(older.id)?
     {
         return Ok(ops);
     }
     // A keyframe (or a delta against another scan): compare the two.
-    let ops = delta::compute(store.records_as(newer.id, &older.root)?, store.records(older.id)?).map_err(err)?;
+    let root = scan_root(store, older)?;
+    let ops = delta::compute(store.records_as(newer.id, &root)?, store.records(older.id)?)
+        .map_err(err)?;
     Ok(Box::new(ops.into_iter().map(Ok)))
 }
 
 /// Why a path missing from `newer` may still be there.
-fn uncertainty(older: &SnapshotMeta, newer: &SnapshotMeta, rel: &[u8]) -> Option<String> {
-    let path = full_path(&newer.root, rel);
-    let comps: Vec<&[u8]> = rel.split(|b| *b == b'/').collect();
+fn uncertainty(older: &SnapshotMeta, newer: &SnapshotMeta, rel: &[NativeName]) -> Option<String> {
+    let relative = rel
+        .iter()
+        .map(NativeName::display)
+        .collect::<Vec<_>>()
+        .join("/");
+    let path = if relative.is_empty() {
+        newer.root.clone()
+    } else {
+        format!("{}/{}", newer.root.trim_end_matches('/'), relative)
+    };
+    let comps: Vec<String> = rel.iter().map(NativeName::display).collect();
     for e in &newer.options.exclude {
-        let hit = if e.starts_with('/') { path.starts_with(e.trim_end_matches('/').as_bytes()) } else { comps.contains(&e.as_bytes()) };
+        let hit = if e.starts_with('/') {
+            path.starts_with(e.trim_end_matches('/'))
+        } else {
+            comps.iter().any(|component| component == e)
+        };
         if hit {
             return Some(format!("scan #{} excluded {e}", newer.id));
         }
     }
-    if older.options.exclude != newer.options.exclude || older.options.stay_on_filesystem != newer.options.stay_on_filesystem {
-        return Some(format!("scans #{} and #{} were made with different settings", older.id, newer.id));
+    if older.options.exclude != newer.options.exclude
+        || older.options.stay_on_filesystem != newer.options.stay_on_filesystem
+    {
+        return Some(format!(
+            "scans #{} and #{} were made with different settings",
+            older.id, newer.id
+        ));
     }
     for i in newer.issues() {
-        let p = i.path.trim_end_matches('/').as_bytes();
-        if path.starts_with(p) && (path.len() == p.len() || path[p.len()] == b'/') {
+        let p = i.path.trim_end_matches('/');
+        if path.starts_with(p)
+            && (path.len() == p.len() || path.as_bytes().get(p.len()) == Some(&b'/'))
+        {
             return Some(format!("scan #{} could not read {}", newer.id, i.path));
         }
     }
     let counts = newer.counts.as_ref()?;
-    (counts.issue_count > newer.issues().len() as u64 && counts.inaccessible_dirs > 0)
-        .then(|| format!("scan #{} could not read {} folders; it may be in one of them", newer.id, counts.inaccessible_dirs))
+    (counts.issue_count > newer.issues().len() as u64 && counts.inaccessible_dirs > 0).then(|| {
+        format!(
+            "scan #{} could not read {} folders; it may be in one of them",
+            newer.id, counts.inaccessible_dirs
+        )
+    })
 }
 
 /// Reads the history of every disk and folder, newest pairs first, and says
 /// when each matching path disappeared (and, for current matches with
 /// `HistoryMode::Always`, when it appeared). `progress(done, total)`.
-pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: bool, cancel: &AtomicBool, progress: &(dyn Fn(usize, usize) + Sync)) -> Result<History> {
+pub fn history(
+    settings: &Effective,
+    q: &Query,
+    cur: &Current,
+    with_current: bool,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<History> {
     let start = std::time::Instant::now();
     let matcher = Matcher::new(q)?;
     let Some(store) = open_store(settings)? else {
@@ -702,9 +1093,15 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
     for (gi, g) in groups.iter().enumerate() {
         pairs.extend((0..g.scans.len().saturating_sub(1)).map(|p| (gi, p)));
     }
-    pairs.sort_by(|a, b| groups[b.0].scans[b.1].started_at.cmp(&groups[a.0].scans[a.1].started_at));
+    pairs.sort_by(|a, b| {
+        groups[b.0].scans[b.1]
+            .started_at
+            .cmp(&groups[a.0].scans[a.1].started_at)
+    });
     // Covered groups: their newest scan is searched too; what is only there is gone.
-    let covered: Vec<usize> = (0..groups.len()).filter(|&i| groups[i].covered_by.is_some()).collect();
+    let covered: Vec<usize> = (0..groups.len())
+        .filter(|&i| groups[i].covered_by.is_some())
+        .collect();
     let total = pairs.len() + covered.len();
     let done = AtomicUsize::new(0);
     let kept = AtomicUsize::new(0);
@@ -719,33 +1116,50 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
         let g = &groups[gi];
         let (newer, older) = (&g.scans[p], &g.scans[p + 1]);
         let mut buf = Vec::new();
-        let mut mine: Vec<(Vec<u8>, Event)> = Vec::new();
+        let mut mine: Vec<(Vec<NativeName>, Event)> = Vec::new();
         let mut run = || -> Result<()> {
             for (n, op) in pair_ops(&store, older, newer)?.enumerate() {
-                let op = op.map_err(|e| AppError::Runtime(format!("reading scan #{}: {e}", older.id)))?;
-                if n % 65536 == 0 && (cancel.load(Ordering::Relaxed) || too_many.load(Ordering::Relaxed)) {
+                let op =
+                    op.map_err(|e| AppError::Runtime(format!("reading scan #{}: {e}", older.id)))?;
+                if n % 65536 == 0
+                    && (cancel.load(Ordering::Relaxed) || too_many.load(Ordering::Relaxed))
+                {
                     return Ok(());
                 }
                 if op.record.depth == 0 {
                     continue;
                 }
-                let name = op.record.name.as_unix_bytes().ok_or_else(|| AppError::Runtime("Windows names are not supported by DDS1 search".into()))?;
                 let rel = || {
                     let mut r = rel_path(&op.parent);
-                    if !r.is_empty() {
-                        r.push(b'/');
-                    }
-                    r.extend_from_slice(name);
+                    r.push(op.record.name.clone());
                     r
                 };
-                let hit = if matcher.on_path() { matcher.is_match(&rel(), &mut buf) } else { matcher.is_match(name, &mut buf) };
+                let hit = if matcher.on_path() {
+                    match_path(&matcher, &rel(), &mut buf)
+                } else {
+                    match_name(&matcher, &op.record.name, &mut buf)
+                };
                 if !hit || !(op.kind == OpKind::Remove || passes(q, &op.record)) {
                     continue;
                 }
                 let rel = rel();
                 // A change only counts: its record is not kept (broad queries match many).
-                let record = if op.kind == OpKind::Replace { Record { kind: op.record.kind, ..Default::default() } } else { op.record };
-                mine.push((rel, Event { pair: p, kind: op.kind, record }));
+                let record = if op.kind == OpKind::Replace {
+                    Record {
+                        kind: op.record.kind,
+                        ..Default::default()
+                    }
+                } else {
+                    op.record
+                };
+                mine.push((
+                    rel,
+                    Event {
+                        pair: p,
+                        kind: op.kind,
+                        record,
+                    },
+                ));
                 if kept.fetch_add(1, Ordering::Relaxed) + 1 > MAX_EVENTS {
                     too_many.store(true, Ordering::Relaxed);
                     return Ok(());
@@ -766,37 +1180,68 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
     if let Some(e) = failure.into_inner().expect("not poisoned") {
         return Err(e);
     }
-    let mut out = History { pairs: total, ..Default::default() };
+    let mut out = History {
+        pairs: total,
+        ..Default::default()
+    };
     let events = events.into_inner().expect("not poisoned");
     // Names that appeared in each pair, for "probably moved".
-    let mut appeared: HashMap<(usize, usize, Vec<u8>), Vec<u8>> = HashMap::new();
+    let mut appeared: HashMap<(usize, usize, NativeName), Vec<NativeName>> = HashMap::new();
     for ((gi, rel), evs) in &events {
         for e in evs.iter().filter(|e| e.kind == OpKind::Remove) {
-            if let Some(name) = e.record.name.as_unix_bytes() {
-                appeared.entry((*gi, e.pair, name.to_vec())).or_insert_with(|| rel.clone());
-            }
+            appeared
+                .entry((*gi, e.pair, e.record.name.clone()))
+                .or_insert_with(|| rel.clone());
         }
     }
-    let current_keys: HashSet<(String, Vec<u8>)> = cur
-        .hits
-        .iter()
-        .filter_map(|h| {
-            let g = groups.iter().find(|g| g.place.root == h.place.root && g.place.disk == h.place.disk)?;
-            Some(volume_key(g, rel_of(&g.place.root, &h.path)))
-        })
-        .collect();
-    let alive_now = |key: &(String, Vec<u8>)| current_keys.contains(key) || cur.keys.as_ref().is_some_and(|k| k.contains(key));
-    let mut gone: HashMap<(String, Vec<u8>), Lifetime> = HashMap::new();
+    let mut current_keys: HashSet<(String, SearchPathKey)> = HashSet::new();
+    for h in &cur.hits {
+        let Some(g) = groups
+            .iter()
+            .find(|g| g.place.root == h.place.root && g.place.disk == h.place.disk)
+        else {
+            continue;
+        };
+        let root = scan_root(&store, &g.scans[0])?;
+        current_keys.insert(volume_key(g, &rel_of(&root, &h.path)?)?);
+    }
+    let alive_now = |key: &(String, SearchPathKey)| {
+        current_keys.contains(key) || cur.keys.as_ref().is_some_and(|k| k.contains(key))
+    };
+    let mut gone: HashMap<(String, SearchPathKey), Lifetime> = HashMap::new();
     for ((gi, rel), mut evs) in events {
         let g = &groups[gi];
         evs.sort_by_key(|e| e.pair);
         let oldest = ScanRef::of(g.scans.last().expect("a group has scans"));
         let first = &evs[0];
+        let first_available = if first.kind == OpKind::Remove || first.record.has(flags::STAT_ERROR)
+        {
+            EntryFields::empty()
+        } else {
+            first.record.available
+        };
         let mut life = Lifetime {
-            path: NativePath(full_path(&g.scans[first.pair + 1].root, &rel)),
+            path: full_path(&scan_root(&store, &g.scans[first.pair + 1])?, &rel)?,
             kind: first.record.kind,
-            size: first.record.alloc,
-            mtime: first.record.mtime,
+            size: if first_available.contains(EntryFields::ALLOCATED_SIZE) {
+                first.record.alloc
+            } else {
+                0
+            },
+            mtime: if first_available.contains(EntryFields::MTIME) {
+                first.record.mtime
+            } else {
+                0
+            },
+            available: first_available,
+            measurement: if first.kind == OpKind::Remove {
+                Envelope::default()
+            } else {
+                record_envelope(
+                    &first.record,
+                    EntryFields::ALLOCATED_SIZE.union(EntryFields::MTIME),
+                )
+            },
             place: g.place.clone(),
             last_seen: ScanRef::of(&g.scans[0]),
             gone_in: None,
@@ -812,10 +1257,11 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
             life.last_seen = ScanRef::of(older);
             life.gone_in = Some(ScanRef::of(newer));
             life.uncertain = uncertainty(older, newer, &rel);
-            life.moved_to = first.record.name.as_unix_bytes().and_then(|name| appeared
-                .get(&(gi, first.pair, name.to_vec()))
+            life.moved_to = appeared
+                .get(&(gi, first.pair, first.record.name.clone()))
                 .filter(|to| **to != rel)
-                .map(|to| String::from_utf8_lossy(&full_path(&newer.root, to)).into_owned()));
+                .map(|to| full_path(&scan_root(&store, newer)?, to).map(|p| p.display()))
+                .transpose()?;
         }
         for e in evs.iter().skip(usize::from(!alive)) {
             match e.kind {
@@ -827,13 +1273,16 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
                 OpKind::Add => break,
             }
         }
-        let key = volume_key(g, &rel);
+        let key = volume_key(g, &rel)?;
         if alive {
             if with_current && current_keys.contains(&key) {
-                if let Some(h) = cur.hits.iter().find(|h| h.path.0 == full_path(&g.place.root, &rel)) {
+                let current_path = full_path(&scan_root(&store, &g.scans[0])?, &rel)?;
+                if let Some(h) = cur.hits.iter().find(|h| h.path == current_path) {
                     life.kind = h.kind;
                     life.size = h.size;
                     life.mtime = h.mtime;
+                    life.available = h.available;
+                    life.measurement = h.measurement.clone();
                     life.last_seen = h.scan.clone();
                 }
                 out.current.push(life);
@@ -857,12 +1306,20 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
         }
         let g = &groups[gi];
         let cover = &groups[g.covered_by.expect("covered")].scans[0];
-        let unlimited = Query { limit: 100_000, ..q.clone() };
+        let unlimited = Query {
+            limit: 100_000,
+            ..q.clone()
+        };
         let found = search_snapshot(&store, g, &g.scans[0], &unlimited, &matcher, false, cancel)?;
         for h in found.hits {
-            let rel = rel_of(&g.place.root, &h.path).to_vec();
-            let key = volume_key(g, &rel);
-            if alive_now(&key) || gone.get(&key).is_some_and(|p| p.last_seen.started_at >= h.scan.started_at) {
+            let root = scan_root(&store, &g.scans[0])?;
+            let rel = rel_of(&root, &h.path)?;
+            let key = volume_key(g, &rel)?;
+            if alive_now(&key)
+                || gone
+                    .get(&key)
+                    .is_some_and(|p| p.last_seen.started_at >= h.scan.started_at)
+            {
                 continue;
             }
             gone.insert(
@@ -872,13 +1329,18 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
                     kind: h.kind,
                     size: h.size,
                     mtime: h.mtime,
+                    available: h.available,
+                    measurement: h.measurement.clone(),
                     place: g.place.clone(),
                     last_seen: h.scan.clone(),
                     gone_in: Some(ScanRef::of(cover)),
                     appeared_in: None,
                     oldest: ScanRef::of(g.scans.last().expect("a group has scans")),
                     changes: 0,
-                    uncertain: Some(format!("not in scan #{} of {}, a larger folder", cover.id, cover.root)),
+                    uncertain: Some(format!(
+                        "not in scan #{} of {}, a larger folder",
+                        cover.id, cover.root
+                    )),
                     moved_to: None,
                 },
             );
@@ -887,7 +1349,12 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
     }
     let mut gone: Vec<Lifetime> = gone.into_values().collect();
     gone.sort_by(|a, b| {
-        let at = |l: &Lifetime| l.gone_in.as_ref().map(|s| s.started_at.clone()).unwrap_or_default();
+        let at = |l: &Lifetime| {
+            l.gone_in
+                .as_ref()
+                .map(|s| s.started_at.clone())
+                .unwrap_or_default()
+        };
         at(b).cmp(&at(a)).then_with(|| a.path.cmp(&b.path))
     });
     out.gone_total = gone.len() as u64;
@@ -902,14 +1369,31 @@ pub fn history(settings: &Effective, q: &Query, cur: &Current, with_current: boo
 }
 
 /// `diskdrift find`: the newest scans, then the history when `mode` says so.
-pub fn find(settings: &Effective, q: &Query, mode: HistoryMode, cancel: &AtomicBool, progress: &(dyn Fn(usize, usize) + Sync)) -> Result<FindResult> {
+pub fn find(
+    settings: &Effective,
+    q: &Query,
+    mode: HistoryMode,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(usize, usize) + Sync),
+) -> Result<FindResult> {
     let current = current_cancellable(settings, q, None, cancel)?;
     let run = match mode {
         HistoryMode::Never => false,
         HistoryMode::Always => true,
         HistoryMode::Auto => current.total == 0,
     };
-    let history = if run && current.store_exists { Some(history(settings, q, &current, mode == HistoryMode::Always, cancel, progress)?) } else { None };
+    let history = if run && current.store_exists {
+        Some(history(
+            settings,
+            q,
+            &current,
+            mode == HistoryMode::Always,
+            cancel,
+            progress,
+        )?)
+    } else {
+        None
+    };
     Ok(FindResult { current, history })
 }
 
@@ -949,6 +1433,21 @@ mod tests {
     }
 
     #[test]
+    fn windows_lone_surrogates_do_not_collide_with_replacement_character() {
+        let lone = NativeName::windows(vec![0xd800]);
+        let replacement = NativeName::windows("\u{fffd}".encode_utf16().collect());
+
+        assert!(!match_name(&m("\u{fffd}"), &lone, &mut Vec::new()));
+        assert!(match_name(&m("\u{fffd}"), &replacement, &mut Vec::new()));
+        assert!(match_name(&m(r"\u{d800}"), &lone, &mut Vec::new()));
+        assert!(!match_name(
+            &m(r"\u{d800}"),
+            &NativeName::windows(r"\u{d800}".encode_utf16().collect()),
+            &mut Vec::new(),
+        ));
+    }
+
+    #[test]
     fn globs_are_whole_names() {
         assert!(hit("*.pdf", "Raport.PDF"));
         assert!(!hit("*.pdf", "raport.pdf.bak"));
@@ -963,7 +1462,11 @@ mod tests {
         assert!(hit("re:^wazna\\d+\\.txt$", "Ważna10.txt"));
         assert!(!hit("re:^wazna\\D", "wazna10"));
         assert!(Matcher::new(&Query::new("re:(")).is_err());
-        let exact = Matcher::new(&Query { exact: true, ..Query::new("Ważna") }).unwrap();
+        let exact = Matcher::new(&Query {
+            exact: true,
+            ..Query::new("Ważna")
+        })
+        .unwrap();
         assert!(exact.is_match("Ważna.txt".as_bytes(), &mut Vec::new()));
         assert!(!exact.is_match("wazna.txt".as_bytes(), &mut Vec::new()));
     }
@@ -982,6 +1485,7 @@ mod tests {
     mod store {
         use super::super::*;
         use crate::config::{Overrides, resolve_with};
+        use crate::test_support::{set_root_volume, unix_volume_descriptor};
         use diskdrift_core::testutil::TestDir;
         use diskdrift_core::walk::WalkReport;
         use diskdrift_storage::{ScanOptions, Status, VolumeIdentity, meta};
@@ -996,12 +1500,30 @@ mod tests {
             let t = TestDir::new(name);
             let db = t.path().join("store");
             let store = Store::create(&db).unwrap();
-            let settings = resolve_with(&Overrides { db: Some(db), ..Default::default() }, t.path(), t.path()).unwrap();
-            Fixture { _t: t, settings, store }
+            let settings = resolve_with(
+                &Overrides {
+                    db: Some(db),
+                    ..Default::default()
+                },
+                t.path(),
+                t.path(),
+            )
+            .unwrap();
+            Fixture {
+                _t: t,
+                settings,
+                store,
+            }
         }
 
         /// A scan of `root` holding `files` (path below the root, allocated size).
-        pub fn scan(f: &Fixture, root: &str, at: &str, exclude: &[&str], files: &[(&str, u64)]) -> u64 {
+        pub fn scan(
+            f: &Fixture,
+            root: &str,
+            at: &str,
+            exclude: &[&str],
+            files: &[(&str, u64)],
+        ) -> u64 {
             let mut paths: Vec<(Vec<Vec<u8>>, Kind, u64)> = Vec::new();
             for (p, size) in files {
                 let comps: Vec<Vec<u8>> = p.split('/').map(|c| c.as_bytes().to_vec()).collect();
@@ -1014,20 +1536,50 @@ mod tests {
             }
             paths.sort_by(|a, b| a.0.cmp(&b.0));
             // Two disks: X and Y.
-            let (disk, mount) = if root.starts_with("/Volumes/Y") { ("d00000002", "/Volumes/Y") } else { ("d00000001", "/Volumes/X") };
+            let (disk, mount) = if root.starts_with("/Volumes/Y") {
+                ("d00000002", "/Volumes/Y")
+            } else {
+                ("d00000001", "/Volumes/X")
+            };
+            let descriptor = unix_volume_descriptor(disk, mount);
             let template = SnapshotMeta {
                 format_version: meta::META_FORMAT_VERSION,
                 id: 0,
                 name: format!("s-{at}"),
                 root: root.into(),
+                root_native: Some(diskdrift_core::native::NativeRoot::posix(
+                    root.as_bytes().to_vec(),
+                )),
                 // Recorded in the registry by `begin`, from the volume UUID.
                 disk: None,
-                root_in_volume: Some(root.strip_prefix(mount).map(|r| if r.is_empty() { "/" } else { r }).unwrap().into()),
+                root_in_volume: Some(
+                    root.strip_prefix(mount)
+                        .map(|r| if r.is_empty() { "/" } else { r })
+                        .unwrap()
+                        .into(),
+                ),
+                root_in_volume_native: Some(diskdrift_core::native::NativePath::unix(
+                    root.strip_prefix(mount)
+                        .map(|r| if r.is_empty() { "/" } else { r })
+                        .unwrap()
+                        .as_bytes()
+                        .to_vec(),
+                )),
                 status: Status::InProgress,
                 started_at: at.into(),
                 finished_at: None,
-                volume: VolumeIdentity { uuid: Some(disk.into()), fs_type: "apfs".into(), mount_point: mount.into(), ..Default::default() },
-                options: ScanOptions { stay_on_filesystem: true, exclude: exclude.iter().map(|e| e.to_string()).collect(), ..Default::default() },
+                volume: VolumeIdentity {
+                    uuid: Some(disk.into()),
+                    fs_type: "apfs".into(),
+                    mount_point: mount.into(),
+                    ..Default::default()
+                },
+                volumes: Vec::new(),
+                options: ScanOptions {
+                    stay_on_filesystem: true,
+                    exclude: exclude.iter().map(|e| e.to_string()).collect(),
+                    ..Default::default()
+                },
                 space_before: None,
                 space_after: None,
                 storage: Default::default(),
@@ -1035,35 +1587,105 @@ mod tests {
                 error: None,
                 diskdrift_version: "test".into(),
             };
-            let lock = f.store.lock().unwrap();
+            let mut template = template;
+            set_root_volume(&mut template, descriptor);
+            let (lock, _) = f.store.lock().unwrap();
             let mut w = f.store.begin(lock, template, None).unwrap();
-            w.push(&Record { depth: 0, name: diskdrift_core::native::NativeName::unix(root.as_bytes().to_vec()), kind: Kind::Dir, ..Default::default() }).unwrap();
+            w.push(&Record {
+                depth: 0,
+                name: diskdrift_core::native::NativeName::unix(root.as_bytes().to_vec()),
+                kind: Kind::Dir,
+                ..Default::default()
+            })
+            .unwrap();
             for (comps, kind, size) in &paths {
                 let name = comps.last().unwrap().clone();
-                w.push(&Record { depth: comps.len() as u16, name: diskdrift_core::native::NativeName::unix(name), kind: *kind, size: *size, alloc: *size, mtime: 1_700_000_000, ..Default::default() }).unwrap();
+                let stat_error = *size == u64::MAX;
+                w.push(&Record {
+                    depth: comps.len() as u16,
+                    name: diskdrift_core::native::NativeName::unix(name),
+                    kind: *kind,
+                    flags: if stat_error {
+                        diskdrift_core::record::flags::STAT_ERROR
+                    } else {
+                        0
+                    },
+                    size: if stat_error { 0 } else { *size },
+                    alloc: if stat_error { 0 } else { *size },
+                    mtime: 1_700_000_000,
+                    available: stat_error
+                        .then(diskdrift_core::record::EntryFields::empty)
+                        .unwrap_or_else(|| diskdrift_core::record::Record::default().available),
+                    ..Default::default()
+                })
+                .unwrap();
             }
-            let (m, _) = w.commit_and_rebase(WalkReport::default(), None, at.into()).unwrap();
+            let (m, _) = w
+                .commit_and_rebase(WalkReport::default(), None, at.into())
+                .unwrap();
             m.id
         }
 
         fn run(f: &Fixture, pattern: &str, mode: HistoryMode) -> FindResult {
-            find(&f.settings, &Query::new(pattern), mode, &AtomicBool::new(false), &|_, _| {}).unwrap()
+            find(
+                &f.settings,
+                &Query::new(pattern),
+                mode,
+                &AtomicBool::new(false),
+                &|_, _| {},
+            )
+            .unwrap()
         }
 
         fn deltas_history(name: &str, exclude_last: &[&str]) -> (Fixture, [u64; 4]) {
             let f = fixture(name);
             let r = "/Volumes/X";
-            let s1 = scan(&f, r, "2026-10-01T10:00:00+02:00", &[], &[("Docs/a.txt", 1), ("Docs/plan.doc", 5)]);
-            let s2 = scan(&f, r, "2026-10-02T10:00:00+02:00", &[], &[("Docs/a.txt", 1), ("Docs/plan.doc", 5), ("Docs/Ważna sprawa 10.txt", 12)]);
-            let s3 = scan(&f, r, "2026-10-03T10:00:00+02:00", &[], &[("Docs/a.txt", 1), ("Docs/plan.doc", 5), ("Docs/Ważna sprawa 10.txt", 14)]);
-            let s4 = scan(&f, r, "2026-10-04T10:00:00+02:00", exclude_last, &[("Archive/plan.doc", 5), ("Docs/a.txt", 1)]);
+            let s1 = scan(
+                &f,
+                r,
+                "2026-10-01T10:00:00+02:00",
+                &[],
+                &[("Docs/a.txt", 1), ("Docs/plan.doc", 5)],
+            );
+            let s2 = scan(
+                &f,
+                r,
+                "2026-10-02T10:00:00+02:00",
+                &[],
+                &[
+                    ("Docs/a.txt", 1),
+                    ("Docs/plan.doc", 5),
+                    ("Docs/Ważna sprawa 10.txt", 12),
+                ],
+            );
+            let s3 = scan(
+                &f,
+                r,
+                "2026-10-03T10:00:00+02:00",
+                &[],
+                &[
+                    ("Docs/a.txt", 1),
+                    ("Docs/plan.doc", 5),
+                    ("Docs/Ważna sprawa 10.txt", 14),
+                ],
+            );
+            let s4 = scan(
+                &f,
+                r,
+                "2026-10-04T10:00:00+02:00",
+                exclude_last,
+                &[("Archive/plan.doc", 5), ("Docs/a.txt", 1)],
+            );
             (f, [s1, s2, s3, s4])
         }
 
         #[test]
         fn a_deleted_file_is_found_in_the_history() {
             let (f, [_, s2, s3, s4]) = deltas_history("search-history", &[]);
-            assert!(f.store.get(s3).unwrap().storage.base.is_some(), "stored as a delta");
+            assert!(
+                f.store.get(s3).unwrap().storage.base.is_some(),
+                "stored as a delta"
+            );
             let r = run(&f, "wazna", HistoryMode::Auto);
             assert_eq!(r.current.total, 0);
             assert_eq!(r.current.searched.len(), 1);
@@ -1071,9 +1693,24 @@ mod tests {
             assert_eq!((h.pairs, h.pairs_done, h.cancelled), (3, 3, false));
             assert_eq!(h.gone.len(), 1, "{:?}", h.gone);
             let g = &h.gone[0];
-            assert_eq!(g.path.lossy(), "/Volumes/X/Docs/Ważna sprawa 10.txt");
-            assert_eq!((g.last_seen.id, g.gone_in.as_ref().map(|s| s.id), g.appeared_in.as_ref().map(|s| s.id)), (s3, Some(s4), Some(s2)));
-            assert_eq!((g.size, g.changes, g.uncertain.as_deref(), g.moved_to.as_deref()), (14, 1, None, None));
+            assert_eq!(g.path.display(), "/Volumes/X/Docs/Ważna sprawa 10.txt");
+            assert_eq!(
+                (
+                    g.last_seen.id,
+                    g.gone_in.as_ref().map(|s| s.id),
+                    g.appeared_in.as_ref().map(|s| s.id)
+                ),
+                (s3, Some(s4), Some(s2))
+            );
+            assert_eq!(
+                (
+                    g.size,
+                    g.changes,
+                    g.uncertain.as_deref(),
+                    g.moved_to.as_deref()
+                ),
+                (14, 1, None, None)
+            );
         }
 
         #[test]
@@ -1081,11 +1718,17 @@ mod tests {
             let (f, [_, _, _, s4]) = deltas_history("search-moved", &[]);
             let r = run(&f, "PLAN", HistoryMode::Auto);
             assert_eq!(r.current.total, 1);
-            assert_eq!(r.current.hits[0].path.lossy(), "/Volumes/X/Archive/plan.doc");
+            assert_eq!(
+                r.current.hits[0].path.display(),
+                "/Volumes/X/Archive/plan.doc"
+            );
             assert!(r.history.is_none(), "found now: no history unless asked");
             let h = run(&f, "plan", HistoryMode::Always).history.unwrap();
             assert_eq!(h.gone.len(), 1);
-            assert_eq!(h.gone[0].moved_to.as_deref(), Some("/Volumes/X/Archive/plan.doc"));
+            assert_eq!(
+                h.gone[0].moved_to.as_deref(),
+                Some("/Volumes/X/Archive/plan.doc")
+            );
             assert_eq!(h.current.len(), 1);
             assert_eq!(h.current[0].appeared_in.as_ref().map(|s| s.id), Some(s4));
             assert!(h.current[0].gone_in.is_none());
@@ -1096,61 +1739,220 @@ mod tests {
         #[test]
         fn a_pair_without_a_delta_is_compared_and_marked_uncertain() {
             let (f, [_, _, s3, s4]) = deltas_history("search-keyframe", &["node_modules"]);
-            assert!(f.store.get(s3).unwrap().storage.base.is_none(), "other settings: kept full");
+            assert!(
+                f.store.get(s3).unwrap().storage.base.is_none(),
+                "other settings: kept full"
+            );
             let h = run(&f, "wazna", HistoryMode::Auto).history.unwrap();
             assert_eq!(h.gone.len(), 1);
             assert_eq!(h.gone[0].gone_in.as_ref().map(|s| s.id), Some(s4));
-            assert!(h.gone[0].uncertain.as_deref().unwrap().contains("different settings"), "{:?}", h.gone[0].uncertain);
+            assert!(
+                h.gone[0]
+                    .uncertain
+                    .as_deref()
+                    .unwrap()
+                    .contains("different settings"),
+                "{:?}",
+                h.gone[0].uncertain
+            );
         }
 
         #[test]
         fn a_folder_scanned_before_the_whole_disk_is_history() {
             let f = fixture("search-covered");
-            let old = scan(&f, "/Volumes/X/Docs", "2026-10-01T10:00:00+02:00", &[], &[("old.txt", 3), ("both.txt", 1)]);
-            let all = scan(&f, "/Volumes/X", "2026-10-02T10:00:00+02:00", &[], &[("Docs/both.txt", 1), ("Music/x.mp3", 9)]);
+            let old = scan(
+                &f,
+                "/Volumes/X/Docs",
+                "2026-10-01T10:00:00+02:00",
+                &[],
+                &[("old.txt", 3), ("both.txt", 1)],
+            );
+            let all = scan(
+                &f,
+                "/Volumes/X",
+                "2026-10-02T10:00:00+02:00",
+                &[],
+                &[("Docs/both.txt", 1), ("Music/x.mp3", 9)],
+            );
             let r = run(&f, "both", HistoryMode::Auto);
-            assert_eq!(r.current.searched.len(), 1, "the folder scan is covered by the newer disk scan");
+            assert_eq!(
+                r.current.searched.len(),
+                1,
+                "the folder scan is covered by the newer disk scan"
+            );
             assert_eq!(r.current.hits.len(), 1);
             assert_eq!(r.current.hits[0].scan.id, all);
             let r = run(&f, "old.txt", HistoryMode::Auto);
             assert_eq!(r.current.total, 0);
             let h = r.history.unwrap();
             assert_eq!(h.gone.len(), 1, "{:?}", h.gone);
-            assert_eq!((h.gone[0].last_seen.id, h.gone[0].gone_in.as_ref().map(|s| s.id)), (old, Some(all)));
+            assert_eq!(
+                (
+                    h.gone[0].last_seen.id,
+                    h.gone[0].gone_in.as_ref().map(|s| s.id)
+                ),
+                (old, Some(all))
+            );
             // A file in both is not reported as gone.
-            assert!(run(&f, "both", HistoryMode::Always).history.unwrap().gone.is_empty());
+            assert!(
+                run(&f, "both", HistoryMode::Always)
+                    .history
+                    .unwrap()
+                    .gone
+                    .is_empty()
+            );
         }
 
         #[test]
         fn a_set_limits_the_search_to_its_disks() {
             let f = fixture("search-set");
-            scan(&f, "/Volumes/X", "2026-10-01T10:00:00+02:00", &[], &[("a/plan.doc", 1)]);
-            scan(&f, "/Volumes/Y", "2026-10-02T10:00:00+02:00", &[], &[("b/plan.doc", 1)]);
-            let y = f.store.list().unwrap().last().unwrap().disk.clone().unwrap();
-            f.store.update_registry(|reg| reg.add_to_set(&y, "stare-dyski")).unwrap();
-            let q = |set: Option<&str>| Query { set: set.map(String::from), ..Query::new("plan") };
+            scan(
+                &f,
+                "/Volumes/X",
+                "2026-10-01T10:00:00+02:00",
+                &[],
+                &[("a/plan.doc", 1)],
+            );
+            scan(
+                &f,
+                "/Volumes/Y",
+                "2026-10-02T10:00:00+02:00",
+                &[],
+                &[("b/plan.doc", 1)],
+            );
+            let y = f
+                .store
+                .list()
+                .unwrap()
+                .last()
+                .unwrap()
+                .disk
+                .clone()
+                .unwrap();
+            let (lock, _) = f.store.lock().unwrap();
+            f.store
+                .update_registry(&lock, |reg| reg.add_to_set(&y, "stare-dyski"))
+                .unwrap();
+            let q = |set: Option<&str>| Query {
+                set: set.map(String::from),
+                ..Query::new("plan")
+            };
             assert_eq!(current(&f.settings, &q(None), Some(&[])).unwrap().total, 2);
             let c = current(&f.settings, &q(Some("Stare-Dyski")), Some(&[])).unwrap();
-            assert_eq!(c.hits.iter().map(|h| h.path.lossy()).collect::<Vec<_>>(), ["/Volumes/Y/b/plan.doc"]);
+            assert_eq!(
+                c.hits.iter().map(|h| h.path.display()).collect::<Vec<_>>(),
+                ["/Volumes/Y/b/plan.doc"]
+            );
             assert_eq!(c.disk.as_deref(), Some("set Stare-Dyski"));
-            assert!(matches!(current(&f.settings, &q(Some("none")), Some(&[])), Err(AppError::Usage(_))));
+            assert!(matches!(
+                current(&f.settings, &q(Some("none")), Some(&[])),
+                Err(AppError::Usage(_))
+            ));
         }
 
         #[test]
         fn filters_and_the_limit() {
             let (f, _) = deltas_history("search-filters", &[]);
-            let q = |kind, min_size, limit| Query { kind, min_size, limit, ..Query::new("a") };
+            let q = |kind, min_size, limit| Query {
+                kind,
+                min_size,
+                limit,
+                ..Query::new("a")
+            };
             let c = current(&f.settings, &q(Some(Kind::Dir), 0, 100), Some(&[])).unwrap();
-            assert_eq!(c.hits.iter().map(|h| h.path.lossy()).collect::<Vec<_>>(), ["/Volumes/X/Archive"]);
+            assert_eq!(
+                c.hits.iter().map(|h| h.path.display()).collect::<Vec<_>>(),
+                ["/Volumes/X/Archive"]
+            );
             let c = current(&f.settings, &q(None, 0, 1), Some(&[])).unwrap();
-            assert_eq!((c.hits.len(), c.total, c.truncated), (1, 3, true), "Archive, plan.doc, a.txt");
+            assert_eq!(
+                (c.hits.len(), c.total, c.truncated),
+                (1, 3, true),
+                "Archive, plan.doc, a.txt"
+            );
             let c = current(&f.settings, &q(Some(Kind::File), 5, 100), Some(&[])).unwrap();
             assert_eq!(c.hits.len(), 1);
+        }
+
+        #[test]
+        fn search_preserves_stat_error_as_unknown_hit() {
+            let f = fixture("search-stat-error");
+            scan(
+                &f,
+                "/Volumes/X",
+                "2026-10-01T10:00:00+02:00",
+                &[],
+                &[("gone.txt", u64::MAX)],
+            );
+            let result = run(&f, "gone", HistoryMode::Never);
+            assert_eq!(result.current.hits.len(), 1);
+            assert_eq!(
+                result.current.hits[0].measurement.quality,
+                Some(diskdrift_diagnostics::measurement::Quality::Unknown)
+            );
+            let json = serde_json::to_string(&result.current.hits[0]).unwrap();
+            assert!(!json.contains("size"), "{json}");
+            assert!(!json.contains("mtime"), "{json}");
         }
     }
 
     #[test]
     fn empty_pattern_is_a_usage_error() {
-        assert!(matches!(Matcher::new(&Query::new("")), Err(AppError::Usage(_))));
+        assert!(matches!(
+            Matcher::new(&Query::new("")),
+            Err(AppError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn search_requires_allocated_availability_and_omits_unavailable_hit_fields() {
+        let record = Record {
+            kind: Kind::File,
+            size: 7,
+            alloc: 99,
+            mtime: 10,
+            available: EntryFields::KIND
+                .union(EntryFields::LOGICAL_SIZE)
+                .union(EntryFields::MTIME),
+            ..Default::default()
+        };
+        assert!(!passes(
+            &Query {
+                min_size: 1,
+                ..Query::new("file")
+            },
+            &record
+        ));
+        let hit = Hit {
+            path: NativePath::unix(b"/file".to_vec()),
+            kind: Kind::File,
+            size: record.alloc,
+            logical_size: record.size,
+            mtime: record.mtime,
+            available: record.available,
+            measurement: record_envelope(
+                &record,
+                EntryFields::ALLOCATED_SIZE
+                    .union(EntryFields::LOGICAL_SIZE)
+                    .union(EntryFields::MTIME),
+            ),
+            scan: ScanRef {
+                id: 1,
+                name: "scan".into(),
+                started_at: "2026-10-29T00:00:00Z".into(),
+            },
+            place: Place {
+                disk: None,
+                disk_name: "disk".into(),
+                connected: false,
+                mount_point: None,
+                root: "/".into(),
+            },
+        };
+        let json = serde_json::to_value(hit).unwrap();
+        assert!(json.get("size").is_none(), "{json}");
+        assert_eq!(json["logicalSize"], 7);
+        assert_eq!(json["mtime"], 10);
+        assert_eq!(json["quality"], "lower_bound");
     }
 }

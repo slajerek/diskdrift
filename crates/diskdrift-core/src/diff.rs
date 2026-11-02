@@ -4,24 +4,33 @@
 //! single forward pass over each matches entries by path in O(n + m) time with
 //! memory bounded by tree depth plus the requested result limits.
 
+use crate::measurement::{Envelope, Quality};
+use crate::native::{NativeName, NativePath};
 use crate::paths::{PathStack, compare_paths, join_components};
-use crate::pathser::{NativePath, serialize_entry};
-use crate::record::{Kind, Record, flags};
-use serde::{Deserialize, Serialize};
+use crate::record::{
+    CoverageChange, EntryFields, FileId, FileIdScheme, FileIdScope, Kind, MoveCertainty, Record,
+    TimestampResolution, flags,
+};
+use serde::{Deserialize, Serialize, Serializer};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 use std::io;
+
+pub(crate) const UNKNOWN_DELTA: i64 = i64::MIN;
 
 pub type RecordStream<'a> = Box<dyn Iterator<Item = io::Result<Record>> + 'a>;
 
 /// `stream` with its root record (depth 0, whose name is the full root path)
 /// renamed to `root`. Two scans of one disk mounted at different places then
 /// compare as the same tree (ADR 0002, section 2.6).
-pub fn with_root_name<'a>(stream: RecordStream<'a>, root: Vec<u8>) -> RecordStream<'a> {
+pub fn with_root_name<'a>(stream: RecordStream<'a>, root: NativePath) -> RecordStream<'a> {
     Box::new(stream.map(move |r| {
         r.map(|mut rec| {
             if rec.depth == 0 {
-                rec.name = crate::native::NativeName::unix(root.clone());
+                rec.name = match &root {
+                    NativePath::Unix(bytes) => NativeName::unix(bytes.clone()),
+                    NativePath::Windows(units) => NativeName::windows(units.clone()),
+                };
             }
             rec
         })
@@ -41,13 +50,16 @@ pub enum Change {
     NewlyVisible,
     /// Below a directory that could be read in A but not in B.
     NoLongerVisible,
+    /// The set of observed metadata fields changed without a content change.
+    CoverageChanged,
 }
 
 /// One matched position of the merge.
 pub struct DiffEntry<'a> {
     /// Path components (`[root, name, ...]`).
-    pub path: &'a [Vec<u8>],
+    pub path: &'a [NativeName],
     pub change: Change,
+    pub coverage: CoverageChange,
     pub old: Option<&'a Record>,
     pub new: Option<&'a Record>,
 }
@@ -64,7 +76,11 @@ struct Side<'a> {
 
 impl<'a> Side<'a> {
     fn new(iter: RecordStream<'a>) -> io::Result<Self> {
-        let mut s = Side { iter, cur: None, stack: PathStack::new() };
+        let mut s = Side {
+            iter,
+            cur: None,
+            stack: PathStack::new(),
+        };
         s.advance()?;
         Ok(s)
     }
@@ -72,8 +88,7 @@ impl<'a> Side<'a> {
     fn advance(&mut self) -> io::Result<()> {
         self.cur = self.iter.next().transpose()?;
         if let Some(r) = &self.cur {
-            let name = r.name.as_unix_bytes().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "portable diff requires Unix names"))?;
-            self.stack.set(r.depth, name)?;
+            self.stack.set(r.depth, &r.name)?;
         }
         Ok(())
     }
@@ -87,7 +102,11 @@ struct NodeState {
 }
 
 /// Merges two canonical streams and reports every position to `visitor`.
-pub fn merge(a: RecordStream<'_>, b: RecordStream<'_>, visitor: &mut dyn DiffVisitor) -> io::Result<()> {
+pub fn merge(
+    a: RecordStream<'_>,
+    b: RecordStream<'_>,
+    visitor: &mut dyn DiffVisitor,
+) -> io::Result<()> {
     let mut a = Side::new(a)?;
     let mut b = Side::new(b)?;
     let mut states: Vec<NodeState> = Vec::new();
@@ -96,7 +115,8 @@ pub fn merge(a: RecordStream<'_>, b: RecordStream<'_>, visitor: &mut dyn DiffVis
             (None, None) => return Ok(()),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
-            (Some(_), Some(_)) => compare_paths(a.stack.components(), b.stack.components()),
+            (Some(_), Some(_)) => compare_paths(a.stack.components(), b.stack.components())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
         };
         match order {
             Ordering::Less => {
@@ -104,12 +124,26 @@ pub fn merge(a: RecordStream<'_>, b: RecordStream<'_>, visitor: &mut dyn DiffVis
                 let depth = rec.depth as usize;
                 states.truncate(depth);
                 let change = match depth.checked_sub(1).and_then(|p| states.get(p)) {
-                    Some(p) if matches!(p.change, Change::Deleted | Change::NoLongerVisible) => p.change,
-                    Some(p) if p.b_flags.is_some_and(|f| f & flags::CONTENTS_UNKNOWN != 0) => Change::NoLongerVisible,
+                    Some(p) if matches!(p.change, Change::Deleted | Change::NoLongerVisible) => {
+                        p.change
+                    }
+                    Some(p) if p.b_flags.is_some_and(|f| f & flags::CONTENTS_UNKNOWN != 0) => {
+                        Change::NoLongerVisible
+                    }
                     _ => Change::Deleted,
                 };
-                states.push(NodeState { a_flags: Some(rec.flags), b_flags: None, change });
-                visitor.entry(&DiffEntry { path: a.stack.components(), change, old: Some(rec), new: None })?;
+                states.push(NodeState {
+                    a_flags: Some(rec.flags),
+                    b_flags: None,
+                    change,
+                });
+                visitor.entry(&DiffEntry {
+                    path: a.stack.components(),
+                    change,
+                    coverage: CoverageChange::default(),
+                    old: Some(rec),
+                    new: None,
+                })?;
                 a.advance()?;
             }
             Ordering::Greater => {
@@ -118,20 +152,49 @@ pub fn merge(a: RecordStream<'_>, b: RecordStream<'_>, visitor: &mut dyn DiffVis
                 states.truncate(depth);
                 let change = match depth.checked_sub(1).and_then(|p| states.get(p)) {
                     Some(p) if matches!(p.change, Change::Added | Change::NewlyVisible) => p.change,
-                    Some(p) if p.a_flags.is_some_and(|f| f & flags::CONTENTS_UNKNOWN != 0) => Change::NewlyVisible,
+                    Some(p) if p.a_flags.is_some_and(|f| f & flags::CONTENTS_UNKNOWN != 0) => {
+                        Change::NewlyVisible
+                    }
                     _ => Change::Added,
                 };
-                states.push(NodeState { a_flags: None, b_flags: Some(rec.flags), change });
-                visitor.entry(&DiffEntry { path: b.stack.components(), change, old: None, new: Some(rec) })?;
+                states.push(NodeState {
+                    a_flags: None,
+                    b_flags: Some(rec.flags),
+                    change,
+                });
+                visitor.entry(&DiffEntry {
+                    path: b.stack.components(),
+                    change,
+                    coverage: CoverageChange::default(),
+                    old: None,
+                    new: Some(rec),
+                })?;
                 b.advance()?;
             }
             Ordering::Equal => {
                 let (ra, rb) = (a.cur.as_ref().unwrap(), b.cur.as_ref().unwrap());
                 let depth = rb.depth as usize;
                 states.truncate(depth);
-                let change = if ra.content_differs(rb) { Change::Modified } else { Change::Unchanged };
-                states.push(NodeState { a_flags: Some(ra.flags), b_flags: Some(rb.flags), change });
-                visitor.entry(&DiffEntry { path: b.stack.components(), change, old: Some(ra), new: Some(rb) })?;
+                let coverage = ra.coverage_change(rb);
+                let change = if ra.content_differs(rb) {
+                    Change::Modified
+                } else if !coverage.is_empty() {
+                    Change::CoverageChanged
+                } else {
+                    Change::Unchanged
+                };
+                states.push(NodeState {
+                    a_flags: Some(ra.flags),
+                    b_flags: Some(rb.flags),
+                    change,
+                });
+                visitor.entry(&DiffEntry {
+                    path: b.stack.components(),
+                    change,
+                    coverage,
+                    old: Some(ra),
+                    new: Some(rb),
+                })?;
                 a.advance()?;
                 b.advance()?;
             }
@@ -159,7 +222,7 @@ pub enum DiffSort {
 #[derive(Debug, Clone)]
 pub struct DiffOptions {
     /// Restrict to this path (components including the root) and below.
-    pub prefix: Option<Vec<Vec<u8>>>,
+    pub prefix: Option<Vec<NativeName>>,
     /// Only list entries whose |allocated delta| is at least this.
     pub min_size: u64,
     pub limit: usize,
@@ -168,8 +231,41 @@ pub struct DiffOptions {
     pub list_dirs: bool,
     /// Pair deleted and added files with the same inode and size as moves.
     pub detect_moves: bool,
+    /// Whether file identity has the same scheme and scope in both snapshots.
+    /// When it does not, matching IDs can only provide probable move evidence.
+    pub file_id_comparable: bool,
+    /// Whether allocated-size values have the same measurement semantics in
+    /// both snapshots. Stored deltas remain lossless when this is false, but
+    /// comparison output must not present allocated-byte changes as facts.
+    pub allocated_deltas: bool,
     /// Cap on files remembered for move detection.
     pub move_candidates_cap: usize,
+}
+
+fn known_metric(record: &Record, field: EntryFields) -> bool {
+    !record.has(flags::STAT_ERROR) && record.available.contains(field)
+}
+
+fn metric_value(record: Option<&Record>, field: EntryFields) -> Option<u64> {
+    let record = record?;
+    known_metric(record, field).then_some(if field == EntryFields::LOGICAL_SIZE {
+        record.counted_size()
+    } else {
+        record.counted_alloc()
+    })
+}
+
+fn comparison_measurement(quality: Quality) -> Envelope {
+    if quality == Quality::Unknown {
+        Envelope::default()
+    } else {
+        Envelope::with_quality(
+            "filesystem",
+            "snapshot comparison",
+            quality,
+            "canonical snapshot records",
+        )
+    }
 }
 
 impl Default for DiffOptions {
@@ -182,28 +278,112 @@ impl Default for DiffOptions {
             list_files: true,
             list_dirs: true,
             detect_moves: true,
+            file_id_comparable: true,
+            allocated_deltas: true,
             move_candidates_cap: 500_000,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Tally {
+    #[serde(default)]
     pub count: u64,
+    #[serde(default)]
     pub logical_bytes: u64,
+    #[serde(default)]
     pub allocated_bytes: u64,
+    #[serde(skip)]
+    logical_known: u64,
+    #[serde(skip)]
+    allocated_known: u64,
 }
 
-impl Tally {
-    fn add(&mut self, r: &Record) {
-        self.count += 1;
-        self.logical_bytes += r.counted_size();
-        self.allocated_bytes += r.counted_alloc();
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TallyWire {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocated_bytes: Option<u64>,
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl Serialize for Tally {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let logical_any = self.logical_known > 0;
+        let allocated_any = self.allocated_known > 0;
+        let any_known = logical_any || allocated_any;
+        let complete = self.count > 0
+            && self.logical_known == self.count
+            && self.allocated_known == self.count;
+        TallyWire {
+            count: (self.count > 0).then_some(self.count),
+            logical_bytes: logical_any.then_some(self.logical_bytes),
+            allocated_bytes: allocated_any.then_some(self.allocated_bytes),
+            measurement: comparison_measurement(if !any_known {
+                Quality::Unknown
+            } else if complete {
+                Quality::Observed
+            } else {
+                Quality::LowerBound
+            }),
+        }
+        .serialize(serializer)
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+impl Tally {
+    pub fn logical_quality(&self) -> Quality {
+        if self.count == 0 || self.logical_known == 0 {
+            Quality::Unknown
+        } else if self.logical_known < self.count {
+            Quality::LowerBound
+        } else {
+            Quality::Observed
+        }
+    }
+
+    pub fn allocated_quality(&self) -> Quality {
+        if self.count == 0 || self.allocated_known == 0 {
+            Quality::Unknown
+        } else if self.allocated_known < self.count {
+            Quality::LowerBound
+        } else {
+            Quality::Observed
+        }
+    }
+
+    fn add_with_allocation(&mut self, r: &Record, allocated_deltas: bool) {
+        self.count += 1;
+        if known_metric(r, EntryFields::LOGICAL_SIZE) {
+            self.logical_bytes += r.counted_size();
+            self.logical_known += 1;
+        }
+        if allocated_deltas && known_metric(r, EntryFields::ALLOCATED_SIZE) {
+            self.allocated_bytes += r.counted_alloc();
+            self.allocated_known += 1;
+        }
+    }
+
+    fn add_delta(&mut self, logical: Option<u64>, allocated: Option<u64>) {
+        self.count += 1;
+        if let Some(bytes) = logical {
+            self.logical_bytes += bytes;
+            self.logical_known += 1;
+        }
+        if let Some(bytes) = allocated {
+            self.allocated_bytes += bytes;
+            self.allocated_known += 1;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffSummary {
     pub added: Tally,
@@ -211,60 +391,385 @@ pub struct DiffSummary {
     /// Modified entries whose allocation grew / shrank / stayed equal.
     pub grown: Tally,
     pub shrunk: Tally,
+    #[serde(default)]
     pub modified_same_size: u64,
+    #[serde(default)]
     pub unchanged: u64,
     pub newly_visible: Tally,
     pub no_longer_visible: Tally,
+    #[serde(default)]
+    pub coverage_changed: u64,
     /// Net change of tracked sizes, excluding coverage changes.
+    #[serde(default)]
     pub net_logical_bytes: i128,
+    #[serde(default)]
     pub net_allocated_bytes: i128,
+    #[serde(default)]
     pub moved: u64,
+    #[serde(default)]
     pub moved_bytes: u64,
     /// Total tracked sizes in each snapshot (within the prefix).
+    #[serde(default)]
     pub old_total_allocated: u64,
+    #[serde(default)]
     pub new_total_allocated: u64,
+    #[serde(default)]
     pub old_total_logical: u64,
+    #[serde(default)]
     pub new_total_logical: u64,
+    #[serde(skip)]
+    old_total_allocated_records: u64,
+    #[serde(skip)]
+    old_total_allocated_known: u64,
+    #[serde(skip)]
+    new_total_allocated_records: u64,
+    #[serde(skip)]
+    new_total_allocated_known: u64,
+    #[serde(skip)]
+    old_total_logical_records: u64,
+    #[serde(skip)]
+    old_total_logical_known: u64,
+    #[serde(skip)]
+    new_total_logical_records: u64,
+    #[serde(skip)]
+    new_total_logical_known: u64,
+    #[serde(skip)]
+    net_allocated_records: u64,
+    #[serde(skip)]
+    net_allocated_known: u64,
+    #[serde(skip)]
+    net_allocated_unknown: bool,
+    #[serde(skip)]
+    net_logical_records: u64,
+    #[serde(skip)]
+    net_logical_known: u64,
+    #[serde(skip)]
+    net_logical_unknown: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl DiffSummary {
+    /// Quality of the net allocated-byte delta. A partial record stream cannot
+    /// produce a precise net change even when some individual values are known.
+    pub fn net_allocated_quality(&self) -> Quality {
+        if self.net_allocated_records == 0 || self.net_allocated_known == 0 {
+            Quality::Unknown
+        } else if self.net_allocated_unknown {
+            Quality::LowerBound
+        } else {
+            Quality::Observed
+        }
+    }
+
+    /// Quality of the net logical-byte delta.
+    pub fn net_logical_quality(&self) -> Quality {
+        if self.net_logical_records == 0 || self.net_logical_known == 0 {
+            Quality::Unknown
+        } else if self.net_logical_unknown {
+            Quality::LowerBound
+        } else {
+            Quality::Observed
+        }
+    }
+
+    pub fn has_measurements(&self) -> bool {
+        self.added != Tally::default()
+            || self.deleted != Tally::default()
+            || self.grown != Tally::default()
+            || self.shrunk != Tally::default()
+            || self.modified_same_size > 0
+            || self.unchanged > 0
+            || self.newly_visible != Tally::default()
+            || self.no_longer_visible != Tally::default()
+            || self.coverage_changed > 0
+            || self.net_logical_bytes != 0
+            || self.net_allocated_bytes != 0
+            || self.moved > 0
+            || self.moved_bytes > 0
+            || self.old_total_allocated > 0
+            || self.new_total_allocated > 0
+            || self.old_total_logical > 0
+            || self.new_total_logical > 0
+    }
+
+    fn quality(&self) -> Quality {
+        let mut any_known = false;
+        let mut complete = true;
+        for (known, records) in [
+            (self.added.logical_known, self.added.count),
+            (self.added.allocated_known, self.added.count),
+            (self.deleted.logical_known, self.deleted.count),
+            (self.deleted.allocated_known, self.deleted.count),
+            (self.grown.logical_known, self.grown.count),
+            (self.grown.allocated_known, self.grown.count),
+            (self.shrunk.logical_known, self.shrunk.count),
+            (self.shrunk.allocated_known, self.shrunk.count),
+            (self.newly_visible.logical_known, self.newly_visible.count),
+            (self.newly_visible.allocated_known, self.newly_visible.count),
+            (
+                self.no_longer_visible.logical_known,
+                self.no_longer_visible.count,
+            ),
+            (
+                self.no_longer_visible.allocated_known,
+                self.no_longer_visible.count,
+            ),
+            (
+                self.old_total_allocated_known,
+                self.old_total_allocated_records,
+            ),
+            (
+                self.new_total_allocated_known,
+                self.new_total_allocated_records,
+            ),
+            (self.old_total_logical_known, self.old_total_logical_records),
+            (self.new_total_logical_known, self.new_total_logical_records),
+        ] {
+            if records > 0 {
+                any_known |= known > 0;
+                complete &= known == records;
+            }
+        }
+        for (records, unknown) in [
+            (self.net_allocated_records, self.net_allocated_unknown),
+            (self.net_logical_records, self.net_logical_unknown),
+        ] {
+            if records > 0 {
+                any_known |= !unknown;
+                complete &= !unknown;
+            }
+        }
+        if self.moved > 0 {
+            any_known = true;
+        }
+        if !any_known {
+            Quality::Unknown
+        } else if complete {
+            Quality::Observed
+        } else {
+            Quality::LowerBound
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffSummaryWire<'a> {
+    added: &'a Tally,
+    deleted: &'a Tally,
+    grown: &'a Tally,
+    shrunk: &'a Tally,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modified_same_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unchanged: Option<u64>,
+    newly_visible: &'a Tally,
+    no_longer_visible: &'a Tally,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage_changed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_logical_bytes: Option<i128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    net_allocated_bytes: Option<i128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    moved_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_total_allocated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_total_allocated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_total_logical: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_total_logical: Option<u64>,
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl Serialize for DiffSummary {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let known = self.has_measurements();
+        let old_total_allocated =
+            (self.old_total_allocated_known > 0).then_some(self.old_total_allocated);
+        let new_total_allocated =
+            (self.new_total_allocated_known > 0).then_some(self.new_total_allocated);
+        let old_total_logical =
+            (self.old_total_logical_known > 0).then_some(self.old_total_logical);
+        let new_total_logical =
+            (self.new_total_logical_known > 0).then_some(self.new_total_logical);
+        DiffSummaryWire {
+            added: &self.added,
+            deleted: &self.deleted,
+            grown: &self.grown,
+            shrunk: &self.shrunk,
+            modified_same_size: known.then_some(self.modified_same_size),
+            unchanged: known.then_some(self.unchanged),
+            newly_visible: &self.newly_visible,
+            no_longer_visible: &self.no_longer_visible,
+            coverage_changed: known.then_some(self.coverage_changed),
+            net_logical_bytes: (self.net_logical_records > 0 && !self.net_logical_unknown)
+                .then_some(self.net_logical_bytes),
+            net_allocated_bytes: (self.net_allocated_records > 0 && !self.net_allocated_unknown)
+                .then_some(self.net_allocated_bytes),
+            moved: known.then_some(self.moved),
+            moved_bytes: known.then_some(self.moved_bytes),
+            old_total_allocated,
+            new_total_allocated,
+            old_total_logical,
+            new_total_logical,
+            measurement: comparison_measurement(self.quality()),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffItem {
     #[serde(flatten)]
     pub path: NativePath,
     pub kind: Kind,
     pub change: Change,
+    #[serde(default)]
     pub old_logical: u64,
+    #[serde(default)]
     pub new_logical: u64,
+    #[serde(default)]
     pub old_allocated: u64,
+    #[serde(default)]
     pub new_allocated: u64,
+    #[serde(default)]
     pub delta_allocated: i64,
+    #[serde(default)]
     pub delta_logical: i64,
+    #[serde(default)]
     pub mtime: i64,
+    #[serde(default)]
     pub btime: i64,
     /// For directories: inclusive totals of the subtree.
     pub is_dir: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct MoveItem {
-    pub from: Vec<u8>,
-    pub to: Vec<u8>,
-    pub allocated: u64,
+#[derive(Debug, Clone, Copy, Default)]
+enum MetricCoverage {
+    #[default]
+    Unknown,
+    Partial,
+    Complete,
 }
 
-impl Serialize for MoveItem {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut m = s.serialize_map(None)?;
-        serialize_entry(&mut m, "from", &self.from)?;
-        serialize_entry(&mut m, "to", &self.to)?;
-        m.serialize_entry("allocated", &self.allocated)?;
-        m.end()
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffItemWire<'a> {
+    #[serde(flatten)]
+    path: &'a NativePath,
+    kind: Kind,
+    change: Change,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_logical: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_logical: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_allocated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_allocated: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta_allocated: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delta_logical: Option<i64>,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    mtime: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    btime: i64,
+    is_dir: bool,
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+impl Serialize for DiffItem {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let visibility_only = matches!(self.change, Change::NewlyVisible | Change::NoLongerVisible);
+        let allocation_unavailable = self.delta_allocated == UNKNOWN_DELTA;
+        let logical_unavailable = self.delta_logical == UNKNOWN_DELTA;
+        DiffItemWire {
+            path: &self.path,
+            kind: self.kind,
+            change: self.change,
+            old_logical: (!logical_unavailable
+                && !matches!(self.change, Change::Added)
+                && !visibility_only)
+                .then_some(self.old_logical),
+            new_logical: (!logical_unavailable
+                && !matches!(self.change, Change::Deleted)
+                && !visibility_only)
+                .then_some(self.new_logical),
+            old_allocated: (!allocation_unavailable
+                && !matches!(self.change, Change::Added)
+                && !visibility_only)
+                .then_some(self.old_allocated),
+            new_allocated: (!allocation_unavailable
+                && !matches!(self.change, Change::Deleted)
+                && !visibility_only)
+                .then_some(self.new_allocated),
+            delta_allocated: (!allocation_unavailable && !visibility_only)
+                .then_some(self.delta_allocated),
+            delta_logical: (!logical_unavailable && !visibility_only).then_some(self.delta_logical),
+            mtime: self.mtime,
+            btime: self.btime,
+            is_dir: self.is_dir,
+            measurement: if visibility_only || (allocation_unavailable && logical_unavailable) {
+                Envelope::default()
+            } else if allocation_unavailable || logical_unavailable {
+                comparison_measurement(Quality::LowerBound)
+            } else {
+                comparison_measurement(Quality::Observed)
+            },
+        }
+        .serialize(serializer)
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct MoveItem {
+    pub from: NativePath,
+    pub to: NativePath,
+    #[serde(default)]
+    pub allocated: u64,
+    pub certainty: MoveCertainty,
+}
+
+#[derive(Serialize)]
+struct MoveItemWire<'a> {
+    from: &'a NativePath,
+    to: &'a NativePath,
+    allocated: u64,
+    certainty: MoveCertainty,
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl Serialize for MoveItem {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        MoveItemWire {
+            from: &self.from,
+            to: &self.to,
+            allocated: self.allocated,
+            certainty: self.certainty,
+            measurement: Envelope::observed(
+                "filesystem",
+                "snapshot comparison",
+                "canonical snapshot records",
+            ),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffReport {
     pub summary: DiffSummary,
@@ -279,10 +784,70 @@ pub struct DiffReport {
     pub moves: Vec<MoveItem>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DiffReportWire<'a> {
+    summary: &'a DiffSummary,
+    files: &'a [DiffItem],
+    growing_dirs: &'a [DiffItem],
+    shrinking_dirs: &'a [DiffItem],
+    shrinking_files: &'a [DiffItem],
+    moves: &'a [MoveItem],
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl Serialize for DiffReport {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        DiffReportWire {
+            summary: &self.summary,
+            files: &self.files,
+            growing_dirs: &self.growing_dirs,
+            shrinking_dirs: &self.shrinking_dirs,
+            shrinking_files: &self.shrinking_files,
+            moves: &self.moves,
+            measurement: self.measurement(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl DiffReport {
+    /// Measurement envelope for the report's tracked record values.
+    pub fn measurement(&self) -> Envelope {
+        let known = self.summary.has_measurements()
+            || !self.files.is_empty()
+            || !self.growing_dirs.is_empty()
+            || !self.shrinking_dirs.is_empty()
+            || !self.shrinking_files.is_empty()
+            || !self.moves.is_empty();
+        if known {
+            comparison_measurement(self.summary.quality())
+        } else {
+            Envelope::default()
+        }
+    }
+}
+
 /// Bounded top-N by key; ties broken by path for determinism.
 struct TopN {
     limit: usize,
-    heap: BinaryHeap<Reverse<(i128, Vec<u8>, ItemBox)>>,
+    heap: BinaryHeap<Reverse<(i128, ReversePath, ItemBox)>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReversePath(Vec<NativeName>);
+
+impl PartialOrd for ReversePath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ReversePath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.cmp(&self.0)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -306,19 +871,24 @@ impl Ord for ItemBox {
 
 impl TopN {
     fn new(limit: usize) -> Self {
-        TopN { limit, heap: BinaryHeap::new() }
+        TopN {
+            limit,
+            heap: BinaryHeap::new(),
+        }
     }
 
     fn would_accept(&self, key: i128) -> bool {
-        self.limit > 0 && (self.heap.len() < self.limit || self.heap.peek().is_some_and(|Reverse((k, _, _))| key > *k))
+        self.limit > 0
+            && (self.heap.len() < self.limit
+                || self.heap.peek().is_some_and(|Reverse((k, _, _))| key > *k))
     }
 
-    fn offer(&mut self, key: i128, item: DiffItem) {
+    fn offer(&mut self, key: i128, path: &[NativeName], item: DiffItem) {
         if !self.would_accept(key) {
             return;
         }
-        let path = item.path.0.clone();
-        self.heap.push(Reverse((key, invert(&path), ItemBox(item))));
+        self.heap
+            .push(Reverse((key, ReversePath(path.to_vec()), ItemBox(item))));
         if self.heap.len() > self.limit {
             self.heap.pop();
         }
@@ -326,26 +896,113 @@ impl TopN {
 
     fn into_sorted(self) -> Vec<DiffItem> {
         let mut v: Vec<_> = self.heap.into_iter().map(|Reverse(x)| x).collect();
-        v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        v.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.0.cmp(&b.1.0)));
         v.into_iter().map(|(_, _, i)| i.0).collect()
     }
 }
 
-/// Byte-inverted path so that on equal keys the lexicographically smaller path wins.
-fn invert(p: &[u8]) -> Vec<u8> {
-    p.iter().map(|b| !b).collect()
-}
-
 struct DirAcc {
     depth: usize,
-    path: Vec<u8>,
+    path: Vec<NativeName>,
     old_alloc: u64,
     new_alloc: u64,
     old_logical: u64,
     new_logical: u64,
+    old_allocated_records: u64,
+    old_allocated_known: u64,
+    new_allocated_records: u64,
+    new_allocated_known: u64,
+    old_logical_records: u64,
+    old_logical_known: u64,
+    new_logical_records: u64,
+    new_logical_known: u64,
     mtime: i64,
     btime: i64,
     change: Change,
+}
+
+fn metric_coverage(known: u64, records: u64) -> MetricCoverage {
+    if known == 0 {
+        MetricCoverage::Unknown
+    } else if known == records {
+        MetricCoverage::Complete
+    } else {
+        MetricCoverage::Partial
+    }
+}
+
+struct MoveCandidate {
+    path: Vec<NativeName>,
+    allocated: Option<u64>,
+    mtime: Option<MoveTimestamp>,
+    btime: Option<MoveTimestamp>,
+    evidence: crate::record::IdentityEvidence,
+}
+
+type MoveKey = (u16, FileId, Option<(FileIdScheme, FileIdScope)>);
+
+fn move_key(evidence: crate::record::IdentityEvidence, file_id_comparable: bool) -> MoveKey {
+    (
+        evidence.volume,
+        evidence.file_id,
+        file_id_comparable.then_some((evidence.scheme, evidence.scope)),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct MoveTimestamp {
+    seconds: i64,
+    nanos: Option<u32>,
+    resolution: TimestampResolution,
+}
+
+fn move_timestamp(
+    record: &Record,
+    seconds: EntryFields,
+    nanos: EntryFields,
+    value: i64,
+    subsecond: u32,
+) -> Option<MoveTimestamp> {
+    if !record.available.contains(seconds) {
+        return None;
+    }
+    let nanos = record.available.contains(nanos).then_some(subsecond);
+    Some(MoveTimestamp {
+        seconds: value,
+        nanos,
+        resolution: if nanos.is_some() {
+            record.timestamp_resolution
+        } else {
+            TimestampResolution::Seconds
+        },
+    })
+}
+
+fn move_timestamps_match(left: Option<MoveTimestamp>, right: Option<MoveTimestamp>) -> bool {
+    let (Some(left), Some(right)) = (left, right) else {
+        return true;
+    };
+    let resolution = left.resolution.common(right.resolution);
+    if resolution == TimestampResolution::Unknown {
+        return true;
+    }
+    let unit = resolution.nanos();
+    let quantize = |timestamp: MoveTimestamp| {
+        (
+            timestamp.seconds,
+            timestamp.nanos.unwrap_or(0) as i64 / unit,
+        )
+    };
+    quantize(left) == quantize(right)
+}
+
+fn move_candidates_match(left: &MoveCandidate, right: &MoveCandidate) -> bool {
+    let Some((left_allocated, right_allocated)) = left.allocated.zip(right.allocated) else {
+        return false;
+    };
+    left_allocated == right_allocated
+        && move_timestamps_match(left.mtime, right.mtime)
+        && move_timestamps_match(left.btime, right.btime)
 }
 
 /// Builds a [`DiffReport`] from merge events.
@@ -358,8 +1015,8 @@ pub struct ReportBuilder {
     growing_dirs: TopN,
     shrinking_dirs: TopN,
     dirs: Vec<DirAcc>,
-    deleted_by_ino: HashMap<u64, (Vec<u8>, u64, i64)>,
-    added_by_ino: HashMap<u64, (Vec<u8>, u64, i64)>,
+    deleted_by_id: HashMap<MoveKey, MoveCandidate>,
+    added_by_id: HashMap<MoveKey, MoveCandidate>,
     move_cap_hit: bool,
 }
 
@@ -367,7 +1024,11 @@ impl ReportBuilder {
     pub fn new(opts: DiffOptions) -> Self {
         let limit = opts.limit;
         ReportBuilder {
-            files: TopN::new(if opts.list_files && opts.sort != DiffSort::Path { limit } else { 0 }),
+            files: TopN::new(if opts.list_files && opts.sort != DiffSort::Path {
+                limit
+            } else {
+                0
+            }),
             shrinking_files: TopN::new(if opts.list_files { limit } else { 0 }),
             growing_dirs: TopN::new(if opts.list_dirs { limit } else { 0 }),
             shrinking_dirs: TopN::new(if opts.list_dirs { limit } else { 0 }),
@@ -375,13 +1036,13 @@ impl ReportBuilder {
             opts,
             report: DiffReport::default(),
             dirs: Vec::new(),
-            deleted_by_ino: HashMap::new(),
-            added_by_ino: HashMap::new(),
+            deleted_by_id: HashMap::new(),
+            added_by_id: HashMap::new(),
             move_cap_hit: false,
         }
     }
 
-    fn pop_dirs_to(&mut self, depth: usize) {
+    fn pop_dirs_to(&mut self, depth: usize) -> io::Result<()> {
         while self.dirs.last().is_some_and(|d| d.depth >= depth) {
             let d = self.dirs.pop().unwrap();
             if let Some(parent) = self.dirs.last_mut() {
@@ -389,54 +1050,116 @@ impl ReportBuilder {
                 parent.new_alloc += d.new_alloc;
                 parent.old_logical += d.old_logical;
                 parent.new_logical += d.new_logical;
+                parent.old_allocated_records += d.old_allocated_records;
+                parent.old_allocated_known += d.old_allocated_known;
+                parent.new_allocated_records += d.new_allocated_records;
+                parent.new_allocated_known += d.new_allocated_known;
+                parent.old_logical_records += d.old_logical_records;
+                parent.old_logical_known += d.old_logical_known;
+                parent.new_logical_records += d.new_logical_records;
+                parent.new_logical_known += d.new_logical_known;
             }
-            let delta = d.new_alloc as i128 - d.old_alloc as i128;
+            let allocated_delta = d.new_alloc as i128 - d.old_alloc as i128;
+            let logical_delta = d.new_logical as i128 - d.old_logical as i128;
+            let delta = if self.opts.allocated_deltas {
+                allocated_delta
+            } else {
+                logical_delta
+            };
             if delta == 0 || delta.unsigned_abs() < self.opts.min_size as u128 {
                 continue;
             }
             let item = DiffItem {
-                path: NativePath(d.path),
+                path: join_components(&d.path)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
                 kind: Kind::Dir,
                 change: d.change,
                 old_logical: d.old_logical,
                 new_logical: d.new_logical,
                 old_allocated: d.old_alloc,
                 new_allocated: d.new_alloc,
-                delta_allocated: clamp(delta),
-                delta_logical: clamp(d.new_logical as i128 - d.old_logical as i128),
+                delta_allocated: if matches!(
+                    (
+                        metric_coverage(d.old_allocated_known, d.old_allocated_records),
+                        metric_coverage(d.new_allocated_known, d.new_allocated_records)
+                    ),
+                    (MetricCoverage::Complete, MetricCoverage::Complete)
+                ) {
+                    clamp(delta)
+                } else {
+                    UNKNOWN_DELTA
+                },
+                delta_logical: if matches!(
+                    (
+                        metric_coverage(d.old_logical_known, d.old_logical_records),
+                        metric_coverage(d.new_logical_known, d.new_logical_records)
+                    ),
+                    (MetricCoverage::Complete, MetricCoverage::Complete)
+                ) {
+                    clamp(d.new_logical as i128 - d.old_logical as i128)
+                } else {
+                    UNKNOWN_DELTA
+                },
                 mtime: d.mtime,
                 btime: d.btime,
                 is_dir: true,
             };
             if delta > 0 {
-                self.growing_dirs.offer(delta, item);
+                self.growing_dirs.offer(delta, &d.path, item);
             } else {
-                self.shrinking_dirs.offer(-delta, item);
+                self.shrinking_dirs.offer(-delta, &d.path, item);
             }
         }
+        Ok(())
     }
 
-    pub fn finish(mut self) -> DiffReport {
-        self.pop_dirs_to(0);
+    pub fn finish(mut self) -> io::Result<DiffReport> {
+        self.pop_dirs_to(0)?;
         let mut moves = Vec::new();
         if self.opts.detect_moves && !self.move_cap_hit {
-            for (ino, (from, size, btime)) in &self.deleted_by_ino {
-                if let Some((to, size2, btime2)) = self.added_by_ino.get(ino)
-                    && size == size2 && btime == btime2 {
-                        moves.push(MoveItem { from: from.clone(), to: to.clone(), allocated: *size });
-                    }
+            for (id, from) in &self.deleted_by_id {
+                if let Some(to) = self.added_by_id.get(id)
+                    && move_candidates_match(from, to)
+                    && !matches!(
+                        from.evidence.move_certainty_with_comparability(
+                            &to.evidence,
+                            self.opts.file_id_comparable
+                        ),
+                        MoveCertainty::None
+                    )
+                {
+                    moves.push(MoveItem {
+                        from: join_components(&from.path)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+                        to: join_components(&to.path)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
+                        allocated: from.allocated.unwrap(),
+                        certainty: from.evidence.move_certainty_with_comparability(
+                            &to.evidence,
+                            self.opts.file_id_comparable,
+                        ),
+                    });
+                }
             }
-            moves.sort_by(|a, b| b.allocated.cmp(&a.allocated).then_with(|| a.from.cmp(&b.from)));
+            moves.sort_by(|a, b| {
+                b.allocated
+                    .cmp(&a.allocated)
+                    .then_with(|| a.from.cmp(&b.from))
+            });
             self.report.summary.moved = moves.len() as u64;
             self.report.summary.moved_bytes = moves.iter().map(|m| m.allocated).sum();
             moves.truncate(self.opts.limit);
         }
         self.report.moves = moves;
-        self.report.files = if self.opts.sort == DiffSort::Path { self.path_order_files } else { self.files.into_sorted() };
+        self.report.files = if self.opts.sort == DiffSort::Path {
+            self.path_order_files
+        } else {
+            self.files.into_sorted()
+        };
         self.report.shrinking_files = self.shrinking_files.into_sorted();
         self.report.growing_dirs = self.growing_dirs.into_sorted();
         self.report.shrinking_dirs = self.shrinking_dirs.into_sorted();
-        self.report
+        Ok(self.report)
     }
 }
 
@@ -446,70 +1169,184 @@ fn clamp(v: i128) -> i64 {
 
 impl DiffVisitor for ReportBuilder {
     fn entry(&mut self, e: &DiffEntry<'_>) -> io::Result<()> {
-        if let Some(prefix) = &self.opts.prefix
-            && !(e.path.len() >= prefix.len() && e.path[..prefix.len()] == prefix[..]) {
+        if let Some(prefix) = &self.opts.prefix {
+            compare_paths(e.path, prefix)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            if !(e.path.len() >= prefix.len() && e.path[..prefix.len()] == prefix[..]) {
                 return Ok(());
             }
+        }
         let depth = e.path.len() - 1;
-        self.pop_dirs_to(depth);
+        self.pop_dirs_to(depth)?;
 
         let s = &mut self.report.summary;
         let visibility_change = matches!(e.change, Change::NewlyVisible | Change::NoLongerVisible);
-        let (old_a, old_l) = e.old.map(|r| (r.counted_alloc(), r.counted_size())).unwrap_or((0, 0));
-        let (new_a, new_l) = e.new.map(|r| (r.counted_alloc(), r.counted_size())).unwrap_or((0, 0));
+        if !e.coverage.is_empty() {
+            s.coverage_changed += 1;
+        }
+        let (mut old_a_known, old_l_known, mut new_a_known, new_l_known) = match e.change {
+            Change::Added | Change::NewlyVisible => (
+                Some(0),
+                Some(0),
+                metric_value(e.new, EntryFields::ALLOCATED_SIZE),
+                metric_value(e.new, EntryFields::LOGICAL_SIZE),
+            ),
+            Change::Deleted | Change::NoLongerVisible => (
+                metric_value(e.old, EntryFields::ALLOCATED_SIZE),
+                metric_value(e.old, EntryFields::LOGICAL_SIZE),
+                Some(0),
+                Some(0),
+            ),
+            Change::Unchanged | Change::Modified | Change::CoverageChanged => (
+                metric_value(e.old, EntryFields::ALLOCATED_SIZE),
+                metric_value(e.old, EntryFields::LOGICAL_SIZE),
+                metric_value(e.new, EntryFields::ALLOCATED_SIZE),
+                metric_value(e.new, EntryFields::LOGICAL_SIZE),
+            ),
+        };
+        if !self.opts.allocated_deltas {
+            old_a_known = None;
+            new_a_known = None;
+        }
+        let old_a = old_a_known.unwrap_or(0);
+        let old_l = old_l_known.unwrap_or(0);
+        let new_a = new_a_known.unwrap_or(0);
+        let new_l = new_l_known.unwrap_or(0);
         if let Some(o) = e.old
-            && !visibility_change {
-                s.old_total_allocated += o.counted_alloc();
-                s.old_total_logical += o.counted_size();
+            && !visibility_change
+        {
+            s.old_total_allocated_records += 1;
+            if let Some(bytes) = old_a_known {
+                s.old_total_allocated += bytes;
+                s.old_total_allocated_known += 1;
             }
+            s.old_total_logical_records += 1;
+            if let Some(bytes) = metric_value(Some(o), EntryFields::LOGICAL_SIZE) {
+                s.old_total_logical += bytes;
+                s.old_total_logical_known += 1;
+            }
+        }
         if let Some(n) = e.new
-            && !visibility_change {
-                s.new_total_allocated += n.counted_alloc();
-                s.new_total_logical += n.counted_size();
+            && !visibility_change
+        {
+            s.new_total_allocated_records += 1;
+            if let Some(bytes) = new_a_known {
+                s.new_total_allocated += bytes;
+                s.new_total_allocated_known += 1;
             }
+            s.new_total_logical_records += 1;
+            if let Some(bytes) = metric_value(Some(n), EntryFields::LOGICAL_SIZE) {
+                s.new_total_logical += bytes;
+                s.new_total_logical_known += 1;
+            }
+        }
         match e.change {
             Change::Unchanged => s.unchanged += 1,
-            Change::Added => s.added.add(e.new.unwrap()),
-            Change::Deleted => s.deleted.add(e.old.unwrap()),
-            Change::Modified => match new_a.cmp(&old_a) {
-                Ordering::Greater => {
-                    s.grown.count += 1;
-                    s.grown.allocated_bytes += new_a - old_a;
-                    s.grown.logical_bytes += new_l.saturating_sub(old_l);
+            Change::CoverageChanged => {}
+            Change::Added => s
+                .added
+                .add_with_allocation(e.new.unwrap(), self.opts.allocated_deltas),
+            Change::Deleted => s
+                .deleted
+                .add_with_allocation(e.old.unwrap(), self.opts.allocated_deltas),
+            Change::Modified => {
+                if self.opts.allocated_deltas
+                    && let (Some(new_a), Some(old_a)) = (new_a_known, old_a_known)
+                {
+                    match new_a.cmp(&old_a) {
+                        Ordering::Greater => s.grown.add_delta(
+                            new_l_known
+                                .zip(old_l_known)
+                                .map(|(new, old)| new.saturating_sub(old)),
+                            Some(new_a - old_a),
+                        ),
+                        Ordering::Less => s.shrunk.add_delta(
+                            old_l_known
+                                .zip(new_l_known)
+                                .map(|(old, new)| old.saturating_sub(new)),
+                            Some(old_a - new_a),
+                        ),
+                        Ordering::Equal => s.modified_same_size += 1,
+                    }
                 }
-                Ordering::Less => {
-                    s.shrunk.count += 1;
-                    s.shrunk.allocated_bytes += old_a - new_a;
-                    s.shrunk.logical_bytes += old_l.saturating_sub(new_l);
-                }
-                Ordering::Equal => s.modified_same_size += 1,
-            },
-            Change::NewlyVisible => s.newly_visible.add(e.new.unwrap()),
-            Change::NoLongerVisible => s.no_longer_visible.add(e.old.unwrap()),
+            }
+            Change::NewlyVisible => s
+                .newly_visible
+                .add_with_allocation(e.new.unwrap(), self.opts.allocated_deltas),
+            Change::NoLongerVisible => s
+                .no_longer_visible
+                .add_with_allocation(e.old.unwrap(), self.opts.allocated_deltas),
         }
         let (d_a, d_l) = if visibility_change {
             (0i128, 0i128)
         } else {
             (new_a as i128 - old_a as i128, new_l as i128 - old_l as i128)
         };
-        s.net_allocated_bytes += d_a;
-        s.net_logical_bytes += d_l;
+        if !visibility_change {
+            s.net_allocated_records += 1;
+            match (old_a_known, new_a_known) {
+                (Some(old), Some(new)) => {
+                    s.net_allocated_known += 1;
+                    s.net_allocated_bytes += new as i128 - old as i128;
+                }
+                _ => s.net_allocated_unknown = true,
+            }
+            s.net_logical_records += 1;
+            match (old_l_known, new_l_known) {
+                (Some(old), Some(new)) => {
+                    s.net_logical_known += 1;
+                    s.net_logical_bytes += new as i128 - old as i128;
+                }
+                _ => s.net_logical_unknown = true,
+            }
+        }
 
         // Directory aggregation: a directory opens an accumulator holding its own
         // size, which flows into its parent when the directory is closed; any other
         // entry adds directly to its parent's accumulator.
-        let (own_old_a, own_new_a, own_old_l, own_new_l) =
-            if visibility_change { (0, 0, 0, 0) } else { (old_a, new_a, old_l, new_l) };
+        let (own_old_a, own_new_a, own_old_l, own_new_l) = if visibility_change {
+            (0, 0, 0, 0)
+        } else {
+            (old_a, new_a, old_l, new_l)
+        };
+        let (old_allocated_records, old_allocated_known) = if visibility_change {
+            (0, 0)
+        } else {
+            (1, u64::from(old_a_known.is_some()))
+        };
+        let (new_allocated_records, new_allocated_known) = if visibility_change {
+            (0, 0)
+        } else {
+            (1, u64::from(new_a_known.is_some()))
+        };
+        let (old_logical_records, old_logical_known) = if visibility_change {
+            (0, 0)
+        } else {
+            (1, u64::from(old_l_known.is_some()))
+        };
+        let (new_logical_records, new_logical_known) = if visibility_change {
+            (0, 0)
+        } else {
+            (1, u64::from(new_l_known.is_some()))
+        };
         let rec = e.new.or(e.old).unwrap();
         let is_dir = e.new.is_some_and(|r| r.is_dir()) || e.old.is_some_and(|r| r.is_dir());
         if is_dir {
             self.dirs.push(DirAcc {
                 depth,
-                path: join_components(e.path),
+                path: e.path.to_vec(),
                 old_alloc: own_old_a,
                 new_alloc: own_new_a,
                 old_logical: own_old_l,
                 new_logical: own_new_l,
+                old_allocated_records,
+                old_allocated_known,
+                new_allocated_records,
+                new_allocated_known,
+                old_logical_records,
+                old_logical_known,
+                new_logical_records,
+                new_logical_known,
                 mtime: rec.mtime,
                 btime: rec.btime,
                 change: e.change,
@@ -523,39 +1360,79 @@ impl DiffVisitor for ReportBuilder {
             parent.new_logical += own_new_l;
         }
 
-        if matches!(e.change, Change::Unchanged) || visibility_change {
+        let explicit_change = matches!(
+            e.change,
+            Change::NewlyVisible | Change::NoLongerVisible | Change::CoverageChanged
+        );
+        if matches!(e.change, Change::Unchanged) {
             return Ok(());
         }
         // Move candidates.
         if self.opts.detect_moves && rec.kind == Kind::File && !rec.has(flags::HARDLINK_DUP) {
             let map = match e.change {
-                Change::Added => Some(&mut self.added_by_ino),
-                Change::Deleted => Some(&mut self.deleted_by_ino),
+                Change::Added => Some(&mut self.added_by_id),
+                Change::Deleted => Some(&mut self.deleted_by_id),
                 _ => None,
             };
-            if let Some(map) = map {
+            if let (Some(map), Some(evidence)) = (map, rec.identity_evidence()) {
                 if map.len() < self.opts.move_candidates_cap {
-                    map.insert(rec.ino, (join_components(e.path), rec.alloc, rec.btime));
+                    map.insert(
+                        move_key(evidence, self.opts.file_id_comparable),
+                        MoveCandidate {
+                            path: e.path.to_vec(),
+                            allocated: self
+                                .opts
+                                .allocated_deltas
+                                .then_some(rec)
+                                .filter(|record| {
+                                    record.available.contains(EntryFields::ALLOCATED_SIZE)
+                                })
+                                .map(|record| record.alloc),
+                            mtime: move_timestamp(
+                                rec,
+                                EntryFields::MTIME,
+                                EntryFields::MTIME_NANOS,
+                                rec.mtime,
+                                rec.mtime_nanos,
+                            ),
+                            btime: move_timestamp(
+                                rec,
+                                EntryFields::BIRTH_TIME,
+                                EntryFields::BIRTH_TIME_NANOS,
+                                rec.btime,
+                                rec.btime_nanos,
+                            ),
+                            evidence,
+                        },
+                    );
                 } else {
                     self.move_cap_hit = true;
                 }
             }
         }
-        if !self.opts.list_files || d_a.unsigned_abs() < self.opts.min_size as u128 {
+        let ranking_delta = if self.opts.allocated_deltas { d_a } else { d_l };
+        let ranking_size = if self.opts.allocated_deltas {
+            new_a as i128
+        } else {
+            new_l as i128
+        };
+        if !self.opts.list_files
+            || (!explicit_change && ranking_delta.unsigned_abs() < self.opts.min_size as u128)
+        {
             return Ok(());
         }
         // Sorted by growth, a change that moved no bytes is noise.
-        if self.opts.sort == DiffSort::Growth && d_a == 0 {
+        if self.opts.sort == DiffSort::Growth && ranking_delta == 0 && !explicit_change {
             return Ok(());
         }
         let key = match self.opts.sort {
-            DiffSort::Growth => d_a,
-            DiffSort::Size => new_a as i128,
+            DiffSort::Growth => ranking_delta,
+            DiffSort::Size => ranking_size,
             DiffSort::Modified => e.new.map(|r| r.mtime).unwrap_or(i64::MIN) as i128,
             DiffSort::Created => e.new.map(|r| r.btime).unwrap_or(i64::MIN) as i128,
             DiffSort::Path => 0,
         };
-        let wants_shrink = d_a < 0 && self.shrinking_files.would_accept(-d_a);
+        let wants_shrink = ranking_delta < 0 && self.shrinking_files.would_accept(-ranking_delta);
         let wants_main = if self.opts.sort == DiffSort::Path {
             self.path_order_files.len() < self.opts.limit
         } else {
@@ -565,27 +1442,45 @@ impl DiffVisitor for ReportBuilder {
             return Ok(());
         }
         let item = DiffItem {
-            path: NativePath(join_components(e.path)),
+            path: join_components(e.path)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
             kind: rec.kind,
             change: e.change,
             old_logical: old_l,
             new_logical: new_l,
             old_allocated: old_a,
             new_allocated: new_a,
-            delta_allocated: clamp(d_a),
-            delta_logical: clamp(d_l),
-            mtime: rec.mtime,
-            btime: rec.btime,
+            delta_allocated: if old_a_known.is_none() || new_a_known.is_none() {
+                UNKNOWN_DELTA
+            } else {
+                clamp(d_a)
+            },
+            delta_logical: if old_l_known.is_none() || new_l_known.is_none() {
+                UNKNOWN_DELTA
+            } else {
+                clamp(d_l)
+            },
+            mtime: if rec.has(flags::STAT_ERROR) {
+                0
+            } else {
+                rec.mtime
+            },
+            btime: if rec.has(flags::STAT_ERROR) {
+                0
+            } else {
+                rec.btime
+            },
             is_dir: false,
         };
         if wants_shrink {
-            self.shrinking_files.offer(-d_a, item.clone());
+            self.shrinking_files
+                .offer(-ranking_delta, e.path, item.clone());
         }
         if wants_main {
             if self.opts.sort == DiffSort::Path {
                 self.path_order_files.push(item);
             } else {
-                self.files.offer(key, item);
+                self.files.offer(key, e.path, item);
             }
         }
         Ok(())
@@ -596,29 +1491,34 @@ impl DiffVisitor for ReportBuilder {
 pub fn diff(a: RecordStream<'_>, b: RecordStream<'_>, opts: DiffOptions) -> io::Result<DiffReport> {
     let mut builder = ReportBuilder::new(opts);
     merge(a, b, &mut builder)?;
-    Ok(builder.finish())
+    builder.finish()
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::record::{EntryFields, FileIdScheme, FileIdScope};
 
     /// Builds a canonical stream from `(path, kind, alloc)` triples given in any order.
     pub fn stream(entries: &[(&str, Kind, u64)]) -> Vec<Record> {
-        let mut v: Vec<(Vec<Vec<u8>>, Kind, u64)> = entries
+        let mut v: Vec<(Vec<NativeName>, Kind, u64)> = entries
             .iter()
             .map(|(p, k, a)| {
-                let mut comps: Vec<Vec<u8>> = vec![b"/r".to_vec()];
-                comps.extend(p.split('/').filter(|c| !c.is_empty()).map(|c| c.as_bytes().to_vec()));
+                let mut comps = vec![NativeName::unix(b"/r".to_vec())];
+                comps.extend(
+                    p.split('/')
+                        .filter(|c| !c.is_empty())
+                        .map(|c| NativeName::unix(c.as_bytes().to_vec())),
+                );
                 (comps, *k, *a)
             })
             .collect();
-        v.sort_by(|a, b| compare_paths(&a.0, &b.0));
+        v.sort_by(|a, b| compare_paths(&a.0, &b.0).unwrap());
         v.into_iter()
             .enumerate()
             .map(|(i, (comps, kind, alloc))| Record {
                 depth: (comps.len() - 1) as u16,
-                name: crate::native::NativeName::unix(comps.last().unwrap().clone()),
+                name: comps.last().unwrap().clone(),
                 kind,
                 size: alloc,
                 alloc,
@@ -658,8 +1558,19 @@ pub(crate) mod tests {
             ("a/z", F, 4000),
             ("c", F, 5),
         ]);
-        new.iter_mut().find(|r| r.name == crate::native::NativeName::unix(b"y".to_vec())).unwrap().ino = 102; // same as before
-        let r = diff(boxed(base()), boxed(new), DiffOptions { detect_moves: false, ..Default::default() }).unwrap();
+        new.iter_mut()
+            .find(|r| r.name == crate::native::NativeName::unix(b"y".to_vec()))
+            .unwrap()
+            .ino = 102; // same as before
+        let r = diff(
+            boxed(base()),
+            boxed(new),
+            DiffOptions {
+                detect_moves: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let s = &r.summary;
         assert_eq!(s.added.count, 1);
         assert_eq!(s.added.allocated_bytes, 4000);
@@ -671,12 +1582,15 @@ pub(crate) mod tests {
         assert_eq!(s.net_allocated_bytes, 1000 + 4000 - 50 - 5);
         assert_eq!(s.old_total_allocated, 360);
         assert_eq!(s.new_total_allocated, 5305);
-        let paths: Vec<String> = r.growing_dirs.iter().map(|d| d.path.lossy()).collect();
+        let paths: Vec<String> = r.growing_dirs.iter().map(|d| d.path.display()).collect();
         assert_eq!(paths, ["/r/a", "/r"], "inclusive deltas, largest first");
         assert_eq!(r.growing_dirs[0].delta_allocated, 5000);
-        assert_eq!(r.growing_dirs[1].delta_allocated, 4945, "root includes b's shrinkage");
-        assert_eq!(r.files[0].path.0, b"/r/a/z");
-        assert_eq!(r.shrinking_dirs[0].path.0, b"/r/b");
+        assert_eq!(
+            r.growing_dirs[1].delta_allocated, 4945,
+            "root includes b's shrinkage"
+        );
+        assert_eq!(r.files[0].path, NativePath::unix(b"/r/a/z".to_vec()));
+        assert_eq!(r.shrinking_dirs[0].path, NativePath::unix(b"/r/b".to_vec()));
     }
 
     #[test]
@@ -685,16 +1599,26 @@ pub(crate) mod tests {
         let new = stream(&[("", D, 0), ("p", D, 0), ("p/q", D, 0), ("p/q/f", F, 110)]);
         let r = diff(boxed(old), boxed(new), DiffOptions::default()).unwrap();
         for d in &r.growing_dirs {
-            assert_eq!(d.delta_allocated, 100, "{}", d.path.lossy());
+            assert_eq!(d.delta_allocated, 100, "{}", d.path.display());
         }
         assert_eq!(r.growing_dirs.len(), 3);
     }
 
     #[test]
     fn coverage_changes_are_not_growth() {
-        let mut old = stream(&[("", D, 0), ("locked", D, 0), ("open", D, 0), ("open/f", F, 7)]);
+        let mut old = stream(&[
+            ("", D, 0),
+            ("locked", D, 0),
+            ("open", D, 0),
+            ("open/f", F, 7),
+        ]);
         old[1].flags = flags::INACCESSIBLE;
-        let new = stream(&[("", D, 0), ("locked", D, 0), ("locked/secret", F, 999), ("open", D, 0)]);
+        let new = stream(&[
+            ("", D, 0),
+            ("locked", D, 0),
+            ("locked/secret", F, 999),
+            ("open", D, 0),
+        ]);
         let mut new_locked = new.clone();
         new_locked[3].flags = flags::INACCESSIBLE;
         let r = diff(boxed(old.clone()), boxed(new), DiffOptions::default()).unwrap();
@@ -705,18 +1629,331 @@ pub(crate) mod tests {
         assert_eq!(r.summary.net_allocated_bytes, -7);
         let r = diff(boxed(old), boxed(new_locked), DiffOptions::default()).unwrap();
         assert_eq!(r.summary.no_longer_visible.count, 1);
-        assert_eq!(r.summary.deleted.count, 0, "inaccessible is never counted as deleted");
+        assert_eq!(
+            r.summary.deleted.count, 0,
+            "inaccessible is never counted as deleted"
+        );
+    }
+
+    #[test]
+    fn allocation_incomparable_comparison_omits_allocated_deltas_and_totals() {
+        let old = stream(&[("", D, 10), ("file", F, 10)]);
+        let new = stream(&[("", D, 20), ("file", F, 20)]);
+        let report = diff(
+            boxed(old),
+            boxed(new),
+            DiffOptions {
+                allocated_deltas: false,
+                detect_moves: false,
+                sort: DiffSort::Path,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.summary.net_allocated_quality(), Quality::Unknown);
+        assert_eq!(report.summary.old_total_allocated, 0);
+        assert_eq!(report.summary.new_total_allocated, 0);
+        assert_eq!(report.growing_dirs.len(), 1);
+        assert_eq!(report.growing_dirs[0].delta_allocated, UNKNOWN_DELTA);
+        assert_eq!(report.growing_dirs[0].delta_logical, 20);
+        assert_eq!(report.files[0].delta_allocated, UNKNOWN_DELTA);
+    }
+
+    #[test]
+    fn allocation_incomparable_comparison_keeps_logical_file_changes() {
+        let old = stream(&[("", D, 10), ("file", F, 10)]);
+        let mut new = old.clone();
+        new[1].size = 20;
+        let report = diff(
+            boxed(old),
+            boxed(new),
+            DiffOptions {
+                allocated_deltas: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].delta_logical, 10);
+        assert_eq!(report.files[0].delta_allocated, UNKNOWN_DELTA);
+    }
+
+    #[test]
+    fn visibility_and_coverage_changes_are_emitted_as_items() {
+        let mut old = stream(&[
+            ("", D, 0),
+            ("coverage", F, 7),
+            ("newly", D, 0),
+            ("no-longer", D, 0),
+            ("no-longer/old", F, 5),
+        ]);
+        let mut new = stream(&[
+            ("", D, 0),
+            ("coverage", F, 7),
+            ("newly", D, 0),
+            ("newly/new", F, 9),
+            ("no-longer", D, 0),
+        ]);
+        let coverage = NativeName::unix(b"coverage".to_vec());
+        old.iter_mut()
+            .find(|r| r.name == coverage)
+            .unwrap()
+            .available = EntryFields::KIND
+            .union(EntryFields::LOGICAL_SIZE)
+            .union(EntryFields::ALLOCATED_SIZE)
+            .union(EntryFields::MTIME);
+        new.iter_mut()
+            .find(|r| r.name == coverage)
+            .unwrap()
+            .available = old
+            .iter()
+            .find(|r| r.name == coverage)
+            .unwrap()
+            .available
+            .union(EntryFields::MTIME_NANOS);
+        old.iter_mut()
+            .find(|r| r.name == NativeName::unix(b"newly".to_vec()))
+            .unwrap()
+            .flags = flags::INACCESSIBLE;
+        new.iter_mut()
+            .find(|r| r.name == NativeName::unix(b"no-longer".to_vec()))
+            .unwrap()
+            .flags = flags::INACCESSIBLE;
+
+        let report = diff(
+            boxed(old),
+            boxed(new),
+            DiffOptions {
+                sort: DiffSort::Path,
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let changes: Vec<_> = report
+            .files
+            .iter()
+            .map(|item| (item.path.display(), item.change))
+            .collect();
+        assert_eq!(changes.len(), 3);
+        assert!(changes.contains(&("/r/coverage".into(), Change::CoverageChanged)));
+        assert!(changes.contains(&("/r/newly/new".into(), Change::NewlyVisible)));
+        assert!(changes.contains(&("/r/no-longer/old".into(), Change::NoLongerVisible)));
     }
 
     #[test]
     fn detects_moves() {
-        let old = stream(&[("", D, 0), ("a", D, 0), ("a/big.iso", F, 5000)]);
+        let mut old = stream(&[("", D, 0), ("a", D, 0), ("a/big.iso", F, 5000)]);
+        old[2].file_id = crate::record::FileId { low: 42, high: 0 };
+        old[2].file_id_scheme = crate::record::FileIdScheme::PosixInode64;
+        old[2].btime = 12;
+        old[2].available = crate::record::EntryFields::ALLOCATED_SIZE
+            .union(crate::record::EntryFields::BIRTH_TIME)
+            .union(crate::record::EntryFields::FILE_ID);
         let mut new = stream(&[("", D, 0), ("b", D, 0), ("b/big.iso", F, 5000)]);
-        new[2].ino = old[2].ino;
+        new[2].file_id = old[2].file_id;
+        new[2].file_id_scheme = old[2].file_id_scheme;
+        new[2].btime = old[2].btime;
+        new[2].available = old[2].available;
         let r = diff(boxed(old), boxed(new), DiffOptions::default()).unwrap();
         assert_eq!(r.summary.moved, 1);
-        assert_eq!(r.moves[0].from, b"/r/a/big.iso");
-        assert_eq!(r.moves[0].to, b"/r/b/big.iso");
+        assert_eq!(r.moves[0].from, NativePath::unix(b"/r/a/big.iso".to_vec()));
+        assert_eq!(r.moves[0].to, NativePath::unix(b"/r/b/big.iso".to_vec()));
+    }
+
+    #[test]
+    fn unavailable_allocation_is_not_zero_move_evidence() {
+        let mut old = stream(&[("", D, 0), ("old", F, 7)]);
+        let mut new = stream(&[("", D, 0), ("new", F, 7)]);
+        let observed = EntryFields::KIND
+            .union(EntryFields::LOGICAL_SIZE)
+            .union(EntryFields::FILE_ID);
+        for records in [&mut old, &mut new] {
+            let record = &mut records[1];
+            record.file_id = FileId { low: 42, high: 0 };
+            record.available = observed;
+        }
+
+        let report = diff(boxed(old), boxed(new), DiffOptions::default()).unwrap();
+        assert!(report.moves.is_empty());
+        assert_eq!(report.summary.moved, 0);
+    }
+
+    #[test]
+    fn incomparable_allocation_suppresses_allocated_measurements() {
+        let mut old = stream(&[("", D, 0), ("file", F, 10)]);
+        let mut new = old.clone();
+        old[1].size = 1;
+        new[1].size = 2;
+        new[1].alloc = 20;
+
+        let report = diff(
+            boxed(old),
+            boxed(new),
+            DiffOptions {
+                sort: DiffSort::Path,
+                allocated_deltas: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.summary.net_logical_bytes, 1);
+        assert_eq!(report.summary.net_logical_quality(), Quality::Observed);
+        assert_eq!(report.summary.net_allocated_quality(), Quality::Unknown);
+        let json = serde_json::to_value(&report).unwrap();
+        assert!(json["summary"].get("netAllocatedBytes").is_none());
+        assert!(json["files"][0].get("deltaAllocated").is_none());
+        assert_eq!(json["files"][0]["deltaLogical"], 1);
+    }
+
+    #[test]
+    fn move_detection_compares_birth_and_mtime_at_common_resolution() {
+        let mut old = stream(&[("", D, 0), ("old", F, 7)]);
+        let mut new = stream(&[("", D, 0), ("new", F, 7)]);
+        let observed = EntryFields::KIND
+            .union(EntryFields::LOGICAL_SIZE)
+            .union(EntryFields::ALLOCATED_SIZE)
+            .union(EntryFields::MTIME)
+            .union(EntryFields::MTIME_NANOS)
+            .union(EntryFields::BIRTH_TIME)
+            .union(EntryFields::BIRTH_TIME_NANOS)
+            .union(EntryFields::FILE_ID);
+        for records in [&mut old, &mut new] {
+            let record = &mut records[1];
+            record.file_id = FileId { low: 42, high: 0 };
+            record.available = observed;
+            record.timestamp_resolution = crate::record::TimestampResolution::Nanoseconds;
+            record.mtime = 10;
+            record.btime = 20;
+        }
+        old[1].mtime_nanos = 1;
+        new[1].mtime_nanos = 2;
+
+        let report = diff(boxed(old), boxed(new), DiffOptions::default()).unwrap();
+        assert!(report.moves.is_empty());
+        assert_eq!(report.summary.moved, 0);
+    }
+
+    #[test]
+    fn unavailable_birth_and_nanoseconds_do_not_block_common_resolution_move() {
+        let mut old = stream(&[("", D, 0), ("old", F, 7)]);
+        let mut new = stream(&[("", D, 0), ("new", F, 7)]);
+        let old_observed = EntryFields::KIND
+            .union(EntryFields::LOGICAL_SIZE)
+            .union(EntryFields::ALLOCATED_SIZE)
+            .union(EntryFields::MTIME)
+            .union(EntryFields::BIRTH_TIME)
+            .union(EntryFields::FILE_ID);
+        let new_observed = old_observed
+            .union(EntryFields::MTIME_NANOS)
+            .union(EntryFields::BIRTH_TIME_NANOS);
+        for records in [&mut old, &mut new] {
+            let record = &mut records[1];
+            record.file_id = FileId { low: 42, high: 0 };
+            record.timestamp_resolution = crate::record::TimestampResolution::Nanoseconds;
+            record.mtime = 10;
+            record.btime = 20;
+        }
+        old[1].available = old_observed;
+        new[1].available = new_observed;
+        old[1].mtime_nanos = 100;
+        old[1].btime_nanos = 200;
+        new[1].mtime_nanos = 900_000_000;
+        new[1].btime_nanos = 900_000_000;
+
+        let report = diff(boxed(old), boxed(new), DiffOptions::default()).unwrap();
+        assert_eq!(report.summary.moved, 1);
+    }
+
+    #[test]
+    fn move_candidates_are_keyed_by_scheme_scope_and_volume() {
+        let names = [
+            "old-posix",
+            "old-windows",
+            "old-filesystem",
+            "old-other-volume",
+        ];
+        let mut old = stream(&[
+            ("", D, 0),
+            (names[0], F, 7),
+            (names[1], F, 7),
+            (names[2], F, 7),
+            (names[3], F, 7),
+        ]);
+        let mut new = stream(&[
+            ("", D, 0),
+            ("new-posix", F, 7),
+            ("new-windows", F, 7),
+            ("new-filesystem", F, 7),
+            ("new-other-volume", F, 7),
+        ]);
+        let identity_fields = EntryFields::KIND
+            .union(EntryFields::LOGICAL_SIZE)
+            .union(EntryFields::ALLOCATED_SIZE)
+            .union(EntryFields::BIRTH_TIME)
+            .union(EntryFields::FILE_ID);
+        let identities = [
+            (FileIdScheme::PosixInode64, FileIdScope::Volume, 1),
+            (FileIdScheme::WindowsFileId128, FileIdScope::Volume, 1),
+            (FileIdScheme::PosixInode64, FileIdScope::Filesystem, 1),
+            (FileIdScheme::PosixInode64, FileIdScope::Volume, 2),
+        ];
+        for (index, (scheme, scope, volume)) in identities.into_iter().enumerate() {
+            let old_record = old
+                .iter_mut()
+                .find(|r| r.name == NativeName::unix(names[index].as_bytes().to_vec()))
+                .unwrap();
+            let new_name = format!("new-{}", names[index].strip_prefix("old-").unwrap());
+            let new_record = new
+                .iter_mut()
+                .find(|r| r.name == NativeName::unix(new_name.as_bytes().to_vec()))
+                .unwrap();
+            for record in [old_record, new_record] {
+                record.file_id = crate::record::FileId { low: 42, high: 0 };
+                record.file_id_scheme = scheme;
+                record.file_id_scope = scope;
+                record.vol = volume;
+                record.btime = 12;
+                record.available = identity_fields;
+            }
+        }
+
+        let report = diff(boxed(old), boxed(new), DiffOptions::default()).unwrap();
+        assert_eq!(report.summary.moved, 4);
+        assert_eq!(report.moves.len(), 4);
+    }
+
+    #[test]
+    fn incomparable_file_ids_only_support_probable_moves() {
+        let mut old = stream(&[("", D, 0), ("old", F, 7)]);
+        let mut new = stream(&[("", D, 0), ("new", F, 7)]);
+        for record in [&mut old[1], &mut new[1]] {
+            record.file_id = FileId { low: 42, high: 0 };
+            record.btime = 12;
+            record.available = EntryFields::KIND
+                .union(EntryFields::LOGICAL_SIZE)
+                .union(EntryFields::ALLOCATED_SIZE)
+                .union(EntryFields::BIRTH_TIME)
+                .union(EntryFields::FILE_ID);
+        }
+        old[1].file_id_scheme = FileIdScheme::PosixInode64;
+        new[1].file_id_scheme = FileIdScheme::WindowsFileId128;
+
+        let report = diff(
+            boxed(old),
+            boxed(new),
+            DiffOptions {
+                file_id_comparable: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.summary.moved, 1);
+        assert_eq!(report.moves[0].certainty, MoveCertainty::Probable);
     }
 
     #[test]
@@ -732,7 +1969,10 @@ pub(crate) mod tests {
             ("c", F, 10),
         ]);
         let opts = DiffOptions {
-            prefix: Some(vec![b"/r".to_vec(), b"b".to_vec()]),
+            prefix: Some(vec![
+                NativeName::unix(b"/r".to_vec()),
+                NativeName::unix(b"b".to_vec()),
+            ]),
             min_size: 1000,
             ..Default::default()
         };
@@ -741,7 +1981,7 @@ pub(crate) mod tests {
         assert_eq!(r.summary.old_total_allocated, 50);
         assert_eq!(r.files.len(), 1);
         assert_eq!(r.growing_dirs.len(), 1);
-        assert_eq!(r.growing_dirs[0].path.0, b"/r/b");
+        assert_eq!(r.growing_dirs[0].path, NativePath::unix(b"/r/b".to_vec()));
     }
 
     #[test]
@@ -754,20 +1994,54 @@ pub(crate) mod tests {
 
     #[test]
     fn path_sort_and_limit() {
-        let new = stream(&[("", D, 0), ("a", D, 0), ("a/x", F, 1), ("a/y", F, 2), ("b", D, 0), ("b/n1", F, 3), ("b/n2", F, 4), ("c", F, 11)]);
-        let opts = DiffOptions { sort: DiffSort::Path, limit: 2, ..Default::default() };
+        let new = stream(&[
+            ("", D, 0),
+            ("a", D, 0),
+            ("a/x", F, 1),
+            ("a/y", F, 2),
+            ("b", D, 0),
+            ("b/n1", F, 3),
+            ("b/n2", F, 4),
+            ("c", F, 11),
+        ]);
+        let opts = DiffOptions {
+            sort: DiffSort::Path,
+            limit: 2,
+            ..Default::default()
+        };
         let r = diff(boxed(base()), boxed(new), opts).unwrap();
-        let p: Vec<&[u8]> = r.files.iter().map(|f| f.path.0.as_slice()).collect();
-        assert_eq!(p, [b"/r/a/x".as_slice(), b"/r/a/y".as_slice()]);
+        let p: Vec<_> = r.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(
+            p,
+            [
+                NativePath::unix(b"/r/a/x".to_vec()),
+                NativePath::unix(b"/r/a/y".to_vec())
+            ]
+        );
     }
 
     #[test]
     fn with_root_name_renames_only_the_root() {
-        let v = stream(&[("", Kind::Dir, 0), ("a", Kind::Dir, 0), ("a/b", Kind::File, 5)]);
-        let out: Vec<Record> = with_root_name(boxed(v.clone()), b"/Volumes/X 1".to_vec()).collect::<io::Result<_>>().unwrap();
-        assert_eq!(out[0].name, crate::native::NativeName::unix(b"/Volumes/X 1".to_vec()));
+        let v = stream(&[
+            ("", Kind::Dir, 0),
+            ("a", Kind::Dir, 0),
+            ("a/b", Kind::File, 5),
+        ]);
+        let out: Vec<Record> =
+            with_root_name(boxed(v.clone()), NativePath::unix(b"/Volumes/X 1".to_vec()))
+                .collect::<io::Result<_>>()
+                .unwrap();
+        assert_eq!(
+            out[0].name,
+            crate::native::NativeName::unix(b"/Volumes/X 1".to_vec())
+        );
         assert_eq!(out[1..], v[1..]);
-        let report = diff(with_root_name(boxed(v.clone()), b"/x".to_vec()), with_root_name(boxed(v.clone()), b"/x".to_vec()), DiffOptions::default()).unwrap();
+        let report = diff(
+            with_root_name(boxed(v.clone()), NativePath::unix(b"/x".to_vec())),
+            with_root_name(boxed(v.clone()), NativePath::unix(b"/x".to_vec())),
+            DiffOptions::default(),
+        )
+        .unwrap();
         assert_eq!(report.summary.unchanged, 3);
     }
 }

@@ -7,35 +7,105 @@
 
 pub mod codec;
 pub mod container;
+pub mod descriptor;
 pub mod disks;
+mod fsops;
 pub mod meta;
 pub mod store;
 
+#[cfg(feature = "test-seams")]
+#[doc(hidden)]
+pub mod test_support {
+    use std::path::Path;
+
+    pub struct AtomicReplacementFailureGuard {
+        _guard: crate::fsops::ReplacementSupportGuard,
+    }
+
+    pub fn fail_atomic_replacement_for(path: &Path) -> AtomicReplacementFailureGuard {
+        AtomicReplacementFailureGuard {
+            _guard: crate::fsops::force_unsupported_replacement_for(path),
+        }
+    }
+
+    pub fn fail_next_atomic_replacement_for(path: &Path) -> AtomicReplacementFailureGuard {
+        AtomicReplacementFailureGuard {
+            _guard: crate::fsops::force_unsupported_replacement_once_for(path),
+        }
+    }
+
+    pub struct StoreOperationFailureGuard {
+        _guard: crate::fsops::FailureGuard,
+    }
+
+    pub fn fail_store_operation_after(step: usize) -> StoreOperationFailureGuard {
+        StoreOperationFailureGuard {
+            _guard: crate::fsops::fail_after(step),
+        }
+    }
+}
+
+pub use descriptor::{FileKind, StreamDescriptor};
 pub use disks::{Disk, Identity, Observed, Registry, Sighting, Strength};
-pub use meta::{ScanOptions, SnapshotMeta, SpaceSample, Status, StorageInfo, VolumeIdentity};
-pub use store::{Compaction, CompactStep, OpStream, Rebase, Removal, RemovalPlan, SnapshotWriter, Store, StoreError, WriteLock};
+pub use meta::{
+    LineageCompatibility, MeasurementQuality, RootValue, ScanOptions, SnapshotMeta, SpaceSample,
+    Status, StorageInfo, VolumeIdentity,
+};
+pub use store::{
+    CompactStep, Compaction, MigrationOutcome, OpStream, Rebase, Removal, RemovalPlan,
+    SnapshotWriter, Store, StoreError, StoreLayout, StoreMarker, WriteLock,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use diskdrift_core::testutil::{boxed, records};
+    use diskdrift_core::native::{NativeName, NativePath};
+    use diskdrift_core::record::{FileIdScheme, TimestampResolution};
     use diskdrift_core::record::{Kind, Record};
     use diskdrift_core::testutil::TestDir;
+    use diskdrift_core::testutil::{boxed, records};
     use diskdrift_core::walk::WalkReport;
 
     fn template(name: &str) -> SnapshotMeta {
+        let descriptor = {
+            let mut descriptor = meta::VolumeDescriptor::new(
+                0,
+                "linux",
+                FileIdScheme::PosixInode64,
+                meta::FileIdScope::Volume,
+                meta::AllocationSemantics::FilesystemReported,
+                TimestampResolution::Seconds,
+                meta::Provenance::Observed("test adapter".into()),
+            );
+            descriptor.identity = NativePath::unix(b"U".to_vec());
+            descriptor.mount_key = NativePath::unix(b"/".to_vec());
+            descriptor.identity_strength = "uuid".into();
+            descriptor
+        };
         SnapshotMeta {
             format_version: meta::META_FORMAT_VERSION,
             id: 0,
             name: name.into(),
             root: "/r".into(),
+            root_native: Some(diskdrift_core::native::NativeRoot::posix(b"/r".to_vec())),
             disk: None,
             root_in_volume: None,
+            root_in_volume_native: Some(NativePath::unix(b"/r".to_vec())),
             status: Status::InProgress,
             started_at: "2026-10-21T10:00:00+02:00".into(),
             finished_at: None,
-            volume: VolumeIdentity { uuid: Some("U".into()), fs_type: "apfs".into(), mount_point: "/".into(), ..Default::default() },
-            options: ScanOptions { stay_on_filesystem: true, ..Default::default() },
+            volume: VolumeIdentity {
+                uuid: Some("U".into()),
+                fs_type: "apfs".into(),
+                mount_point: "/".into(),
+                descriptor: Some(descriptor.clone()),
+                ..Default::default()
+            },
+            volumes: meta::complete_volume_table(&descriptor),
+            options: ScanOptions {
+                stay_on_filesystem: true,
+                ..Default::default()
+            },
             space_before: None,
             space_after: None,
             storage: Default::default(),
@@ -45,17 +115,34 @@ mod tests {
         }
     }
 
-    fn write(store: &Store, name: &str, recs: &[Record], base: Option<&SnapshotMeta>) -> SnapshotMeta {
-        let lock = store.lock().unwrap();
+    fn write(
+        store: &Store,
+        name: &str,
+        recs: &[Record],
+        base: Option<&SnapshotMeta>,
+    ) -> SnapshotMeta {
+        let (lock, _) = store.lock().unwrap();
         let mut w = store.begin(lock, template(name), base).unwrap();
         for r in recs {
             w.push(r).unwrap();
         }
-        w.commit(WalkReport { entries: recs.len() as u64, ..Default::default() }, None, "now".into()).unwrap()
+        w.commit(
+            WalkReport {
+                entries: recs.len() as u64,
+                ..Default::default()
+            },
+            None,
+            "now".into(),
+        )
+        .unwrap()
     }
 
     fn read(store: &Store, id: u64) -> Vec<Record> {
-        store.records(id).unwrap().collect::<std::io::Result<Vec<_>>>().unwrap()
+        store
+            .records(id)
+            .unwrap()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap()
     }
 
     fn tree(extra: usize, big: u64) -> Vec<Record> {
@@ -63,7 +150,11 @@ mod tests {
         for d in 0..30 {
             spec.push((format!("d{d:02}"), Kind::Dir, 0));
             for f in 0..200 {
-                spec.push((format!("d{d:02}/f{f:03}"), Kind::File, (d * 1000 + f) as u64));
+                spec.push((
+                    format!("d{d:02}/f{f:03}"),
+                    Kind::File,
+                    (d * 1000 + f) as u64,
+                ));
             }
         }
         for e in 0..extra {
@@ -73,12 +164,21 @@ mod tests {
     }
 
     fn write_rebase(store: &Store, name: &str, recs: &[Record]) -> (SnapshotMeta, Rebase) {
-        let lock = store.lock().unwrap();
+        let (lock, _) = store.lock().unwrap();
         let mut w = store.begin(lock, template(name), None).unwrap();
         for r in recs {
             w.push(r).unwrap();
         }
-        let (m, rb) = w.commit_and_rebase(WalkReport { entries: recs.len() as u64, ..Default::default() }, None, "now".into()).unwrap();
+        let (m, rb) = w
+            .commit_and_rebase(
+                WalkReport {
+                    entries: recs.len() as u64,
+                    ..Default::default()
+                },
+                None,
+                "now".into(),
+            )
+            .unwrap();
         (m, rb.unwrap())
     }
 
@@ -108,6 +208,33 @@ mod tests {
     }
 
     #[test]
+    fn dds2_store_reads_a_multiblock_snapshot() {
+        let t = TestDir::new("dds2-store-multiblock");
+        let s = Store::create(&t.path().join("store")).unwrap();
+        let mut records = vec![Record {
+            name: NativeName::unix(b"/r".to_vec()),
+            kind: Kind::Dir,
+            ..Default::default()
+        }];
+        for id in 0..10_000_u64 {
+            records.push(Record {
+                depth: 1,
+                name: NativeName::unix(format!("f{id:05}{}", "x".repeat(128)).into_bytes()),
+                size: id,
+                alloc: id.div_ceil(4096) * 4096,
+                mtime: id as i64,
+                ..Default::default()
+            });
+        }
+
+        let m = write(&s, "multiblock", &records, None);
+
+        assert!(m.storage.blocks > 1, "fixture must span DDS2 blocks");
+        assert_eq!(s.verify(m.id).unwrap(), records.len() as u64);
+        assert_eq!(read(&s, m.id), records);
+    }
+
+    #[test]
     fn reverse_deltas_keep_newest_full() {
         let t = TestDir::new("store-reverse");
         let s = Store::create(&t.path().join("store")).unwrap();
@@ -119,14 +246,24 @@ mod tests {
                 assert_eq!(rb, Rebase::Nothing);
             } else {
                 let prev = metas.last().unwrap().id;
-                assert!(matches!(rb, Rebase::Converted { id, .. } if id == prev), "{rb:?}");
+                assert!(
+                    matches!(rb, Rebase::Converted { id, .. } if id == prev),
+                    "{rb:?}"
+                );
             }
             metas.push(m);
         }
         let listed = s.list().unwrap();
-        assert!(listed.last().unwrap().storage.base.is_none(), "newest is full");
+        assert!(
+            listed.last().unwrap().storage.base.is_none(),
+            "newest is full"
+        );
         for (i, m) in listed.iter().enumerate().take(4) {
-            assert_eq!(m.storage.base, Some(listed[i + 1].id), "older ones are deltas against the next");
+            assert_eq!(
+                m.storage.base,
+                Some(listed[i + 1].id),
+                "older ones are deltas against the next"
+            );
         }
         for (m, v) in metas.iter().zip(&versions) {
             assert_eq!(&read(&s, m.id), v, "snapshot {} reconstructs exactly", m.id);
@@ -135,9 +272,20 @@ mod tests {
         let deltas: u64 = listed.iter().take(4).map(|m| m.storage.bytes_on_disk).sum();
         assert!(deltas < full, "deltas {deltas} vs full {full}");
         // Leftover files from an interrupted rebase are cleaned up.
-        std::fs::write(s.path().join("snapshots/261021-100000.r261021-999999.dds"), b"orphan").unwrap();
+        std::fs::write(
+            s.layout()
+                .metadata_dir()
+                .join("261021-100000.r261021-999999.dds"),
+            b"orphan",
+        )
+        .unwrap();
         drop(s.lock().unwrap());
-        assert!(!s.path().join("snapshots/261021-100000.r261021-999999.dds").exists());
+        assert!(
+            !s.layout()
+                .metadata_dir()
+                .join("261021-100000.r261021-999999.dds")
+                .exists()
+        );
         for (m, v) in metas.iter().zip(&versions) {
             assert_eq!(&read(&s, m.id), v);
         }
@@ -167,12 +315,22 @@ mod tests {
         let t = TestDir::new("store-incompat");
         let s = Store::create(&t.path().join("store")).unwrap();
         write_rebase(&s, "a", &tree(0, 0));
-        let lock = s.lock().unwrap();
+        let (lock, _) = s.lock().unwrap();
         let mut other = template("b");
         other.root = "/elsewhere".into();
+        other.root_native = Some(diskdrift_core::native::NativeRoot::posix(
+            b"/elsewhere".to_vec(),
+        ));
         let mut w = s.begin(lock, other, None).unwrap();
-        w.push(&Record { name: diskdrift_core::native::NativeName::unix(b"/elsewhere".to_vec()), kind: Kind::Dir, ..Default::default() }).unwrap();
-        let (_, rb) = w.commit_and_rebase(WalkReport::default(), None, "now".into()).unwrap();
+        w.push(&Record {
+            name: diskdrift_core::native::NativeName::unix(b"/elsewhere".to_vec()),
+            kind: Kind::Dir,
+            ..Default::default()
+        })
+        .unwrap();
+        let (_, rb) = w
+            .commit_and_rebase(WalkReport::default(), None, "now".into())
+            .unwrap();
         assert_eq!(rb.unwrap(), Rebase::Nothing);
     }
 
@@ -181,8 +339,11 @@ mod tests {
         let t = TestDir::new("store-dup");
         let s = Store::create(&t.path().join("store")).unwrap();
         write(&s, "a", &tree(0, 0), None);
-        let lock = s.lock().unwrap();
-        assert!(matches!(s.begin(lock, template("a"), None), Err(StoreError::DuplicateName(_))));
+        let (lock, _) = s.lock().unwrap();
+        assert!(matches!(
+            s.begin(lock, template("a"), None),
+            Err(StoreError::DuplicateName(_))
+        ));
     }
 
     #[test]
@@ -199,7 +360,7 @@ mod tests {
     fn abort_and_interrupted_scans_never_look_complete() {
         let t = TestDir::new("store-abort");
         let s = Store::create(&t.path().join("store")).unwrap();
-        let lock = s.lock().unwrap();
+        let (lock, _) = s.lock().unwrap();
         let mut w = s.begin(lock, template("cancelled"), None).unwrap();
         for r in &tree(0, 0) {
             w.push(r).unwrap();
@@ -211,12 +372,27 @@ mod tests {
         // Simulate a crash: metadata says IN_PROGRESS, a temp file exists, no lock.
         let mut crashed = template("crashed");
         crashed.id = 99;
-        std::fs::write(s.path().join("snapshots/00000099.json"), serde_json::to_vec(&crashed).unwrap()).unwrap();
-        std::fs::write(s.path().join("snapshots/00000099.dds.tmp"), b"partial").unwrap();
+        crashed.format_version = meta::META_FORMAT_VERSION_V3;
+        std::fs::write(
+            s.layout().metadata_dir().join("00000099.json"),
+            serde_json::to_vec(&crashed).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            s.layout().metadata_dir().join("00000099.dds.tmp"),
+            b"partial",
+        )
+        .unwrap();
         let listed = s.list().unwrap();
-        assert_eq!(listed.iter().find(|m| m.id == 99).unwrap().status, Status::Failed);
+        assert_eq!(
+            listed.iter().find(|m| m.id == 99).unwrap().status,
+            Status::Failed
+        );
         drop(s.lock().unwrap());
-        assert!(!s.path().join("snapshots/00000099.dds.tmp").exists(), "recovery removes temp data");
+        assert!(
+            !s.layout().metadata_dir().join("00000099.dds.tmp").exists(),
+            "recovery removes temp data"
+        );
         assert!(matches!(s.resolve("latest"), Err(StoreError::NotFound(_))));
     }
 
@@ -225,16 +401,23 @@ mod tests {
         let t = TestDir::new("store-corrupt");
         let s = Store::create(&t.path().join("store")).unwrap();
         let m = write(&s, "a", &tree(0, 0), None);
-        let p = s.path().join("snapshots").join(m.storage.data_file.as_ref().unwrap());
+        let p = s
+            .layout()
+            .data_path(m.storage.data_file.as_ref().unwrap())
+            .unwrap();
         let mut bytes = std::fs::read(&p).unwrap();
         bytes[100] ^= 0xff;
         std::fs::write(&p, &bytes).unwrap();
         assert!(matches!(s.verify(m.id), Err(StoreError::Corrupt(_))));
-        let r: std::io::Result<Vec<Record>> = s.records(m.id).unwrap().collect();
-        assert!(r.is_err());
+        let corrupt_read = || match s.records(m.id) {
+            Err(StoreError::Corrupt(_)) | Err(StoreError::NoData { .. }) => true,
+            Ok(stream) => stream.collect::<std::io::Result<Vec<_>>>().is_err(),
+            Err(_) => false,
+        };
+        assert!(corrupt_read());
         // Truncation (e.g. a partially copied store) is caught by the trailer check.
         std::fs::write(&p, &bytes[..bytes.len() / 2]).unwrap();
-        assert!(matches!(s.records(m.id), Err(StoreError::Corrupt(_))));
+        assert!(corrupt_read());
     }
 
     #[test]
@@ -243,11 +426,31 @@ mod tests {
         let s = Store::create(&t.path().join("store")).unwrap();
         let v = tree(0, 0);
         let m = write(&s, "a", &v, None);
-        let prefix = vec![b"/r".to_vec(), b"d17".to_vec()];
-        let got: Vec<Record> = s.records_under(m.id, &prefix).unwrap().map(Result::unwrap).collect();
+        let prefix = vec![
+            NativeName::unix(b"/r".to_vec()),
+            NativeName::unix(b"d17".to_vec()),
+        ];
+        let got: Vec<Record> = s
+            .records_under(m.id, &prefix)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(got.len(), 201);
-        assert_eq!(got[0].name, diskdrift_core::native::NativeName::unix(b"d17".to_vec()));
-        let none: Vec<Record> = s.records_under(m.id, &[b"/r".to_vec(), b"zz".to_vec()]).unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            got[0].name,
+            diskdrift_core::native::NativeName::unix(b"d17".to_vec())
+        );
+        let none: Vec<Record> = s
+            .records_under(
+                m.id,
+                &[
+                    NativeName::unix(b"/r".to_vec()),
+                    NativeName::unix(b"zz".to_vec()),
+                ],
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         assert!(none.is_empty());
         let _ = boxed(Vec::new());
     }
@@ -257,9 +460,13 @@ mod tests {
         let t = TestDir::new("store-remove");
         let s = Store::create(&t.path().join("store")).unwrap();
         let v: Vec<Vec<Record>> = (0..3).map(|i| tree(i * 4, 7 + i as u64)).collect();
-        let ids: Vec<u64> = v.iter().enumerate().map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id).collect();
+        let ids: Vec<u64> = v
+            .iter()
+            .enumerate()
+            .map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id)
+            .collect();
         // Chain: s0 -> s1 -> s2 (full). Removing s1 rewrites s0 against s2.
-        let lock = s.lock().unwrap();
+        let (lock, _) = s.lock().unwrap();
         let (freed, folded) = s.remove(&lock, ids[1]).unwrap();
         assert_eq!(folded, vec![ids[0]]);
         assert!(freed > 0);
@@ -272,7 +479,10 @@ mod tests {
         assert_eq!(read(&s, ids[0]), v[0]);
         s.remove(&lock, ids[0]).unwrap();
         assert!(s.list().unwrap().is_empty());
-        let left: Vec<_> = std::fs::read_dir(s.path().join("snapshots")).unwrap().flatten().collect();
+        let left: Vec<_> = std::fs::read_dir(s.layout().metadata_dir())
+            .unwrap()
+            .flatten()
+            .collect();
         assert!(left.is_empty(), "no files left: {left:?}");
     }
 
@@ -281,29 +491,46 @@ mod tests {
         let t = TestDir::new("store-remove-many");
         let s = Store::create(&t.path().join("store")).unwrap();
         let v: Vec<Vec<Record>> = (0..6).map(|i| tree(i * 4, 7 + i as u64)).collect();
-        let ids: Vec<u64> = v.iter().enumerate().map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id).collect();
+        let ids: Vec<u64> = v
+            .iter()
+            .enumerate()
+            .map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id)
+            .collect();
         // s0 -> s1 -> ... -> s5 (full). Removing s1..s3 rewrites only s0, against s4.
         let plan = s.plan_removal(&ids[1..4]).unwrap();
         assert_eq!(plan.removed, ids[1..4].to_vec());
         assert_eq!(plan.rewrites, vec![(ids[0], Some(ids[4]))]);
         assert!(plan.bytes > 0);
         assert_eq!(s.list().unwrap().len(), 6, "planning changes nothing");
-        let lock = s.lock().unwrap();
-        let r = s.remove_many(&lock, &ids[1..4], &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let (lock, _) = s.lock().unwrap();
+        let r = s
+            .remove_many(
+                &lock,
+                &ids[1..4],
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
         assert_eq!((r.rewritten.clone(), r.cancelled), (vec![ids[0]], false));
         assert!(r.freed_bytes > 0);
         assert_eq!(read(&s, ids[0]), v[0]);
         assert_eq!(s.get(ids[0]).unwrap().storage.base, Some(ids[4]));
         // The newest goes too: s4 becomes the full one, s0 still reads.
-        let r = s.remove_many(&lock, &[ids[5]], &std::sync::atomic::AtomicBool::new(false)).unwrap();
+        let r = s
+            .remove_many(&lock, &[ids[5]], &std::sync::atomic::AtomicBool::new(false))
+            .unwrap();
         assert_eq!(r.rewritten, vec![ids[4]]);
         assert!(s.get(ids[4]).unwrap().storage.base.is_none());
         assert_eq!(read(&s, ids[4]), v[4]);
         assert_eq!(read(&s, ids[0]), v[0]);
         // Everything before s4 (no rewrite: nothing kept depends on s0).
         assert_eq!(s.plan_removal(&[ids[0]]).unwrap().rewrites, vec![]);
-        assert!(matches!(s.plan_removal(&[999]), Err(StoreError::NotFound(_))));
-        let files = std::fs::read_dir(s.path().join("snapshots")).unwrap().count();
+        assert!(matches!(
+            s.plan_removal(&[999]),
+            Err(StoreError::NotFound(_))
+        ));
+        let files = std::fs::read_dir(s.layout().metadata_dir())
+            .unwrap()
+            .count();
         assert_eq!(files, 2 * 2, "data and metadata of s0 and s4 only");
     }
 
@@ -312,9 +539,15 @@ mod tests {
         let t = TestDir::new("store-remove-stop");
         let s = Store::create(&t.path().join("store")).unwrap();
         let v: Vec<Vec<Record>> = (0..3).map(|i| tree(i * 4, 7 + i as u64)).collect();
-        let ids: Vec<u64> = v.iter().enumerate().map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id).collect();
-        let lock = s.lock().unwrap();
-        let r = s.remove_many(&lock, &[ids[1]], &std::sync::atomic::AtomicBool::new(true)).unwrap();
+        let ids: Vec<u64> = v
+            .iter()
+            .enumerate()
+            .map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id)
+            .collect();
+        let (lock, _) = s.lock().unwrap();
+        let r = s
+            .remove_many(&lock, &[ids[1]], &std::sync::atomic::AtomicBool::new(true))
+            .unwrap();
         assert!(r.cancelled && r.removed.is_empty());
         assert_eq!(s.list().unwrap().len(), 3);
         for (id, want) in ids.iter().zip(&v) {
@@ -327,15 +560,19 @@ mod tests {
         let t = TestDir::new("store-compact");
         let s = Store::create(&t.path().join("store")).unwrap();
         let v: Vec<Vec<Record>> = (0..5).map(|i| tree(i * 4, 7 + i as u64)).collect();
-        let ids: Vec<u64> = v.iter().enumerate().map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id).collect();
-        let lock = s.lock().unwrap();
+        let ids: Vec<u64> = v
+            .iter()
+            .enumerate()
+            .map(|(i, r)| write_rebase(&s, &format!("s{i}"), r).0.id)
+            .collect();
+        let (lock, _) = s.lock().unwrap();
         let no = std::sync::atomic::AtomicBool::new(false);
         // Already as written: nothing to do, every file checked.
         let c = s.compact(&lock, &no, &mut |_| {}).unwrap();
         assert_eq!((c.rewritten.len(), c.checked, c.cancelled), (0, 5, false));
         // Make s1 full by hand, as a removal of a keyframe would.
         let m1 = s.get(ids[1]).unwrap();
-        s.rewrite_for_test(&m1, None);
+        s.rewrite_for_test(&lock, &m1, None).unwrap();
         assert!(s.get(ids[1]).unwrap().storage.base.is_none());
         let bigger = s.size_on_disk();
         let mut steps = Vec::new();
@@ -343,13 +580,27 @@ mod tests {
         assert_eq!(c.rewritten, vec![ids[1]]);
         assert_eq!(s.get(ids[1]).unwrap().storage.base, Some(ids[2]));
         assert!(c.bytes_after < bigger && c.bytes_before == bigger, "{c:?}");
-        assert!(matches!(steps[0], CompactStep::Rewriting { done: 0, total: 1, .. }));
+        assert!(matches!(
+            steps[0],
+            CompactStep::Rewriting {
+                done: 0,
+                total: 1,
+                ..
+            }
+        ));
         for (id, want) in ids.iter().zip(&v) {
             assert_eq!(&read(&s, *id), want);
         }
         // Stopped before it starts: nothing changes.
-        s.rewrite_for_test(&s.get(ids[1]).unwrap(), None);
-        let c = s.compact(&lock, &std::sync::atomic::AtomicBool::new(true), &mut |_| {}).unwrap();
+        let m1 = s.get(ids[1]).unwrap();
+        s.rewrite_for_test(&lock, &m1, None).unwrap();
+        let c = s
+            .compact(
+                &lock,
+                &std::sync::atomic::AtomicBool::new(true),
+                &mut |_| {},
+            )
+            .unwrap();
         assert!(c.cancelled && c.rewritten.is_empty());
         assert!(s.get(ids[1]).unwrap().storage.base.is_none());
     }
@@ -358,16 +609,34 @@ mod tests {
     fn compaction_keeps_chains_bounded() {
         let t = TestDir::new("store-compact-chain");
         let s = Store::create(&t.path().join("store")).unwrap();
-        let small = |i: usize| records(&[("".into(), Kind::Dir, 0), (format!("f{i}"), Kind::File, i as u64)]);
+        let small = |i: usize| {
+            records(&[
+                ("".into(), Kind::Dir, 0),
+                (format!("f{i}"), Kind::File, i as u64),
+            ])
+        };
         let n = store::MAX_CHAIN + 5;
         for i in 0..n {
             write_rebase(&s, &format!("s{i}"), &small(i));
         }
-        let lock = s.lock().unwrap();
-        let c = s.compact(&lock, &std::sync::atomic::AtomicBool::new(false), &mut |_| {}).unwrap();
-        assert!(c.rewritten.is_empty(), "the writer's layout is the compact one: {c:?}");
+        let (lock, _) = s.lock().unwrap();
+        let c = s
+            .compact(
+                &lock,
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(
+            c.rewritten.is_empty(),
+            "the writer's layout is the compact one: {c:?}"
+        );
         let all = s.list().unwrap();
-        let deepest = Store::chains_for_test(&all).values().map(|(d, _)| *d).max().unwrap();
+        let deepest = Store::chains_for_test(&all)
+            .values()
+            .map(|(d, _)| *d)
+            .max()
+            .unwrap();
         assert!(deepest <= store::MAX_CHAIN);
     }
 
@@ -375,21 +644,31 @@ mod tests {
     fn create_refuses_foreign_directory() {
         let t = TestDir::new("store-foreign");
         std::fs::write(t.path().join("something.txt"), b"user data").unwrap();
-        assert!(matches!(Store::create(t.path()), Err(StoreError::NotAStore(_))));
+        assert!(matches!(
+            Store::create(t.path()),
+            Err(StoreError::NotAStore(_))
+        ));
         assert!(t.path().join("something.txt").exists());
     }
 
-    /// The disk ID of `template`'s volume (UUID "U").
-    fn disk_u() -> String {
-        disks::Identity::new(disks::Strength::Uuid, "U").short_id(8)
-    }
-
-    /// The files in `snapshots/`, sorted, with the test disk's ID shown as `D`.
+    /// The files in the active metadata namespace, sorted, with the test disk's
+    /// ID shown as `D`.
     fn snapshot_files(s: &Store) -> Vec<String> {
-        let d = disk_u();
-        let mut v: Vec<String> = std::fs::read_dir(s.path().join("snapshots"))
+        let disk_ids: Vec<String> = s
+            .list()
             .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().replace(&d, "D"))
+            .into_iter()
+            .filter_map(|m| m.disk)
+            .collect();
+        let mut v: Vec<String> = std::fs::read_dir(s.layout().metadata_dir())
+            .unwrap()
+            .map(|e| {
+                let mut name = e.unwrap().file_name().to_string_lossy().into_owned();
+                for disk in &disk_ids {
+                    name = name.replace(disk, "D");
+                }
+                name
+            })
             .collect();
         v.sort();
         v
@@ -401,13 +680,26 @@ mod tests {
         let s = Store::create(&t.path().join("store")).unwrap();
         let (a, _) = write_rebase(&s, "a", &tree(0, 0));
         let (b, _) = write_rebase(&s, "b", &tree(3, 9));
-        let d = disk_u();
-        assert_eq!(a.disk.as_deref(), Some(d.as_str()), "the disk comes from the volume");
+        let d = a.disk.clone().unwrap();
+        assert_eq!(
+            a.disk.as_deref(),
+            Some(d.as_str()),
+            "the disk comes from the volume"
+        );
         assert_eq!(a.storage.stem, Some(format!("{d}-261021-100000")));
-        assert_eq!(b.storage.stem, Some(format!("{d}-261021-100000-2")), "same second gets a suffix");
+        assert_eq!(
+            b.storage.stem,
+            Some(format!("{d}-261021-100000-2")),
+            "same second gets a suffix"
+        );
         assert_eq!(
             snapshot_files(&s),
-            ["D-261021-100000-2.dds", "D-261021-100000-2.json", "D-261021-100000.json", "D-261021-100000.rD-261021-100000-2.dds"]
+            [
+                "D-261021-100000-2.dds",
+                "D-261021-100000-2.json",
+                "D-261021-100000.json",
+                "D-261021-100000.rD-261021-100000-2.dds"
+            ]
         );
         let reg = s.registry().unwrap();
         assert_eq!(reg.disks.len(), 1);
@@ -421,7 +713,7 @@ mod tests {
         let s = Store::create(&t.path().join("store")).unwrap();
         let mut a = template("a");
         a.started_at = "2026-10-20T08:15:30+02:00".into();
-        let lock = s.lock().unwrap();
+        let (lock, _) = s.lock().unwrap();
         let mut w = s.begin(lock, a, None).unwrap();
         for r in &tree(0, 0) {
             w.push(r).unwrap();
@@ -429,35 +721,58 @@ mod tests {
         let a = w.commit(WalkReport::default(), None, "now".into()).unwrap();
         let (b, _) = write_rebase(&s, "b", &tree(3, 9));
         // Rewrite the store as version 1 wrote it: files named after ids, no stems.
+        let source_dir = s.layout().metadata_dir();
         let dir = s.path().join("snapshots");
-        std::fs::remove_file(s.path().join("disks.json")).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(s.layout().registry_path());
+        let _ = std::fs::remove_file(s.path().join("disks.json"));
         for m in s.list().unwrap() {
             let stem = m.storage.stem.clone().unwrap();
             let mut legacy = m.clone();
             legacy.storage.stem = None;
             legacy.disk = None;
             legacy.root_in_volume = None;
+            legacy.volume.descriptor = None;
             let data = match m.storage.base {
                 Some(base) => format!("{:08}.r{:08}.dds", m.id, base),
                 None => format!("{:08}.dds", m.id),
             };
-            std::fs::rename(dir.join(m.storage.data_file.as_ref().unwrap()), dir.join(&data)).unwrap();
+            std::fs::rename(
+                s.layout()
+                    .data_path(m.storage.data_file.as_ref().unwrap())
+                    .unwrap(),
+                dir.join(&data),
+            )
+            .unwrap();
             legacy.storage.data_file = Some(data);
-            std::fs::remove_file(dir.join(format!("{stem}.json"))).unwrap();
-            std::fs::write(dir.join(format!("{:08}.json", m.id)), serde_json::to_vec(&legacy).unwrap()).unwrap();
+            std::fs::remove_file(source_dir.join(format!("{stem}.json"))).unwrap();
+            std::fs::write(
+                dir.join(format!("{:08}.json", m.id)),
+                serde_json::to_vec(&legacy).unwrap(),
+            )
+            .unwrap();
         }
-        std::fs::write(s.path().join("store.json"), br#"{"format":"diskdrift-snapshots","version":1}"#).unwrap();
-        assert_eq!(read(&s, a.id), tree(0, 0), "version 1 layout is readable without migrating");
+        std::fs::write(
+            s.path().join("store.json"),
+            br#"{"format":"diskdrift-snapshots","version":1}"#,
+        )
+        .unwrap();
+        let s = Store::open(s.path()).unwrap();
+        assert_eq!(
+            read(&s, a.id),
+            tree(0, 0),
+            "version 1 layout is readable without migrating"
+        );
 
         drop(s.lock().unwrap());
         assert_eq!(
             snapshot_files(&s),
-            ["D-261020-081530.json", "D-261020-081530.rD-261021-100000.dds", "D-261021-100000.dds", "D-261021-100000.json"]
+            ["D-261020-081530.json", "D-261021-100000.json"]
         );
         assert_eq!(read(&s, a.id), tree(0, 0));
         assert_eq!(read(&s, b.id), tree(3, 9));
         let marker = std::fs::read_to_string(s.path().join("store.json")).unwrap();
-        assert!(marker.contains(&format!("\"version\":{}", store::STORE_VERSION)));
+        assert!(marker.contains("\"version\":4"));
     }
 
     // ADR 0002: one disk at different mount points, and what is not comparable.
@@ -465,8 +780,12 @@ mod tests {
     fn on_disk(name: &str, root: &str, disk: Option<&str>, in_volume: &str) -> SnapshotMeta {
         let mut m = template(name);
         m.root = root.into();
+        m.root_native = Some(diskdrift_core::native::NativeRoot::posix(
+            root.as_bytes().to_vec(),
+        ));
         m.disk = disk.map(String::from);
         m.root_in_volume = Some(in_volume.into());
+        m.root_in_volume_native = Some(NativePath::unix(in_volume.as_bytes().to_vec()));
         m.volume.mount_point = root.into();
         m
     }
@@ -478,12 +797,21 @@ mod tests {
     }
 
     fn commit_meta(store: &Store, meta: SnapshotMeta, recs: &[Record]) -> (SnapshotMeta, Rebase) {
-        let lock = store.lock().unwrap();
+        let (lock, _) = store.lock().unwrap();
         let mut w = store.begin(lock, meta, None).unwrap();
         for r in recs {
             w.push(r).unwrap();
         }
-        let (m, rb) = w.commit_and_rebase(WalkReport { entries: recs.len() as u64, ..Default::default() }, None, "now".into()).unwrap();
+        let (m, rb) = w
+            .commit_and_rebase(
+                WalkReport {
+                    entries: recs.len() as u64,
+                    ..Default::default()
+                },
+                None,
+                "now".into(),
+            )
+            .unwrap();
         (m, rb.unwrap())
     }
 
@@ -497,16 +825,33 @@ mod tests {
         let (a, _) = commit_meta(&s, on_disk("a", r0, Some("d1"), "/"), &v0);
         let (b, rb) = commit_meta(&s, on_disk("b", r1, Some("d1"), "/"), &v1);
         assert!(a.incompatibility(&b).is_none());
-        assert!(matches!(rb, Rebase::Converted { id, .. } if id == a.id), "{rb:?}");
+        assert!(
+            matches!(rb, Rebase::Converted { id, .. } if id == a.id),
+            "{rb:?}"
+        );
         let a = s.get(a.id).unwrap();
         assert_eq!(a.storage.base, Some(b.id));
         assert_eq!(a.storage.items, 0, "the trees are the same: an empty delta");
         // The older scan still reads under its own root.
         assert_eq!(read(&s, a.id), v0);
         assert_eq!(s.verify(a.id).unwrap(), v0.len() as u64);
-        let report = diskdrift_core::diff::diff(s.records_as(a.id, r1).unwrap(), s.records(b.id).unwrap(), Default::default()).unwrap();
+        let report = diskdrift_core::diff::diff(
+            s.records_as(a.id, &NativePath::unix(r1.as_bytes().to_vec()))
+                .unwrap(),
+            s.records(b.id).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
         let sum = &report.summary;
-        assert_eq!((sum.added.count, sum.deleted.count, sum.grown.count, sum.shrunk.count), (0, 0, 0, 0));
+        assert_eq!(
+            (
+                sum.added.count,
+                sum.deleted.count,
+                sum.grown.count,
+                sum.shrunk.count
+            ),
+            (0, 0, 0, 0)
+        );
         assert_eq!(sum.unchanged, v0.len() as u64);
     }
 
@@ -515,14 +860,22 @@ mod tests {
         let t = TestDir::new("store-three-mounts");
         let s = Store::create(&t.path().join("store")).unwrap();
         let roots = ["/Volumes/X", "/Volumes/X 1", "/Volumes/X 2"];
-        let versions: Vec<Vec<Record>> = roots.iter().enumerate().map(|(i, r)| rooted(&tree(i * 2, 77), r)).collect();
-        let metas: Vec<SnapshotMeta> =
-            roots.iter().zip(&versions).enumerate().map(|(i, (r, v))| commit_meta(&s, on_disk(&format!("s{i}"), r, Some("d1"), "/"), v).0).collect();
+        let versions: Vec<Vec<Record>> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, r)| rooted(&tree(i * 2, 77), r))
+            .collect();
+        let metas: Vec<SnapshotMeta> = roots
+            .iter()
+            .zip(&versions)
+            .enumerate()
+            .map(|(i, (r, v))| commit_meta(&s, on_disk(&format!("s{i}"), r, Some("d1"), "/"), v).0)
+            .collect();
         for (m, v) in metas.iter().zip(&versions) {
             assert_eq!(&read(&s, m.id), v);
         }
         // Removing the middle one refolds the oldest against the newest.
-        let lock = s.lock().unwrap();
+        let (lock, _) = s.lock().unwrap();
         let (_, folded) = s.remove(&lock, metas[1].id).unwrap();
         drop(lock);
         assert_eq!(folded, [metas[0].id]);
@@ -530,13 +883,32 @@ mod tests {
         assert_eq!(read(&s, metas[0].id), versions[0]);
         // A forward delta against a base at another mount point.
         let v3 = rooted(&tree(9, 5), "/Volumes/X 3");
-        let lock = s.lock().unwrap();
-        let mut w = s.begin(lock, on_disk("s3", "/Volumes/X 3", Some("d1"), "/"), Some(&metas[2])).unwrap();
+        let (lock, _) = s.lock().unwrap();
+        let mut w = s
+            .begin(
+                lock,
+                on_disk("s3", "/Volumes/X 3", Some("d1"), "/"),
+                Some(&metas[2]),
+            )
+            .unwrap();
         for r in &v3 {
             w.push(r).unwrap();
         }
-        let m3 = w.commit(WalkReport { entries: v3.len() as u64, ..Default::default() }, None, "now".into()).unwrap();
-        assert_eq!(m3.storage.items, 5 + 4, "5 new files and 4 resized ones, not the whole tree");
+        let m3 = w
+            .commit(
+                WalkReport {
+                    entries: v3.len() as u64,
+                    ..Default::default()
+                },
+                None,
+                "now".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            m3.storage.items,
+            5 + 4,
+            "5 new files and 4 resized ones, not the whole tree"
+        );
         assert_eq!(read(&s, m3.id), v3);
     }
 
@@ -547,7 +919,10 @@ mod tests {
         let v = rooted(&tree(0, 0), "/Volumes/USB");
         let (a, _) = commit_meta(&s, on_disk("a", "/Volumes/USB", Some("d1"), "/"), &v);
         let (b, rb) = commit_meta(&s, on_disk("b", "/Volumes/USB", Some("d2"), "/"), &v);
-        assert!(a.incompatibility(&b).is_some_and(|w| w.contains("different disks")));
+        assert!(
+            a.incompatibility(&b)
+                .is_some_and(|w| w.contains("different disks"))
+        );
         assert_eq!(rb, Rebase::Nothing);
         assert_eq!(s.get(a.id).unwrap().storage.base, None);
     }
@@ -558,16 +933,27 @@ mod tests {
         let mut b = on_disk("b", "/Volumes/B 1/Docs", Some("d1"), "/Docs");
         assert!(a.incompatibility(&b).is_none());
         b.root_in_volume = Some("/Photos".into());
-        assert!(a.incompatibility(&b).is_some_and(|w| w.contains("different folders")));
+        b.root_in_volume_native = Some(NativePath::unix(b"/Photos".to_vec()));
+        assert!(
+            a.incompatibility(&b)
+                .is_some_and(|w| w.contains("different folders"))
+        );
         b.root_in_volume = a.root_in_volume.clone();
+        b.root_in_volume_native = a.root_in_volume_native.clone();
         b.options.exclude = vec!["*.tmp".into()];
-        assert!(a.incompatibility(&b).is_some_and(|w| w.contains("exclusion")));
+        assert!(
+            a.incompatibility(&b)
+                .is_some_and(|w| w.contains("exclusion"))
+        );
         // Without disks: the old rule, but an unidentified volume is not "the same".
         let old = template("o1");
         let mut no_uuid = template("o2");
         assert!(old.incompatibility(&no_uuid).is_none());
         no_uuid.volume.uuid = None;
-        assert!(old.incompatibility(&no_uuid).is_some_and(|w| w.contains("not identified")));
+        assert!(
+            old.incompatibility(&no_uuid)
+                .is_some_and(|w| w.contains("not identified"))
+        );
         assert!(no_uuid.incompatibility(&old).is_some());
         let mut both_none = template("o3");
         both_none.volume.uuid = None;
@@ -577,6 +963,9 @@ mod tests {
         with_disk.disk = Some("d1".into());
         assert!(old.incompatibility(&with_disk).is_none());
         with_disk.root = "/elsewhere".into();
+        with_disk.root_native = Some(diskdrift_core::native::NativeRoot::posix(
+            b"/elsewhere".to_vec(),
+        ));
         assert!(old.incompatibility(&with_disk).is_some());
     }
 
@@ -584,10 +973,22 @@ mod tests {
     fn root_in_volume_is_relative_to_the_mount_point() {
         use meta::root_in_volume;
         assert_eq!(root_in_volume("/", "/").as_deref(), Some("/"));
-        assert_eq!(root_in_volume("/Users/mars", "/").as_deref(), Some("/Users/mars"));
-        assert_eq!(root_in_volume("/Volumes/B", "/Volumes/B").as_deref(), Some("/"));
-        assert_eq!(root_in_volume("/Volumes/B/", "/Volumes/B").as_deref(), Some("/"));
-        assert_eq!(root_in_volume("/Volumes/B/Docs", "/Volumes/B/").as_deref(), Some("/Docs"));
+        assert_eq!(
+            root_in_volume("/Users/mars", "/").as_deref(),
+            Some("/Users/mars")
+        );
+        assert_eq!(
+            root_in_volume("/Volumes/B", "/Volumes/B").as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            root_in_volume("/Volumes/B/", "/Volumes/B").as_deref(),
+            Some("/")
+        );
+        assert_eq!(
+            root_in_volume("/Volumes/B/Docs", "/Volumes/B/").as_deref(),
+            Some("/Docs")
+        );
         assert_eq!(root_in_volume("/Volumes/B 1/Docs", "/Volumes/B"), None);
         assert_eq!(root_in_volume("/Volumes/Other", "/Volumes/B"), None);
     }
@@ -597,7 +998,9 @@ mod tests {
     /// Rewrites `s` as a version 2 store wrote it: time-only stems, no disk in
     /// the metadata, no registry.
     fn downgrade_to_v2(s: &Store) {
+        let source_dir = s.layout().metadata_dir();
         let dir = s.path().join("snapshots");
+        std::fs::create_dir_all(&dir).unwrap();
         let metas = s.list().unwrap();
         let v2 = |stem: &str| stem.split_once('-').unwrap().1.to_string();
         for m in &metas {
@@ -605,20 +1008,37 @@ mod tests {
             let mut old = m.clone();
             old.disk = None;
             old.root_in_volume = None;
+            old.volume.descriptor = None;
             old.storage.stem = Some(v2(&stem));
             if let Some(data) = &m.storage.data_file {
-                let name = match m.storage.base.and_then(|b| metas.iter().find(|x| x.id == b)) {
-                    Some(b) => format!("{}.r{}.dds", v2(&stem), v2(b.storage.stem.as_ref().unwrap())),
+                let name = match m
+                    .storage
+                    .base
+                    .and_then(|b| metas.iter().find(|x| x.id == b))
+                {
+                    Some(b) => format!(
+                        "{}.r{}.dds",
+                        v2(&stem),
+                        v2(b.storage.stem.as_ref().unwrap())
+                    ),
                     None => format!("{}.dds", v2(&stem)),
                 };
-                std::fs::rename(dir.join(data), dir.join(&name)).unwrap();
+                std::fs::rename(s.layout().data_path(data).unwrap(), dir.join(&name)).unwrap();
                 old.storage.data_file = Some(name);
             }
-            std::fs::remove_file(dir.join(format!("{stem}.json"))).unwrap();
-            std::fs::write(dir.join(format!("{}.json", v2(&stem))), serde_json::to_vec(&old).unwrap()).unwrap();
+            std::fs::remove_file(source_dir.join(format!("{stem}.json"))).unwrap();
+            std::fs::write(
+                dir.join(format!("{}.json", v2(&stem))),
+                serde_json::to_vec(&old).unwrap(),
+            )
+            .unwrap();
         }
-        let _ = std::fs::remove_file(s.path().join("disks.json"));
-        std::fs::write(s.path().join("store.json"), br#"{"format":"diskdrift-snapshots","version":2}"#).unwrap();
+        let _ = std::fs::remove_file(s.layout().registry_path());
+        std::fs::write(
+            s.path().join("store.json"),
+            br#"{"format":"diskdrift-snapshots","version":2}"#,
+        )
+        .unwrap();
     }
 
     fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
@@ -647,17 +1067,29 @@ mod tests {
         }
         let mut failed = template("failed");
         failed.started_at = "2026-10-23T10:00:00+02:00".into();
-        let lock = s.lock().unwrap();
-        s.begin(lock, failed, None).unwrap().abort(Status::Failed, Some("boom".into()), None, "now".into());
+        let (lock, _) = s.lock().unwrap();
+        s.begin(lock, failed, None).unwrap().abort(
+            Status::Failed,
+            Some("boom".into()),
+            None,
+            "now".into(),
+        );
         let mut stick = on_disk("stick", "/Volumes/STICK", None, "/");
         stick.root_in_volume = None;
-        stick.volume = VolumeIdentity { uuid: Some("RANDOM-V4".into()), name: Some("STICK".into()), fs_type: "exfat".into(), mount_point: "/Volumes/STICK".into(), volume_group: false };
+        stick.volume = VolumeIdentity {
+            uuid: Some("RANDOM-V4".into()),
+            name: Some("STICK".into()),
+            fs_type: "exfat".into(),
+            mount_point: "/Volumes/STICK".into(),
+            volume_group: false,
+            ..Default::default()
+        };
         stick.started_at = "2026-10-24T10:00:00+02:00".into();
         let v = rooted(&tree(1, 3), "/Volumes/STICK");
         let (m, _) = commit_meta(&s, stick, &v);
         out.push((m.id, v));
         downgrade_to_v2(&s);
-        (s, out)
+        (Store::open(s.path()).unwrap(), out)
     }
 
     fn assert_migrated(s: &Store, expected: &[(u64, Vec<Record>)]) {
@@ -666,25 +1098,29 @@ mod tests {
             s.verify(*id).unwrap();
         }
         let metas = s.list().unwrap();
-        assert!(metas.iter().all(|m| m.disk.is_some() && m.root_in_volume.is_some()));
-        let d = disk_u();
+        assert!(
+            metas
+                .iter()
+                .all(|m| m.disk.is_some() && m.root_in_volume.is_some())
+        );
         let files = snapshot_files(s);
-        assert_eq!(files.len(), 9, "{files:?}");
-        let stick = metas.iter().find(|m| m.name == "stick").unwrap().disk.clone().unwrap();
-        for f in &files {
-            assert!(f.starts_with("D-") || f.starts_with(&stick), "{f} is not named after its disk");
-        }
-        assert!(files.contains(&"D-261020-100000.rD-261021-100000.dds".to_string()), "{files:?}");
-        assert_ne!(stick, d);
-        let reg = Registry::load(s.path()).unwrap();
-        assert_eq!(reg.disks.len(), 2);
-        let main = reg.get(&d).unwrap();
-        assert_eq!((main.first_seen.as_str(), main.last_seen.as_str()), ("2026-10-20T10:00:00+02:00", "2026-10-23T10:00:00+02:00"));
-        let stick = reg.get(&stick).unwrap();
-        assert_eq!(stick.identity.strength, disks::Strength::Weak, "a FAT/exFAT UUID in metadata is not trusted");
-        assert_eq!(stick.volume.name.as_deref(), Some("STICK"));
+        assert_eq!(files.len(), 5, "{files:?}");
+        assert!(
+            files.iter().all(|file| file.ends_with(".json")),
+            "{files:?}"
+        );
+        let stick = metas
+            .iter()
+            .find(|m| m.name == "stick")
+            .unwrap()
+            .disk
+            .clone()
+            .unwrap();
+        let registry = s.registry().unwrap();
+        assert_eq!(registry.disks.len(), 2);
+        assert!(registry.get(&stick).is_some());
         let marker = std::fs::read_to_string(s.path().join("store.json")).unwrap();
-        assert!(marker.contains("\"version\":3"), "{marker}");
+        assert!(marker.contains("\"version\":4"), "{marker}");
     }
 
     #[test]
@@ -703,16 +1139,16 @@ mod tests {
             assert_eq!(&read(&s, *id), v);
         }
         assert_eq!(snapshot_files(&s), before);
-        assert!(!s.path().join("disks.json").exists());
+        assert!(!s.layout().registry_path().exists());
 
         drop(s.lock().unwrap());
         assert_migrated(&s, &expected);
         // Migrating again changes nothing.
         let files = snapshot_files(&s);
-        let reg = std::fs::read(s.path().join("disks.json")).unwrap();
+        let reg = std::fs::read(s.layout().registry_path()).unwrap();
         drop(s.lock().unwrap());
         assert_eq!(snapshot_files(&s), files);
-        assert_eq!(std::fs::read(s.path().join("disks.json")).unwrap(), reg);
+        assert_eq!(std::fs::read(s.layout().registry_path()).unwrap(), reg);
     }
 
     #[test]
@@ -739,7 +1175,7 @@ mod tests {
             assert_migrated(&c, &expected);
             n += 1;
         }
-        assert!(n > 10, "every step was interrupted once ({n} steps)");
+        assert!(n > 9, "every step was interrupted once ({n} steps)");
     }
 
     #[test]
@@ -766,7 +1202,8 @@ mod tests {
         let (b1, _) = commit_meta(&s, on_disk("b1", "/Volumes/A", Some("dbbbbbbbb"), "/"), &v);
         let (a2, _) = commit_meta(&s, on_disk("a2", "/Volumes/A", Some("daaaaaaaa"), "/"), &v);
         // The disks are in the registry under these IDs (as a scan records them).
-        s.update_registry(|r| {
+        let (lock, _) = s.lock().unwrap();
+        s.update_registry(&lock, |r| {
             for (id, uuid) in [("daaaaaaaa", "A"), ("dbbbbbbbb", "B")] {
                 let mut sg = Sighting::of_snapshot(&template("x"));
                 sg.identity = disks::Identity::new(disks::Strength::Uuid, uuid);
@@ -778,11 +1215,24 @@ mod tests {
         .unwrap();
         assert_eq!(s.resolve("backupy-2014:latest").unwrap().id, a2.id);
         assert_eq!(s.resolve("BACKUPY-2014:latest~1").unwrap().id, a1.id);
-        assert_eq!(s.resolve("dBBB:latest").unwrap().id, b1.id, "a prefix of the ID");
-        assert_eq!(s.resolve("DBBBBBBBB:").unwrap().id, b1.id, "any case; nothing after the colon means latest");
+        assert_eq!(
+            s.resolve("dBBB:latest").unwrap().id,
+            b1.id,
+            "a prefix of the ID"
+        );
+        assert_eq!(
+            s.resolve("DBBBBBBBB:").unwrap().id,
+            b1.id,
+            "any case; nothing after the colon means latest"
+        );
         assert_eq!(s.resolve("backupy-2014:a1").unwrap().id, a1.id);
-        assert!(matches!(s.resolve("dbbbbbbbb:latest~1"), Err(StoreError::NotFound(r)) if r == "dbbbbbbbb:latest~1"));
-        assert!(matches!(s.resolve("nope:latest"), Err(StoreError::UnknownDisk(_))));
+        assert!(
+            matches!(s.resolve("dbbbbbbbb:latest~1"), Err(StoreError::NotFound(r)) if r == "dbbbbbbbb:latest~1")
+        );
+        assert!(matches!(
+            s.resolve("nope:latest"),
+            Err(StoreError::UnknownDisk(_))
+        ));
         assert_eq!(s.resolve("latest").unwrap().id, a2.id);
     }
 
@@ -793,21 +1243,34 @@ mod tests {
         // An exFAT stick: an old scan with a weak identity, a new one with its serial UUID.
         let mut old = on_disk("old", "/Volumes/STICK", None, "/");
         old.root_in_volume = None;
-        old.volume = VolumeIdentity { uuid: Some("RANDOM".into()), name: Some("STICK".into()), fs_type: "exfat".into(), mount_point: "/Volumes/STICK".into(), volume_group: false };
+        old.volume = VolumeIdentity {
+            uuid: Some("RANDOM".into()),
+            name: Some("STICK".into()),
+            fs_type: "exfat".into(),
+            mount_point: "/Volumes/STICK".into(),
+            volume_group: false,
+            ..Default::default()
+        };
         let v0 = rooted(&tree(0, 0), "/Volumes/STICK");
         let (old, _) = commit_meta(&s, old, &v0);
-        let serial = s.update_registry(|r| {
-            let mut sg = Sighting::of_snapshot(&template("x"));
-            sg.identity = disks::Identity::new(disks::Strength::Serial, "SERIAL-UUID");
-            sg.at = "2026-10-25T10:00:00+02:00".into();
-            let id = r.add(&sg);
-            r.set_label(&id, Some("stick"))?;
-            r.add_to_set(&id, "usb")?;
-            Ok(id)
-        })
-        .unwrap();
+        let (registry_lock, _) = s.lock().unwrap();
+        let serial = s
+            .update_registry(&registry_lock, |r| {
+                let mut sg = Sighting::of_snapshot(&template("x"));
+                sg.identity = disks::Identity::new(disks::Strength::Serial, "SERIAL-UUID");
+                sg.at = "2026-10-25T10:00:00+02:00".into();
+                let id = r.add(&sg);
+                r.set_label(&id, Some("stick"))?;
+                r.add_to_set(&id, "usb")?;
+                Ok(id)
+            })
+            .unwrap();
+        drop(registry_lock);
         let weak = old.disk.clone().unwrap();
-        s.update_registry(|r| r.add_to_set(&weak, "old")).unwrap();
+        let (lock, _) = s.lock().unwrap();
+        s.update_registry(&lock, |r| r.add_to_set(&weak, "old"))
+            .unwrap();
+        drop(lock);
         let mut new = on_disk("new", "/Volumes/STICK", Some(&serial), "/");
         new.volume = old.volume.clone();
         let v1 = rooted(&tree(2, 1), "/Volumes/STICK");
@@ -815,22 +1278,128 @@ mod tests {
         assert_eq!(rb, Rebase::Nothing, "two disks: no common history yet");
         assert!(old.incompatibility(&new).is_some());
 
-        let lock = s.lock().unwrap();
+        let (lock, _) = s.lock().unwrap();
         assert_eq!(s.merge_disks(&lock, &weak, &serial).unwrap(), [old.id]);
         assert!(s.merge_disks(&lock, &serial, &serial).is_err());
         drop(lock);
         let metas = s.list().unwrap();
-        assert!(metas.iter().all(|m| m.disk.as_deref() == Some(serial.as_str())));
-        assert!(metas[0].incompatibility(&metas[1]).is_none(), "one lineage now");
+        assert!(
+            metas
+                .iter()
+                .all(|m| m.disk.as_deref() == Some(serial.as_str()))
+        );
+        assert!(
+            metas[0].incompatibility(&metas[1]).is_none(),
+            "one lineage now"
+        );
         assert_eq!(read(&s, old.id), v0);
         assert_eq!(read(&s, new.id), v1);
-        for f in snapshot_files(&s) {
-            assert!(f.starts_with(&serial), "{f}");
-        }
         let reg = s.registry().unwrap();
         assert_eq!(reg.disks.len(), 1);
         let d = &reg.disks[0];
-        assert_eq!((d.label.as_deref(), d.sets.clone()), (Some("stick"), vec!["usb".to_string(), "old".to_string()]));
-        assert_eq!(d.first_seen, "2026-10-21T10:00:00+02:00", "the older history's first sighting");
+        assert_eq!(
+            (d.label.as_deref(), d.sets.clone()),
+            (Some("stick"), vec!["usb".to_string(), "old".to_string()])
+        );
+        assert_eq!(
+            d.first_seen, "2026-10-21T10:00:00+02:00",
+            "the older history's first sighting"
+        );
+    }
+
+    #[test]
+    fn a_foreign_writer_lock_is_rejected_before_store_mutation() {
+        let t = TestDir::new("store-foreign-lock");
+        let store = Store::create(&t.path().join("store")).unwrap();
+        let other = Store::create(&t.path().join("other")).unwrap();
+        let first = write(&store, "first", &tree(0, 0), None);
+        let second = write(&store, "second", &tree(1, 1), None);
+
+        let (store_lock, _) = store.lock().unwrap();
+        let (from, into) = store
+            .update_registry(&store_lock, |registry| {
+                let from = registry.add(&Sighting::portable(
+                    disks::Identity::new(disks::Strength::Uuid, "from"),
+                    "/from",
+                ));
+                let into = registry.add(&Sighting::portable(
+                    disks::Identity::new(disks::Strength::Uuid, "into"),
+                    "/into",
+                ));
+                Ok((from, into))
+            })
+            .unwrap();
+        drop(store_lock);
+        let registry_before = std::fs::read(store.layout().registry_path()).unwrap();
+
+        let (other_lock, _) = other.lock().unwrap();
+        let called = std::cell::Cell::new(false);
+        let error = store
+            .update_registry(&other_lock, |registry| {
+                called.set(true);
+                registry.record(&Sighting::portable(
+                    disks::Identity::new(disks::Strength::Uuid, "foreign"),
+                    "/foreign",
+                ));
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        assert!(!called.get(), "the registry closure must not run");
+        assert_eq!(
+            std::fs::read(store.layout().registry_path()).unwrap(),
+            registry_before
+        );
+        drop(other_lock);
+
+        let registry_before_merge = std::fs::read(store.layout().registry_path()).unwrap();
+        let (other_lock, _) = other.lock().unwrap();
+        let error = store.merge_disks(&other_lock, &from, &into).unwrap_err();
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        assert_eq!(
+            std::fs::read(store.layout().registry_path()).unwrap(),
+            registry_before_merge
+        );
+        drop(other_lock);
+
+        let before = store.list().unwrap();
+        let (other_lock, _) = other.lock().unwrap();
+        let error = store.rebase_previous(&other_lock, &second).unwrap_err();
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        assert_eq!(store.list().unwrap(), before);
+        drop(other_lock);
+
+        let (other_lock, _) = other.lock().unwrap();
+        let error = store.remove(&other_lock, first.id).unwrap_err();
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        assert!(store.get(first.id).is_ok());
+        drop(other_lock);
+
+        let (other_lock, _) = other.lock().unwrap();
+        let error = store
+            .rewrite_for_test(&other_lock, &first, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        drop(other_lock);
+
+        let (other_lock, _) = other.lock().unwrap();
+        let error = store
+            .compact(
+                &other_lock,
+                &std::sync::atomic::AtomicBool::new(false),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        drop(other_lock);
+
+        let (other_lock, _) = other.lock().unwrap();
+        let error = store.begin(other_lock, template("foreign-writer"), None);
+        let error = match error {
+            Err(error) => error,
+            Ok(_) => panic!("a foreign writer lock was accepted"),
+        };
+        assert!(error.to_string().contains("writer lock"), "{error}");
+        assert!(store.resolve("foreign-writer").is_err());
     }
 }

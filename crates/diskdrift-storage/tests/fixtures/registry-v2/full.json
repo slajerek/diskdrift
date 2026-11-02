@@ -1,0 +1,51 @@
+{
+  "format": "diskdrift-disks",
+  "version": 2,
+  "disks": [
+    {
+      "id": "dwindows01",
+      "identity": {
+        "platform": "windows",
+        "scheme": "volume_guid",
+        "strength": "uuid",
+        "source": "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}"
+      },
+      "label": "archive",
+      "description": "offline Windows archive",
+      "sets": ["archives", "usb"],
+      "volume": {
+        "name": "ARCHIVE",
+        "fsType": "ntfs",
+        "capacityBytes": 500000000000
+      },
+      "device": {
+        "model": "Portable SSD",
+        "vendor": "DiskDrift",
+        "bus": "USB",
+        "serial": "SERIAL-01",
+        "mediaBytes": 512000000000,
+        "internal": false
+      },
+      "firstSeen": "2026-01-01T00:00:00Z",
+      "lastSeen": "2026-10-28T12:00:00Z",
+      "lastMountPoint": "E:\\Archive",
+      "aliases": [
+        {
+          "path": "E:\\Archive",
+          "pathEncoding": "windows_utf16le",
+          "pathWide": "RQA6AFwAQQByAGMAaABpAHYAZQA="
+        },
+        {
+          "path": "E:\\Archive\\�",
+          "pathEncoding": "windows_utf16le",
+          "pathWide": "RQA6AFwAQQByAGMAaABpAHYAZQBcAADY"
+        }
+      ],
+      "lastMountPath": {
+        "path": "E:\\Archive",
+        "pathEncoding": "windows_utf16le",
+        "pathWide": "RQA6AFwAQQByAGMAaABpAHYAZQA="
+      }
+    }
+  ]
+}

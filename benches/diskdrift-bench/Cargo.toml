@@ -23,5 +23,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 heed = "0.22"
 mimalloc = "0.1"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [dev-dependencies]
 diskdrift-core = { workspace = true, features = ["testutil"] }
