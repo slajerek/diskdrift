@@ -153,7 +153,11 @@ fn windows_root_requires_an_explicit_verbatim_field() {
 
 #[test]
 fn windows_device_forms_are_rejected() {
-    for path in [r"\\.\PhysicalDrive0\", r"\\?\GLOBALROOT\Device\Harddisk0\", r"\??\C:\"] {
+    for path in [
+        r"\\.\PhysicalDrive0\",
+        r"\\?\GLOBALROOT\Device\Harddisk0\",
+        r"\??\C:\",
+    ] {
         let root = NativeRoot::new(
             NativePath::windows(path.encode_utf16().collect()),
             RootKind::Unc,

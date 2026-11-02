@@ -20,7 +20,9 @@ pub enum NativeName {
 }
 
 impl Default for NativeName {
-    fn default() -> Self { Self::Unix(Vec::new()) }
+    fn default() -> Self {
+        Self::Unix(Vec::new())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -85,10 +87,26 @@ impl NativeName {
     pub fn display(&self) -> String {
         display_value(self)
     }
-    pub fn len(&self) -> usize { match self { Self::Unix(v) => v.len(), Self::Windows(v) => v.len() } }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
-    pub fn as_unix_bytes(&self) -> Option<&[u8]> { match self { Self::Unix(v) => Some(v), Self::Windows(_) => None } }
-    pub fn extend_from_slice(&mut self, suffix: &[u8]) { if let Self::Unix(v) = self { v.extend_from_slice(suffix); } }
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Unix(v) => v.len(),
+            Self::Windows(v) => v.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn as_unix_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Unix(v) => Some(v),
+            Self::Windows(_) => None,
+        }
+    }
+    pub fn extend_from_slice(&mut self, suffix: &[u8]) {
+        if let Self::Unix(v) = self {
+            v.extend_from_slice(suffix);
+        }
+    }
 }
 
 impl NativePath {
@@ -187,21 +205,22 @@ fn is_absolute_drive(s: &str) -> bool {
         && s.as_bytes().get(2) == Some(&b'\\')
 }
 fn is_verbatim_drive(s: &str) -> bool {
-    s.len() >= 7 && s.as_bytes().get(0..4) == Some(br"\\?\") && is_absolute_drive(&s[4..])
+    s.len() >= 7 && starts_with_ascii_case_insensitive(s, r"\\?\") && is_absolute_drive(&s[4..])
 }
 fn is_device_path(s: &str) -> bool {
-    s.starts_with(r"\\.\") || s.starts_with(r"\\?\GLOBALROOT\") || s.starts_with(r"\??\")
+    starts_with_ascii_case_insensitive(s, r"\\.\")
+        || starts_with_ascii_case_insensitive(s, r"\\?\GLOBALROOT\")
+        || starts_with_ascii_case_insensitive(s, r"\??\")
 }
 fn valid_unc(s: &str, prefix: &str) -> bool {
-    let Some(rest) = s.strip_prefix(prefix) else {
+    let Some(rest) = strip_prefix_ascii_case_insensitive(s, prefix) else {
         return false;
     };
     let mut parts = rest.split('\\');
-    parts.next().is_some_and(|x| !x.is_empty())
-        && parts.next().is_some_and(|x| !x.is_empty())
+    parts.next().is_some_and(|x| !x.is_empty()) && parts.next().is_some_and(|x| !x.is_empty())
 }
 fn valid_volume_guid(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix(r"\\?\Volume{") else {
+    let Some(rest) = strip_prefix_ascii_case_insensitive(s, r"\\?\Volume{") else {
         return false;
     };
     let Some(end) = rest.find("}\\") else {
@@ -213,6 +232,17 @@ fn valid_volume_guid(s: &str) -> bool {
             matches!(i, 8 | 13 | 18 | 23) && c == b'-'
                 || !matches!(i, 8 | 13 | 18 | 23) && c.is_ascii_hexdigit()
         })
+}
+
+fn starts_with_ascii_case_insensitive(value: &str, prefix: &str) -> bool {
+    value
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn strip_prefix_ascii_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    starts_with_ascii_case_insensitive(value, prefix).then(|| &value[prefix.len()..])
 }
 
 #[cfg(test)]
@@ -233,7 +263,37 @@ mod root_tests {
     #[test]
     fn incomplete_unc_roots_are_rejected() {
         for path in [r#"\\server"#, r#"\\server\"#] {
-            assert!(NativeRoot::new(windows(path), RootKind::Unc, false).is_err(), "{path}");
+            assert!(
+                NativeRoot::new(windows(path), RootKind::Unc, false).is_err(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_root_syntax_is_case_insensitive_but_payload_stays_exact() {
+        for (path, kind) in [
+            (r#"\\?\unc\SERVER\Share\folder"#, RootKind::Unc),
+            (
+                r#"\\?\volume{01234567-89AB-CDEF-0123-456789ABCDEF}\"#,
+                RootKind::VolumeGuid,
+            ),
+        ] {
+            let root = NativeRoot::new(windows(path), kind, true).unwrap();
+            assert_eq!(root.path, windows(path));
+        }
+    }
+
+    #[test]
+    fn device_path_rejection_is_case_insensitive() {
+        for path in [
+            r#"\\.\PhysicalDrive0"#,
+            r#"\\?\globalroot\Device\HarddiskVolume1"#,
+        ] {
+            assert!(
+                NativeRoot::new(windows(path), RootKind::Drive, true).is_err(),
+                "{path}"
+            );
         }
     }
 }
@@ -433,12 +493,17 @@ impl<'de> Deserialize<'de> for NativeRoot {
         let verbatim = match kind {
             RootKind::Posix => {
                 if verbatim.is_some() {
-                    return Err(serde::de::Error::custom("verbatim is forbidden for posix roots"));
+                    return Err(serde::de::Error::custom(
+                        "verbatim is forbidden for posix roots",
+                    ));
                 }
                 false
             }
-            RootKind::Drive | RootKind::Unc | RootKind::VolumeGuid => verbatim
-                .ok_or_else(|| serde::de::Error::custom("verbatim is required for windows roots"))?,
+            RootKind::Drive | RootKind::Unc | RootKind::VolumeGuid => {
+                verbatim.ok_or_else(|| {
+                    serde::de::Error::custom("verbatim is required for windows roots")
+                })?
+            }
         };
         NativeRoot::new(path, kind, verbatim).map_err(serde::de::Error::custom)
     }

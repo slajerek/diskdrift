@@ -380,6 +380,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "thiserror",
+ "tracing",
  "unicode-normalization",
 ]
 
@@ -401,6 +402,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -427,6 +429,7 @@ name = "diskdrift-core"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "crossbeam-channel",
  "fastrand",
  "serde",
@@ -452,10 +455,13 @@ dependencies = [
 name = "diskdrift-platform"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "diskdrift-core",
  "libc",
  "serde",
  "thiserror",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -469,6 +475,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -483,6 +490,7 @@ dependencies = [
  "diskdrift-app",
  "diskdrift-core",
  "ratatui",
+ "tracing",
 ]
 
 [[package]]

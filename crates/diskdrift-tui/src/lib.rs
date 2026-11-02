@@ -7,7 +7,9 @@ use app::{App, Command, Msg};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use diskdrift_app::config::Effective;
 use diskdrift_app::diagnostics::doctor::{self, DoctorOptions};
 use diskdrift_app::platform::{self, ListerKind};
@@ -116,7 +118,14 @@ impl Workers {
                             None
                         } else {
                             let max_age = s.auto_max_age_hours.value.max(1) as i64 * 3600;
-                            diskdrift_app::investigate::known_sizes(&s, max_age, chrono::Local::now().timestamp()).ok().flatten().map(Arc::new)
+                            diskdrift_app::investigate::known_sizes(
+                                &s,
+                                max_age,
+                                chrono::Local::now().timestamp(),
+                            )
+                            .ok()
+                            .flatten()
+                            .map(Arc::new)
                         },
                         baseline: diskdrift_app::investigate::latest_baseline(&s),
                     };
@@ -127,15 +136,19 @@ impl Workers {
                     });
                     // Recovery suggestions come from the same measurement.
                     let _ = tx.send(Msg::Doctor(Box::new(report.clone())));
-                    let r = diskdrift_app::investigate::recover_from(&s, &report).map_err(|e| e.to_string());
+                    let r = diskdrift_app::investigate::recover_from(&s, &report)
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(Msg::Recover(Box::new(r)));
                 });
             }
             Command::LoadDisks => {
                 let mounted = app.volumes.clone();
+                let mount_errors = app.mount_errors.clone();
                 spawn(move || {
                     let r = match mounted {
-                        Some(v) => diskdrift_app::disks::list_with(&s, &v),
+                        Some(v) => {
+                            diskdrift_app::disks::list_with_mount_errors(&s, &v, mount_errors)
+                        }
                         None => diskdrift_app::disks::list(&s),
                     };
                     let _ = tx.send(Msg::Disks(Box::new(r.map_err(|e| e.to_string()))));
@@ -143,15 +156,25 @@ impl Workers {
             }
             Command::DiskConnected(volume) => spawn(move || {
                 let now = chrono::Local::now().timestamp();
-                let action = diskdrift_app::disks::on_connect(&s, &volume, now).map_err(|e| e.to_string());
-                let _ = tx.send(Msg::Connected { volume, action: Box::new(action) });
+                let action =
+                    diskdrift_app::disks::on_connect(&s, &volume, now).map_err(|e| e.to_string());
+                let _ = tx.send(Msg::Connected {
+                    volume,
+                    action: Box::new(action),
+                });
             }),
-            Command::StartScan { root, name, background, disk } => {
+            Command::StartScan {
+                root,
+                name,
+                background,
+                disk,
+            } => {
                 self.scan_cancel = Arc::new(AtomicBool::new(false));
                 let cancel = self.scan_cancel.clone();
                 let progress = app.scan_progress().unwrap_or_default();
                 spawn(move || {
-                    let mut req = snapshots::ScanRequest::from_settings(&s, Some(root.into()), name, &[]);
+                    let mut req =
+                        snapshots::ScanRequest::from_settings(&s, Some(root.into()), name, &[]);
                     req.background = background;
                     req.disk_choice = disk;
                     let msg = match snapshots::scan(&s, &req, &cancel, Some(progress.as_ref())) {
@@ -162,14 +185,31 @@ impl Workers {
                 });
             }
             Command::CancelScan => self.scan_cancel.store(true, Ordering::SeqCst),
-            Command::RunDiff { old, new, sort, min_size } => spawn(move || {
-                let opts = diskdrift_app::core::diff::DiffOptions { sort, min_size, limit: crate::app::DIFF_LIMIT, ..Default::default() };
-                let r = snapshots::diff(&s, &old.to_string(), &new.to_string(), None, false, opts).map_err(|e| e.to_string());
+            Command::RunDiff {
+                old,
+                new,
+                sort,
+                min_size,
+            } => spawn(move || {
+                let opts = diskdrift_app::core::diff::DiffOptions {
+                    sort,
+                    min_size,
+                    limit: crate::app::DIFF_LIMIT,
+                    ..Default::default()
+                };
+                let r = snapshots::diff(&s, &old.to_string(), &new.to_string(), None, false, opts)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(Msg::Diff(Box::new(r)));
             }),
             Command::RunTop { snapshot, metric } => spawn(move || {
-                let opts = diskdrift_app::core::top::TopOptions { limit: 200, metric, deepest: true, ..Default::default() };
-                let r = snapshots::top(&s, &snapshot.to_string(), None, opts).map_err(|e| e.to_string());
+                let opts = diskdrift_app::core::top::TopOptions {
+                    limit: 200,
+                    metric,
+                    deepest: true,
+                    ..Default::default()
+                };
+                let r = snapshots::top(&s, &snapshot.to_string(), None, opts)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(Msg::Top(Box::new(r)));
             }),
             Command::RunAnalyze { id, path, live } => {
@@ -186,40 +226,86 @@ impl Workers {
                     let from_scan = if live {
                         None
                     } else {
-                        diskdrift_app::analyze::analyze_from_scan(&s, &path, 500, max_age, chrono::Local::now().timestamp()).ok().flatten()
+                        diskdrift_app::analyze::analyze_from_scan(
+                            &s,
+                            &path,
+                            500,
+                            max_age,
+                            chrono::Local::now().timestamp(),
+                        )
+                        .ok()
+                        .flatten()
                     };
                     let r = match from_scan {
                         Some(r) => Ok(r),
-                        None => diskdrift_app::analyze::analyze(&s, &path, 500, Duration::from_secs(120), &cancel, Some(progress.as_ref()), &step)
-                            .map_err(|e| e.to_string()),
+                        None => diskdrift_app::analyze::analyze(
+                            &s,
+                            &path,
+                            500,
+                            Duration::from_secs(120),
+                            &cancel,
+                            Some(progress.as_ref()),
+                            &step,
+                        )
+                        .map_err(|e| e.to_string()),
                     };
-                    let _ = tx.send(Msg::Analyze { id, result: Box::new(r) });
+                    let _ = tx.send(Msg::Analyze {
+                        id,
+                        result: Box::new(r),
+                    });
                 });
             }
             Command::RunBrowse { id, source, path } => spawn(move || {
                 const LIMIT: usize = 1000;
                 let r = match source {
                     app::BrowseSource::Snapshot(snap) => {
-                        snapshots::browse(&s, &snap.to_string(), path.as_deref(), LIMIT).map(|r| app::BrowseData::Snapshot(Box::new(r)))
+                        snapshots::browse(&s, &snap.to_string(), path.as_deref(), LIMIT)
+                            .map(|r| app::BrowseData::Snapshot(Box::new(r)))
                     }
-                    app::BrowseSource::Diff { old, new } => {
-                        snapshots::diff_browse(&s, &old.to_string(), &new.to_string(), path.as_deref(), LIMIT).map(|r| app::BrowseData::Diff(Box::new(r)))
-                    }
+                    app::BrowseSource::Diff { old, new } => snapshots::diff_browse(
+                        &s,
+                        &old.to_string(),
+                        &new.to_string(),
+                        path.as_deref(),
+                        LIMIT,
+                    )
+                    .map(|r| app::BrowseData::Diff(Box::new(r))),
                 };
-                let _ = tx.send(Msg::Browse { id, result: Box::new(r.map_err(|e| e.to_string())) });
+                let _ = tx.send(Msg::Browse {
+                    id,
+                    result: Box::new(r.map_err(|e| e.to_string())),
+                });
             }),
-            Command::RunFind { id, pattern, disk, set } => {
+            Command::RunFind {
+                id,
+                pattern,
+                disk,
+                set,
+            } => {
                 self.find_cancel = Arc::new(AtomicBool::new(false));
                 let cancel = self.find_cancel.clone();
                 let mounted = app.volumes.clone();
                 spawn(move || {
-                    let q = Query { disk, set, limit: app::FIND_LIMIT, ..Query::new(&pattern) };
-                    let r = search::current_cancellable(&s, &q, mounted.as_deref(), &cancel).map_err(|e| e.to_string());
-                    let _ = tx.send(Msg::FindCurrent { id, result: Box::new(r) });
+                    let q = Query {
+                        disk,
+                        set,
+                        limit: app::FIND_LIMIT,
+                        ..Query::new(&pattern)
+                    };
+                    let r = search::current_cancellable(&s, &q, mounted.as_deref(), &cancel)
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::FindCurrent {
+                        id,
+                        result: Box::new(r),
+                    });
                 });
             }
             Command::RunFindHistory { id, always } => {
-                let (Some(q), Some(cur)) = (app.find.query.clone(), app.find.current.done().cloned()) else { return };
+                let (Some(q), Some(cur)) =
+                    (app.find.query.clone(), app.find.current.done().cloned())
+                else {
+                    return;
+                };
                 self.find_cancel = Arc::new(AtomicBool::new(false));
                 let cancel = self.find_cancel.clone();
                 spawn(move || {
@@ -227,56 +313,99 @@ impl Workers {
                     let progress = move |done, total| {
                         let _ = progress_tx.send(Msg::FindProgress { id, done, total });
                     };
-                    let r = search::history(&s, &q, &cur, always, &cancel, &progress).map_err(|e| e.to_string());
-                    let _ = tx.send(Msg::FindHistory { id, result: Box::new(r) });
+                    let r = search::history(&s, &q, &cur, always, &cancel, &progress)
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::FindHistory {
+                        id,
+                        result: Box::new(r),
+                    });
                 });
             }
             Command::CancelFind => self.find_cancel.store(true, Ordering::SeqCst),
             Command::Careful(true) => {
                 let events_tx = tx.clone();
                 let settings = s.clone();
-                let started = diskdrift_app::platform::MountGuard::start(Box::new(move |e| match e {
-                    diskdrift_app::platform::GuardEvent::Held(v) => {
-                        // Off the guard thread: reading the store must not hold up Disk Arbitration.
-                        let (tx, settings) = (events_tx.clone(), settings.clone());
-                        spawn(move || {
-                            let r = diskdrift_app::careful::describe(&settings, *v).map_err(|e| e.to_string());
-                            let _ = tx.send(Msg::CarefulHeld(Box::new(r)));
-                        });
-                    }
-                    diskdrift_app::platform::GuardEvent::Gone(bsd) => {
-                        let _ = events_tx.send(Msg::CarefulGone(bsd));
-                    }
-                }));
-                let r = started.map(|g| self.guard = Some(Arc::new(g))).map_err(|e| e.to_string());
+                let started =
+                    diskdrift_app::platform::MountGuard::start(Box::new(move |e| match e {
+                        diskdrift_app::platform::GuardEvent::Held(v) => {
+                            // Off the guard thread: reading the store must not hold up Disk Arbitration.
+                            let (tx, settings) = (events_tx.clone(), settings.clone());
+                            spawn(move || {
+                                let r = diskdrift_app::careful::describe(&settings, *v)
+                                    .map_err(|e| e.to_string());
+                                let _ = tx.send(Msg::CarefulHeld(Box::new(r)));
+                            });
+                        }
+                        diskdrift_app::platform::GuardEvent::Gone(bsd) => {
+                            let _ = events_tx.send(Msg::CarefulGone(bsd));
+                        }
+                    }));
+                let r = started
+                    .map(|g| self.guard = Some(Arc::new(g)))
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(Msg::CarefulStarted(r));
             }
             // Dropping the guard ends the policy; a running careful scan keeps its own handle until it has ejected.
             Command::Careful(false) => self.guard = None,
             Command::CarefulScan { bsd, choice } => {
-                let (Some(guard), Some(held)) = (self.guard.clone(), app.careful.held.iter().find(|h| h.bsd() == bsd).cloned()) else { return };
+                let (Some(guard), Some(held)) = (
+                    self.guard.clone(),
+                    app.careful.held.iter().find(|h| h.bsd() == bsd).cloned(),
+                ) else {
+                    return;
+                };
                 self.careful_cancel = Arc::new(AtomicBool::new(false));
                 let cancel = self.careful_cancel.clone();
                 let progress = app.careful_progress().unwrap_or_default();
                 spawn(move || {
-                    let r = diskdrift_app::careful::careful_scan(&s, &guard, &held, choice, &cancel, Some(progress.as_ref())).map_err(|e| e.to_string());
-                    let _ = tx.send(Msg::CarefulDone { bsd, result: Box::new(r) });
+                    let r = diskdrift_app::careful::careful_scan(
+                        &s,
+                        &guard,
+                        &held,
+                        choice,
+                        &cancel,
+                        Some(progress.as_ref()),
+                    )
+                    .map_err(|e| e.to_string());
+                    let _ = tx.send(Msg::CarefulDone {
+                        bsd,
+                        result: Box::new(r),
+                    });
                 });
             }
-            Command::CarefulMount { bsd } | Command::CarefulEject { bsd } if self.guard.is_none() => {
-                let _ = tx.send(Msg::CarefulAction { bsd, result: Err("careful mode is off".into()) });
+            Command::CarefulMount { bsd } | Command::CarefulEject { bsd }
+                if self.guard.is_none() =>
+            {
+                let _ = tx.send(Msg::CarefulAction {
+                    bsd,
+                    result: Err("careful mode is off".into()),
+                });
             }
             Command::CarefulMount { bsd } => {
-                let (Some(guard), Some(held)) = (self.guard.clone(), app.careful.held.iter().find(|h| h.bsd() == bsd).cloned()) else { return };
+                let (Some(guard), Some(held)) = (
+                    self.guard.clone(),
+                    app.careful.held.iter().find(|h| h.bsd() == bsd).cloned(),
+                ) else {
+                    return;
+                };
                 spawn(move || {
-                    let r = diskdrift_app::careful::mount_for_finder(&guard, &held).map(Some).map_err(|e| e.to_string());
+                    let r = diskdrift_app::careful::mount_for_finder(&guard, &held)
+                        .map(Some)
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(Msg::CarefulAction { bsd, result: r });
                 });
             }
             Command::CarefulEject { bsd } => {
-                let (Some(guard), Some(held)) = (self.guard.clone(), app.careful.held.iter().find(|h| h.bsd() == bsd).cloned()) else { return };
+                let (Some(guard), Some(held)) = (
+                    self.guard.clone(),
+                    app.careful.held.iter().find(|h| h.bsd() == bsd).cloned(),
+                ) else {
+                    return;
+                };
                 spawn(move || {
-                    let r = diskdrift_app::careful::eject(&guard, &held).map(|()| None).map_err(|e| e.to_string());
+                    let r = diskdrift_app::careful::eject(&guard, &held)
+                        .map(|()| None)
+                        .map_err(|e| e.to_string());
                     let _ = tx.send(Msg::CarefulAction { bsd, result: r });
                 });
             }
@@ -285,7 +414,8 @@ impl Workers {
                 self.store_cancel = Arc::new(AtomicBool::new(false));
                 let cancel = self.store_cancel.clone();
                 spawn(move || {
-                    let r = diskdrift_app::prune::remove(&s, &ids, &cancel).map_err(|e| e.to_string());
+                    let r =
+                        diskdrift_app::prune::remove(&s, &ids, &cancel).map_err(|e| e.to_string());
                     let _ = tx.send(Msg::Removed(Box::new(r)));
                 });
             }
@@ -295,7 +425,9 @@ impl Workers {
                 spawn(move || {
                     let progress_tx = tx.clone();
                     let r = diskdrift_app::prune::compact(&s, &cancel, &mut |step| {
-                        let _ = progress_tx.send(Msg::StoreProgress(diskdrift_app::text::prune::compact_step(&step)));
+                        let _ = progress_tx.send(Msg::StoreProgress(
+                            diskdrift_app::text::prune::compact_step(&step),
+                        ));
                     })
                     .map_err(|e| e.to_string());
                     let _ = tx.send(Msg::Compacted(Box::new(r)));
@@ -323,20 +455,58 @@ impl Workers {
 fn watch_mounts(tx: Sender<Msg>, stop: Arc<AtomicBool>) {
     spawn(move || {
         let mut last: Option<Vec<std::path::PathBuf>> = None;
+        let mut last_errors: Option<Vec<String>> = None;
+        let mut last_volumes: Vec<diskdrift_app::disks::Volume> = Vec::new();
         while !stop.load(Ordering::SeqCst) {
-            let now = diskdrift_app::disks::disk_mount_points();
-            if last.as_ref() != Some(&now) {
-                if tx.send(Msg::Volumes(diskdrift_app::disks::volumes())).is_err() {
+            let now_inventory = match diskdrift_app::disks::disk_mount_points() {
+                Ok(now) => now,
+                Err(error) => {
+                    let errors = vec![error.to_string()];
+                    if last_errors.as_ref() != Some(&errors) {
+                        if tx
+                            .send(Msg::Volumes(diskdrift_app::disks::VolumeInventory {
+                                volumes: last_volumes.clone(),
+                                errors: errors.clone(),
+                            }))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        last_errors = Some(errors);
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+            };
+            let inventory = match diskdrift_app::disks::volumes_from_mounts(&now_inventory) {
+                Ok(inventory) => inventory,
+                Err(error) => diskdrift_app::disks::VolumeInventory {
+                    volumes: last_volumes.clone(),
+                    errors: vec![error.to_string()],
+                },
+            };
+            let now: Vec<_> = inventory
+                .volumes
+                .iter()
+                .map(|v| v.mount_point.clone())
+                .collect();
+            if last.as_ref() != Some(&now) || last_errors.as_ref() != Some(&inventory.errors) {
+                if tx.send(Msg::Volumes(inventory.clone())).is_err() {
                     return;
                 }
                 last = Some(now);
+                last_errors = Some(inventory.errors);
+                last_volumes = inventory.volumes;
             }
             std::thread::sleep(Duration::from_secs(2));
         }
     });
 }
 
-fn event_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, settings: Effective) -> anyhow::Result<()> {
+fn event_loop<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    settings: Effective,
+) -> anyhow::Result<()> {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = unbounded();
     let mut workers = Workers {
         tx,

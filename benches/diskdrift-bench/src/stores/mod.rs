@@ -7,6 +7,7 @@ pub mod sqlite;
 
 use diskdrift_core::delta::{Apply, DeltaOp};
 use diskdrift_core::diff::RecordStream;
+use diskdrift_core::native::NativeName;
 use diskdrift_core::paths::PathStack;
 use diskdrift_core::record::Record;
 use std::io;
@@ -36,7 +37,7 @@ pub trait Store {
 
     /// Records at or below `prefix` (components including the root). The default
     /// streams the whole snapshot and filters.
-    fn read_prefix(&self, id: u32, prefix: &[Vec<u8>]) -> io::Result<RecordStream<'_>> {
+    fn read_prefix(&self, id: u32, prefix: &[NativeName]) -> io::Result<RecordStream<'_>> {
         Ok(Box::new(PrefixFilter::new(
             self.read_full(id)?,
             prefix.to_vec(),
@@ -66,14 +67,14 @@ pub fn open<'a>(store: &'a dyn Store, infos: &[SnapInfo], id: u32) -> io::Result
 /// Keeps the contiguous run of records at or below `prefix`.
 pub struct PrefixFilter<'a> {
     inner: RecordStream<'a>,
-    prefix: Vec<Vec<u8>>,
+    prefix: Vec<NativeName>,
     stack: PathStack,
     inside: bool,
     done: bool,
 }
 
 impl<'a> PrefixFilter<'a> {
-    pub fn new(inner: RecordStream<'a>, prefix: Vec<Vec<u8>>) -> Self {
+    pub fn new(inner: RecordStream<'a>, prefix: Vec<NativeName>) -> Self {
         PrefixFilter {
             inner,
             prefix,
@@ -84,7 +85,11 @@ impl<'a> PrefixFilter<'a> {
     }
 
     /// Starts with a pre-filled path context (ancestors of the first record).
-    pub fn with_context(inner: RecordStream<'a>, prefix: Vec<Vec<u8>>, ctx: &[Vec<u8>]) -> Self {
+    pub fn with_context(
+        inner: RecordStream<'a>,
+        prefix: Vec<NativeName>,
+        ctx: &[NativeName],
+    ) -> Self {
         let mut f = Self::new(inner, prefix);
         for (d, c) in ctx.iter().enumerate() {
             let _ = f.stack.set(d as u16, c);
@@ -105,13 +110,14 @@ impl Iterator for PrefixFilter<'_> {
                 Ok(r) => r,
                 Err(e) => return Some(Err(e)),
             };
-            if let Err(e) = self
-                .stack
-                .set(rec.depth, rec.name.as_unix_bytes().unwrap_or_default())
-            {
+            if let Err(e) = self.stack.set(rec.depth, &rec.name) {
                 return Some(Err(e));
             }
-            if self.stack.starts_with(&self.prefix) {
+            let starts = match self.stack.starts_with(&self.prefix) {
+                Ok(starts) => starts,
+                Err(e) => return Some(Err(io::Error::new(io::ErrorKind::InvalidInput, e))),
+            };
+            if starts {
                 self.inside = true;
                 return Some(Ok(rec));
             }
@@ -246,9 +252,7 @@ mod tests {
         let mut stack = PathStack::new();
         let mut prefix = Vec::new();
         for (i, r) in v0.iter().enumerate() {
-            stack
-                .set(r.depth, r.name.as_unix_bytes().unwrap_or_default())
-                .unwrap();
+            stack.set(r.depth, &r.name).unwrap();
             if i >= 100 && r.is_dir() && r.depth >= 2 {
                 prefix = stack.components().to_vec();
                 break;

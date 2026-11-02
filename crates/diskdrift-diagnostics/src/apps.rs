@@ -22,7 +22,10 @@ pub struct InstalledApps {
 
 /// Lowercase alphanumerics only: "Google Chrome" and "google-chrome" agree.
 fn norm(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// Strips an Apple team-id prefix (`UBF8T346G9.com.microsoft` → `com.microsoft`),
@@ -30,7 +33,11 @@ fn norm(s: &str) -> String {
 fn strip_team_id(s: &str) -> &str {
     match s.split_once('.') {
         Some((head, rest))
-            if head.len() == 10 && head.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) && rest.contains('.') =>
+            if head.len() == 10
+                && head
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                && rest.contains('.') =>
         {
             rest
         }
@@ -40,7 +47,10 @@ fn strip_team_id(s: &str) -> &str {
 
 fn bundle_id(app: &Path) -> Option<String> {
     let v = plist::Value::from_file(app.join("Contents/Info.plist")).ok()?;
-    v.as_dictionary()?.get("CFBundleIdentifier")?.as_string().map(str::to_string)
+    v.as_dictionary()?
+        .get("CFBundleIdentifier")?
+        .as_string()
+        .map(str::to_string)
 }
 
 impl InstalledApps {
@@ -64,12 +74,21 @@ impl InstalledApps {
         }
         let mut apps = Vec::new();
         for d in dirs {
-            let Ok(rd) = std::fs::read_dir(&d) else { continue };
+            let Ok(rd) = std::fs::read_dir(&d) else {
+                continue;
+            };
             for e in rd.flatten() {
                 let p = e.path();
                 if p.extension().is_some_and(|x| x == "app") {
-                    let name = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    apps.push(App { name, bundle_id: bundle_id(&p), path: p });
+                    let name = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    apps.push(App {
+                        name,
+                        bundle_id: bundle_id(&p),
+                        path: p,
+                    });
                 }
             }
         }
@@ -85,7 +104,11 @@ impl InstalledApps {
             }
             by_name.entry(norm(&a.name)).or_insert(i);
         }
-        InstalledApps { apps, by_id, by_name }
+        InstalledApps {
+            apps,
+            by_id,
+            by_name,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -103,12 +126,19 @@ impl InstalledApps {
         if let Some(&i) = self.by_id.get(&id) {
             return Some(&self.apps[i]);
         }
-        if id.matches('.').count() >= 1 && id.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c)) {
+        if id.matches('.').count() >= 1
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c))
+        {
             // Reverse-DNS name: a vendor or helper prefix of an installed bundle id.
             let found = self.apps.iter().find(|a| {
-                a.bundle_id.as_deref().map(str::to_lowercase).is_some_and(|b| {
-                    b.starts_with(&format!("{id}.")) || (id.starts_with(&format!("{b}.")))
-                })
+                a.bundle_id
+                    .as_deref()
+                    .map(str::to_lowercase)
+                    .is_some_and(|b| {
+                        b.starts_with(&format!("{id}.")) || (id.starts_with(&format!("{b}.")))
+                    })
             });
             if found.is_some() {
                 return found;
@@ -134,7 +164,11 @@ mod tests {
     use super::*;
 
     fn apps() -> InstalledApps {
-        let a = |name: &str, id: &str| App { name: name.into(), bundle_id: Some(id.into()), path: PathBuf::from(format!("/Applications/{name}.app")) };
+        let a = |name: &str, id: &str| App {
+            name: name.into(),
+            bundle_id: Some(id.into()),
+            path: PathBuf::from(format!("/Applications/{name}.app")),
+        };
         InstalledApps::from_apps(vec![
             a("Google Chrome", "com.google.Chrome"),
             a("Microsoft Word", "com.microsoft.Word"),
@@ -146,9 +180,18 @@ mod tests {
     #[test]
     fn matches_ids_vendors_and_names() {
         let a = apps();
-        assert_eq!(a.owner_of("com.google.Chrome").unwrap().name, "Google Chrome");
-        assert_eq!(a.owner_of("UBF8T346G9.com.microsoft").unwrap().name, "Microsoft Word");
-        assert_eq!(a.owner_of("com.tinyspeck.slackmacgap.helper").unwrap().name, "Slack");
+        assert_eq!(
+            a.owner_of("com.google.Chrome").unwrap().name,
+            "Google Chrome"
+        );
+        assert_eq!(
+            a.owner_of("UBF8T346G9.com.microsoft").unwrap().name,
+            "Microsoft Word"
+        );
+        assert_eq!(
+            a.owner_of("com.tinyspeck.slackmacgap.helper").unwrap().name,
+            "Slack"
+        );
         assert_eq!(a.owner_of("Slack").unwrap().name, "Slack");
         assert_eq!(a.owner_of("Google").unwrap().name, "Google Chrome");
         assert!(a.owner_of("Steam").is_none());

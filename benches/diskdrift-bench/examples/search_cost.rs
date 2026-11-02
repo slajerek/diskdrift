@@ -35,8 +35,20 @@ fn main() {
     let with_history = a.get(3).is_some_and(|x| x == "history");
     // No config file: the home is a directory without one.
     let home = store.parent().unwrap();
-    let settings = resolve_with(&Overrides { db: Some(store.clone()), ..Default::default() }, home, home).unwrap();
-    assert!(settings.storage_path.value.join("store.json").exists(), "no store at {}", store.display());
+    let settings = resolve_with(
+        &Overrides {
+            db: Some(store.clone()),
+            ..Default::default()
+        },
+        home,
+        home,
+    )
+    .unwrap();
+    assert!(
+        settings.storage_path.value.join("store.json").exists(),
+        "no store at {}",
+        store.display()
+    );
     let q = Query::new(pattern);
     let cancel = AtomicBool::new(false);
     let t = Instant::now();

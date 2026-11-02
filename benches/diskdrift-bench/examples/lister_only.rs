@@ -4,7 +4,13 @@ use diskdrift_core::walk::DirLister;
 use std::path::Path;
 use std::time::Instant;
 
-fn rec(l: &dyn DirLister, p: &Path, dev: u64, n: &mut u64, buf: &mut Vec<diskdrift_core::walk::RawEntry>) {
+fn rec(
+    l: &dyn DirLister,
+    p: &Path,
+    dev: u64,
+    n: &mut u64,
+    buf: &mut Vec<diskdrift_core::walk::RawEntry>,
+) {
     let start = buf.len();
     if l.list(p, buf).is_err() {
         return;
@@ -13,7 +19,15 @@ fn rec(l: &dyn DirLister, p: &Path, dev: u64, n: &mut u64, buf: &mut Vec<diskdri
     *n += children.len() as u64;
     for c in children {
         if c.kind == Kind::Dir && c.dev == dev && !c.is_mount_point {
-            rec(l, &p.join(std::ffi::OsStr::new(std::str::from_utf8(c.name.as_unix_bytes().unwrap_or_default()).unwrap_or("?"))), dev, n, buf);
+            rec(
+                l,
+                &p.join(std::ffi::OsStr::new(
+                    std::str::from_utf8(c.name.as_unix_bytes().unwrap_or_default()).unwrap_or("?"),
+                )),
+                dev,
+                n,
+                buf,
+            );
         }
     }
 }
@@ -27,5 +41,9 @@ fn main() {
     let mut n = 0;
     let mut buf = Vec::new();
     rec(l.as_ref(), Path::new(&root), dev, &mut n, &mut buf);
-    println!("{which}: {n} entries in {:.2}s ({:.0} k/s)", t.elapsed().as_secs_f64(), n as f64 / t.elapsed().as_secs_f64() / 1000.0);
+    println!(
+        "{which}: {n} entries in {:.2}s ({:.0} k/s)",
+        t.elapsed().as_secs_f64(),
+        n as f64 / t.elapsed().as_secs_f64() / 1000.0
+    );
 }

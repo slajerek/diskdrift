@@ -12,7 +12,9 @@ use std::fmt::Write;
 
 /// Start of the scan as a Unix timestamp (0 if unparseable).
 pub fn scan_time(m: &SnapshotMeta) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(&m.started_at).map(|t| t.timestamp()).unwrap_or(0)
+    chrono::DateTime::parse_from_rfc3339(&m.started_at)
+        .map(|t| t.timestamp())
+        .unwrap_or(0)
 }
 
 /// "Name/" for directories.
@@ -26,30 +28,60 @@ pub fn share(part: u64, whole: u64) -> String {
         return String::new();
     }
     let p = part as f64 * 100.0 / whole as f64;
-    if p < 1.0 && part > 0 { "<1%".into() } else { format!("{p:.0}%") }
+    if p < 1.0 && part > 0 {
+        "<1%".into()
+    } else {
+        format!("{p:.0}%")
+    }
 }
 
 /// Allocated size, marked when part of the contents could not be read.
 pub fn child_size(c: &Child, u: SizeUnits) -> String {
-    if c.incomplete { format!("≥ {}", format_size(c.allocated_bytes, u)) } else { format_size(c.allocated_bytes, u) }
+    if c.incomplete && c.entries == 0 {
+        "unknown".into()
+    } else if c.incomplete {
+        format!("≥ {}", format_size(c.allocated_bytes, u))
+    } else {
+        format_size(c.allocated_bytes, u)
+    }
 }
 
 /// How long ago anything inside last changed (as recorded by the scan).
 pub fn child_changed(c: &Child, now: i64) -> String {
-    changed_ago(c.newest_mtime, now)
+    if c.newest_mtime == 0 {
+        "unknown".into()
+    } else {
+        changed_ago(c.newest_mtime, now)
+    }
 }
 
 pub fn child_detail(c: &Child, u: SizeUnits, now: i64) -> Vec<String> {
-    let mut out = vec![c.path.lossy()];
+    let mut out = vec![c.path.display()];
     let mut line = format!(
         "{} on disk, files {} · {} · last change {} ({})",
-        format_size(c.allocated_bytes, u),
-        format_size(c.logical_bytes, u),
-        entries(c.entries),
-        date(c.newest_mtime),
+        child_size(c, u),
+        if c.incomplete && c.entries == 0 {
+            "unknown".into()
+        } else if c.incomplete {
+            format!("≥ {}", format_size(c.logical_bytes, u))
+        } else {
+            format_size(c.logical_bytes, u)
+        },
+        if c.incomplete && c.entries == 0 {
+            "unknown".into()
+        } else {
+            entries(c.entries)
+        },
+        if c.newest_mtime == 0 {
+            "unknown".into()
+        } else {
+            date(c.newest_mtime)
+        },
         child_changed(c, now)
     );
-    if c.incomplete {
+    if c.incomplete && c.entries == 0 {
+        line.push_str(" · metadata unavailable");
+    } else if c.incomplete {
         line.push_str(" · some contents unreadable or excluded: a lower bound");
     }
     out.push(line);
@@ -66,27 +98,61 @@ pub fn diff_change(c: &DiffChild) -> &'static str {
         Change::Modified | Change::Unchanged if c.is_dir() => "changed inside",
         Change::Modified => "changed",
         Change::Unchanged => "",
+        Change::CoverageChanged => "coverage changed",
     }
 }
 
 pub fn diff_detail(c: &DiffChild, u: SizeUnits) -> Vec<String> {
-    let mut out = vec![c.path.lossy()];
+    let mut out = vec![c.path.display()];
+    let unavailable = c.mtime == i64::MIN;
+    let old = match c.change {
+        Change::Added | Change::NewlyVisible | Change::NoLongerVisible if !unavailable => {
+            "unknown".into()
+        }
+        _ if unavailable => "unknown".into(),
+        _ => format_size(c.old_allocated, u),
+    };
+    let new = match c.change {
+        Change::Deleted | Change::NewlyVisible | Change::NoLongerVisible if !unavailable => {
+            "unknown".into()
+        }
+        _ if unavailable => "unknown".into(),
+        _ => format_size(c.new_allocated, u),
+    };
+    let delta = if unavailable || matches!(c.change, Change::NewlyVisible | Change::NoLongerVisible)
+    {
+        "unknown".into()
+    } else {
+        format_delta(c.delta_allocated as i128, u)
+    };
     let mut line = format!(
         "{} → {} ({}) · {} added, deleted or modified",
-        format_size(c.old_allocated, u),
-        format_size(c.new_allocated, u),
-        format_delta(c.delta_allocated as i128, u),
+        old,
+        new,
+        delta,
         entries(c.changed_entries)
     );
     if c.visibility_changes > 0 {
-        let _ = write!(line, " · {} entries only became (in)visible (access changed), not counted", c.visibility_changes);
+        let _ = write!(
+            line,
+            " · {} entries only became (in)visible (access changed), not counted",
+            c.visibility_changes
+        );
     }
     out.push(line);
     out
 }
 
 fn snap(m: &SnapshotMeta) -> String {
-    format!("#{} {} ({})", m.id, m.name, m.started_at.get(..16).unwrap_or(&m.started_at).replace('T', " "))
+    format!(
+        "#{} {} ({})",
+        m.id,
+        m.name,
+        m.started_at
+            .get(..16)
+            .unwrap_or(&m.started_at)
+            .replace('T', " ")
+    )
 }
 
 pub fn browse(r: &BrowseResult, u: SizeUnits) -> String {
@@ -95,10 +161,23 @@ pub fn browse(r: &BrowseResult, u: SizeUnits) -> String {
     let l = &r.listing;
     let total = l.dir.as_ref().map(|d| d.allocated_bytes).unwrap_or(0);
     if let Some(d) = &l.dir {
-        let _ = writeln!(out, "{} in snapshot {}: {} on disk, {}", d.path.lossy(), snap(&r.snapshot), child_size(d, u), entries(d.entries));
+        let _ = writeln!(
+            out,
+            "{} in snapshot {}: {} on disk, {}",
+            d.path.display(),
+            snap(&r.snapshot),
+            child_size(d, u),
+            entries(d.entries)
+        );
     }
     out.push('\n');
-    let mut t = Table::new(&[("On disk", Align::Right), ("Share", Align::Right), ("Entries", Align::Right), ("Last change", Align::Right), ("Name", Align::Left)]);
+    let mut t = Table::new(&[
+        ("On disk", Align::Right),
+        ("Share", Align::Right),
+        ("Entries", Align::Right),
+        ("Last change", Align::Right),
+        ("Name", Align::Left),
+    ]);
     for c in &l.items {
         t.row(vec![
             child_size(c, u),
@@ -110,7 +189,12 @@ pub fn browse(r: &BrowseResult, u: SizeUnits) -> String {
     }
     out.push_str(&t.render());
     if l.more_items > 0 {
-        let _ = writeln!(out, "  … {} more item(s), {} in total", l.more_items, format_size(l.more_allocated_bytes, u));
+        let _ = writeln!(
+            out,
+            "  … {} more item(s), {} in total",
+            l.more_items,
+            format_size(l.more_allocated_bytes, u)
+        );
     }
     out
 }
@@ -122,7 +206,7 @@ pub fn diff_browse(r: &DiffBrowseResult, u: SizeUnits) -> String {
         let _ = writeln!(
             out,
             "{}: {} → {} ({}), {} changed — {} → {}",
-            d.path.lossy(),
+            d.path.display(),
             format_size(d.old_allocated, u),
             format_size(d.new_allocated, u),
             format_delta(d.delta_allocated as i128, u),
@@ -152,10 +236,36 @@ pub fn diff_browse(r: &DiffBrowseResult, u: SizeUnits) -> String {
     }
     out.push_str(&t.render());
     if l.more_items > 0 {
-        let _ = writeln!(out, "  … {} more changed item(s), {} net", l.more_items, format_delta(l.more_delta_allocated as i128, u));
+        let _ = writeln!(
+            out,
+            "  … {} more changed item(s), {} net",
+            l.more_items,
+            format_delta(l.more_delta_allocated as i128, u)
+        );
     }
     if l.unchanged_items > 0 {
         let _ = writeln!(out, "  {} unchanged item(s) not listed", l.unchanged_items);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::native::NativePath;
+
+    #[test]
+    fn unavailable_child_is_not_rendered_as_a_zero_lower_bound() {
+        let child = Child {
+            path: NativePath::unix(b"/r/gone".to_vec()),
+            kind: crate::core::record::Kind::File,
+            allocated_bytes: 0,
+            logical_bytes: 0,
+            entries: 0,
+            newest_mtime: 0,
+            incomplete: true,
+        };
+        assert_eq!(child_size(&child, SizeUnits::Decimal), "unknown");
+        assert!(child_detail(&child, SizeUnits::Decimal, 0)[1].contains("unknown"));
+    }
 }

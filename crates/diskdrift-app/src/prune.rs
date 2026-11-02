@@ -6,8 +6,11 @@
 use crate::config::Effective;
 use crate::snapshots::{AppError, Result, SnapshotRow, require_store};
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate};
-use diskdrift_storage::{Compaction, CompactStep, SnapshotMeta, Status};
-use serde::Serialize;
+use diskdrift_diagnostics::measurement::Envelope;
+use diskdrift_storage::{
+    CompactStep, Compaction, MigrationOutcome, RootValue, SnapshotMeta, Status,
+};
+use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicBool;
 
@@ -41,7 +44,11 @@ impl Retention {
         if self.keep_monthly > 0 {
             parts.push(format!("one a month for {} months", self.keep_monthly));
         }
-        if parts.is_empty() { "no rules".into() } else { parts.join(", ") }
+        if parts.is_empty() {
+            "no rules".into()
+        } else {
+            parts.join(", ")
+        }
     }
 }
 
@@ -71,11 +78,12 @@ pub struct Proposal {
     pub rewritten: usize,
     /// Of every scan the selection looked at (one disk's, or all).
     pub kept: usize,
+    #[serde(flatten)]
+    pub measurement: Envelope,
 }
 
 /// What removal did.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct Removed {
     /// Ids of the removed snapshots.
     pub removed: Vec<u64>,
@@ -84,11 +92,50 @@ pub struct Removed {
     pub cancelled: bool,
     /// Snapshots compaction would now store tighter.
     pub uncompacted: usize,
+    pub migration: MigrationOutcome,
+    pub measurement: Envelope,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovedWire<'a> {
+    removed: &'a [u64],
+    rewritten: &'a [u64],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freed_bytes: Option<u64>,
+    cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uncompacted: Option<usize>,
+    migration: MigrationOutcome,
+    #[serde(flatten)]
+    measurement: &'a Envelope,
+}
+
+impl Serialize for Removed {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let known = matches!(
+            self.measurement.quality,
+            Some(diskdrift_diagnostics::measurement::Quality::Observed)
+                | Some(diskdrift_diagnostics::measurement::Quality::Estimated)
+                | Some(diskdrift_diagnostics::measurement::Quality::LowerBound)
+        );
+        RemovedWire {
+            removed: &self.removed,
+            rewritten: &self.rewritten,
+            freed_bytes: known.then_some(self.freed_bytes),
+            cancelled: self.cancelled,
+            uncompacted: known.then_some(self.uncompacted),
+            migration: self.migration,
+            measurement: &self.measurement,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// `YYYY-MM-DD`.
 pub fn parse_day(s: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").map_err(|_| AppError::Usage(format!("'{s}' is not a date (YYYY-MM-DD)")))
+    NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map_err(|_| AppError::Usage(format!("'{s}' is not a date (YYYY-MM-DD)")))
 }
 
 fn started(m: &SnapshotMeta) -> Option<DateTime<FixedOffset>> {
@@ -96,17 +143,24 @@ fn started(m: &SnapshotMeta) -> Option<DateTime<FixedOffset>> {
 }
 
 /// The scans of one disk and folder are compared, so they are pruned together.
-pub fn scan_group(m: &SnapshotMeta) -> (String, String) {
-    (m.disk.clone().unwrap_or_default(), m.root_in_volume.clone().unwrap_or_else(|| m.root.clone()))
+pub fn scan_group(m: &SnapshotMeta) -> (String, RootValue) {
+    (
+        m.disk.clone().unwrap_or_default(),
+        m.derived_root_in_volume_value(),
+    )
 }
 
 /// The ids of the usable scans `rules` do not keep. Scans without data are
 /// left to [`Selection::Failed`]; a scan whose start cannot be read is kept.
-pub fn retention_removals(metas: &[SnapshotMeta], rules: Retention, now: DateTime<FixedOffset>) -> Vec<u64> {
+pub fn retention_removals(
+    metas: &[SnapshotMeta],
+    rules: Retention,
+    now: DateTime<FixedOffset>,
+) -> Vec<u64> {
     if rules.is_off() {
         return Vec::new();
     }
-    let mut groups: BTreeMap<(String, String), Vec<&SnapshotMeta>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, RootValue), Vec<&SnapshotMeta>> = BTreeMap::new();
     for m in metas.iter().filter(|m| m.status.is_usable()) {
         groups.entry(scan_group(m)).or_default().push(m);
     }
@@ -145,14 +199,28 @@ pub fn retention_removals(metas: &[SnapshotMeta], rules: Retention, now: DateTim
 }
 
 /// The ids `sel` picks among `metas`.
-fn select(store: &diskdrift_storage::Store, metas: &[SnapshotMeta], sel: &Selection) -> Result<Vec<u64>> {
+fn select(
+    store: &diskdrift_storage::Store,
+    metas: &[SnapshotMeta],
+    sel: &Selection,
+) -> Result<Vec<u64>> {
     let mut ids: Vec<u64> = match sel {
-        Selection::Refs(refs) => refs.iter().map(|r| store.resolve(r).map(|m| m.id)).collect::<std::result::Result<_, _>>()?,
+        Selection::Refs(refs) => refs
+            .iter()
+            .map(|r| store.resolve(r).map(|m| m.id))
+            .collect::<std::result::Result<_, _>>()?,
         Selection::Ids(ids) => ids.clone(),
-        Selection::Failed => metas.iter().filter(|m| matches!(m.status, Status::Failed | Status::Cancelled)).map(|m| m.id).collect(),
+        Selection::Failed => metas
+            .iter()
+            .filter(|m| matches!(m.status, Status::Failed | Status::Cancelled))
+            .map(|m| m.id)
+            .collect(),
         Selection::Before(day) => metas
             .iter()
-            .filter(|m| m.status != Status::InProgress && started(m).is_some_and(|at| at.date_naive() < *day))
+            .filter(|m| {
+                m.status != Status::InProgress
+                    && started(m).is_some_and(|at| at.date_naive() < *day)
+            })
             .map(|m| m.id)
             .collect(),
         Selection::Retention(rules) => {
@@ -166,8 +234,14 @@ fn select(store: &diskdrift_storage::Store, metas: &[SnapshotMeta], sel: &Select
     };
     ids.sort_unstable();
     ids.dedup();
-    if let Some(m) = metas.iter().find(|m| ids.contains(&m.id) && m.status == Status::InProgress) {
-        return Err(AppError::Usage(format!("snapshot {} is being written by a scan now; it cannot be removed", m.id)));
+    if let Some(m) = metas
+        .iter()
+        .find(|m| ids.contains(&m.id) && m.status == Status::InProgress)
+    {
+        return Err(AppError::Usage(format!(
+            "snapshot {} is being written by a scan now; it cannot be removed",
+            m.id
+        )));
     }
     Ok(ids)
 }
@@ -180,62 +254,110 @@ pub fn propose(settings: &Effective, sel: &Selection, disk: Option<&str>) -> Res
     let metas: Vec<SnapshotMeta> = store
         .list()?
         .into_iter()
-        .filter(|m| filter.as_ref().is_none_or(|d| m.disk.as_deref() == Some(d.id.as_str())))
+        .filter(|m| {
+            filter
+                .as_ref()
+                .is_none_or(|d| m.disk.as_deref() == Some(d.id.as_str()))
+        })
         .collect();
     let ids = select(&store, &metas, sel)?;
     if let Selection::Refs(_) = sel
         && let Some(d) = &filter
         && let Some(id) = ids.iter().find(|id| !metas.iter().any(|m| m.id == **id))
     {
-        return Err(AppError::Usage(format!("snapshot {id} is not a scan of disk {}", d.display_name())));
+        return Err(AppError::Usage(format!(
+            "snapshot {id} is not a scan of disk {}",
+            d.display_name()
+        )));
     }
     let plan = store.plan_removal(&ids)?;
     let all = store.list()?;
     let snapshots = all
         .into_iter()
         .filter(|m| ids.contains(&m.id))
-        .map(|m| SnapshotRow { size_on_disk: store.snapshot_size(&m), disk_name: crate::disks::disk_name(&reg, &m), meta: m })
+        .map(|m| SnapshotRow {
+            size_on_disk: store.snapshot_size(&m),
+            disk_name: crate::disks::disk_name(&reg, &m),
+            meta: m,
+        })
         .collect();
-    Ok(Proposal { snapshots, bytes: plan.bytes, rewritten: plan.rewrites.len(), kept: metas.len().saturating_sub(ids.len()) })
+    Ok(Proposal {
+        snapshots,
+        bytes: plan.bytes,
+        rewritten: plan.rewrites.len(),
+        kept: metas.len().saturating_sub(ids.len()),
+        measurement: Envelope::observed("diskdrift store", "snapshot files", "store plan"),
+    })
 }
 
 /// Removes the snapshots `ids` (as [`propose`] listed them). `cancel` stops it
 /// before anything is removed.
 pub fn remove(settings: &Effective, ids: &[u64], cancel: &AtomicBool) -> Result<Removed> {
     let store = require_store(settings)?;
-    let lock = store.lock()?;
+    let (lock, migration) = store.lock()?;
     let r = store.remove_many(&lock, ids, cancel)?;
-    Ok(Removed { removed: r.removed, rewritten: r.rewritten, freed_bytes: r.freed_bytes, cancelled: r.cancelled, uncompacted: store.uncompacted()? })
+    Ok(Removed {
+        removed: r.removed,
+        rewritten: r.rewritten,
+        freed_bytes: r.freed_bytes,
+        cancelled: r.cancelled,
+        uncompacted: store.uncompacted()?,
+        migration,
+        measurement: if r.cancelled {
+            Envelope::lower_bound("diskdrift store", "snapshot files", "partial removal")
+        } else {
+            Envelope::observed("diskdrift store", "snapshot files", "store removal")
+        },
+    })
 }
 
 /// Compacts the store (see `Store::compact`).
-pub fn compact(settings: &Effective, cancel: &AtomicBool, progress: &mut dyn FnMut(CompactStep)) -> Result<Compaction> {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionResult {
+    #[serde(flatten)]
+    pub compaction: Compaction,
+    pub migration: MigrationOutcome,
+}
+
+pub fn compact(
+    settings: &Effective,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(CompactStep),
+) -> Result<CompactionResult> {
     let store = require_store(settings)?;
-    let lock = store.lock()?;
-    Ok(store.compact(&lock, cancel, progress)?)
+    let (lock, migration) = store.lock()?;
+    Ok(CompactionResult {
+        compaction: store.compact(&lock, cancel, progress)?,
+        migration,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Overrides, resolve_with};
-    use diskdrift_core::testutil::{TestDir, records};
+    use crate::test_support::{set_root_volume, unix_volume_descriptor};
     use diskdrift_core::record::Kind;
+    use diskdrift_core::testutil::{TestDir, records};
     use diskdrift_core::walk::WalkReport;
     use diskdrift_storage::{ScanOptions, Store, VolumeIdentity};
 
     fn meta(id: u64, at: &str, disk: &str, status: Status) -> SnapshotMeta {
-        SnapshotMeta {
+        let mut meta = SnapshotMeta {
             format_version: diskdrift_storage::meta::META_FORMAT_VERSION,
             id,
             name: format!("s{id}"),
             root: "/r".into(),
+            root_native: Some(diskdrift_core::native::NativeRoot::posix(b"/r".to_vec())),
             disk: Some(disk.into()),
             root_in_volume: Some("/".into()),
+            root_in_volume_native: Some(diskdrift_core::native::NativePath::unix(b"/".to_vec())),
             status,
             started_at: at.into(),
             finished_at: None,
             volume: VolumeIdentity::default(),
+            volumes: Vec::new(),
             options: ScanOptions::default(),
             space_before: None,
             space_after: None,
@@ -243,7 +365,19 @@ mod tests {
             counts: None,
             error: None,
             diskdrift_version: "test".into(),
-        }
+        };
+        set_root_volume(
+            &mut meta,
+            unix_volume_descriptor(
+                if disk.is_empty() {
+                    "fixture-volume"
+                } else {
+                    disk
+                },
+                "/",
+            ),
+        );
+        meta
     }
 
     #[test]
@@ -260,57 +394,153 @@ mod tests {
             .collect();
         let id_of = |d: i64| 100 - days.iter().position(|x| *x == d).unwrap() as u64;
         // Only the last 2.
-        let r = retention_removals(&metas, Retention { keep_last: 2, ..Default::default() }, now);
+        let r = retention_removals(
+            &metas,
+            Retention {
+                keep_last: 2,
+                ..Default::default()
+            },
+            now,
+        );
         assert_eq!(r.len(), days.len() - 2);
         assert!(!r.contains(&id_of(0)) && !r.contains(&id_of(1)));
         // Weekly for 3 weeks: the newest of this week (day 0), last week (day 8: Oct 15),
         // and the week before (day 16: Oct 7).
-        let r = retention_removals(&metas, Retention { keep_weekly: 3, ..Default::default() }, now);
-        let kept: Vec<u64> = metas.iter().map(|m| m.id).filter(|id| !r.contains(id)).collect();
+        let r = retention_removals(
+            &metas,
+            Retention {
+                keep_weekly: 3,
+                ..Default::default()
+            },
+            now,
+        );
+        let kept: Vec<u64> = metas
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| !r.contains(id))
+            .collect();
         assert_eq!(kept, vec![id_of(0), id_of(8), id_of(16)]);
         // Monthly for 4 months: October (day 0), September (day 40), August (day 75).
-        let r = retention_removals(&metas, Retention { keep_monthly: 4, ..Default::default() }, now);
-        let kept: Vec<u64> = metas.iter().map(|m| m.id).filter(|id| !r.contains(id)).collect();
+        let r = retention_removals(
+            &metas,
+            Retention {
+                keep_monthly: 4,
+                ..Default::default()
+            },
+            now,
+        );
+        let kept: Vec<u64> = metas
+            .iter()
+            .map(|m| m.id)
+            .filter(|id| !r.contains(id))
+            .collect();
         assert_eq!(kept, vec![id_of(0), id_of(40), id_of(75)]);
         // Off: nothing. Another disk is pruned on its own; failed scans are not touched.
         assert!(retention_removals(&metas, Retention::default(), now).is_empty());
         let mut more = metas.clone();
-        more.push(meta(1, "2020-01-01T10:00:00+01:00", "d2", Status::Completed));
+        more.push(meta(
+            1,
+            "2020-01-01T10:00:00+01:00",
+            "d2",
+            Status::Completed,
+        ));
         more.push(meta(2, "2020-01-01T10:00:00+01:00", "d1", Status::Failed));
-        let r = retention_removals(&more, Retention { keep_last: 1, ..Default::default() }, now);
-        assert!(!r.contains(&1) && !r.contains(&2), "the only scan of d2 and a failed scan stay");
+        let r = retention_removals(
+            &more,
+            Retention {
+                keep_last: 1,
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(
+            !r.contains(&1) && !r.contains(&2),
+            "the only scan of d2 and a failed scan stay"
+        );
     }
 
     #[test]
     fn propose_then_remove() {
         let t = TestDir::new("app-prune");
         let db = t.path().join("store");
-        let settings = resolve_with(&Overrides { db: Some(db.clone()), ..Default::default() }, t.path(), t.path()).unwrap();
+        let settings = resolve_with(
+            &Overrides {
+                db: Some(db.clone()),
+                ..Default::default()
+            },
+            t.path(),
+            t.path(),
+        )
+        .unwrap();
         let store = Store::create(&db).unwrap();
         let days = ["2026-09-01", "2026-09-10", "2026-10-01", "2026-10-20"];
         for (i, d) in days.iter().enumerate() {
-            let lock = store.lock().unwrap();
+            let (lock, _) = store.lock().unwrap();
             let mut m = meta(0, &format!("{d}T10:00:00+02:00"), "", Status::InProgress);
             m.disk = None;
             m.root_in_volume = None;
             m.name = format!("s{i}");
-            m.volume = VolumeIdentity { uuid: Some("U".into()), fs_type: "apfs".into(), mount_point: "/".into(), ..Default::default() };
+            m.volume = VolumeIdentity {
+                uuid: Some("U".into()),
+                fs_type: "apfs".into(),
+                mount_point: "/".into(),
+                ..Default::default()
+            };
+            set_root_volume(&mut m, unix_volume_descriptor("U", "/"));
             let mut w = store.begin(lock, m, None).unwrap();
-            for r in records(&[("".into(), Kind::Dir, 0), (format!("f{i}"), Kind::File, i as u64 * 1000)]) {
+            for r in records(&[
+                ("".into(), Kind::Dir, 0),
+                (format!("f{i}"), Kind::File, i as u64 * 1000),
+            ]) {
                 w.push(&r).unwrap();
             }
-            w.commit_and_rebase(WalkReport::default(), None, "now".into()).unwrap().1.unwrap();
+            w.commit_and_rebase(WalkReport::default(), None, "now".into())
+                .unwrap()
+                .1
+                .unwrap();
         }
-        let lock = store.lock().unwrap();
-        let mut w = store.begin(lock, { let mut m = meta(0, "2026-10-21T10:00:00+02:00", "", Status::InProgress); m.disk = None; m.name = "x".into(); m }, None).unwrap();
-        w.push(&records(&[(String::new(), Kind::Dir, 0)])[0]).unwrap();
+        let (lock, _) = store.lock().unwrap();
+        let mut w = store
+            .begin(
+                lock,
+                {
+                    let mut m = meta(0, "2026-10-21T10:00:00+02:00", "", Status::InProgress);
+                    m.disk = None;
+                    m.name = "x".into();
+                    m
+                },
+                None,
+            )
+            .unwrap();
+        w.push(&records(&[(String::new(), Kind::Dir, 0)])[0])
+            .unwrap();
         w.abort(Status::Cancelled, None, None, "now".into());
         let p = propose(&settings, &Selection::Failed, None).unwrap();
-        assert_eq!(p.snapshots.iter().map(|r| r.meta.name.as_str()).collect::<Vec<_>>(), vec!["x"]);
-        let p = propose(&settings, &Selection::Before(parse_day("2026-10-01").unwrap()), None).unwrap();
+        assert_eq!(
+            p.snapshots
+                .iter()
+                .map(|r| r.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x"]
+        );
+        let p = propose(
+            &settings,
+            &Selection::Before(parse_day("2026-10-01").unwrap()),
+            None,
+        )
+        .unwrap();
         assert_eq!(p.snapshots.len(), 2);
-        assert_eq!((p.rewritten, p.kept), (0, 3), "the oldest go: nothing depends on them");
-        let p = propose(&settings, &Selection::Refs(vec!["s1".into(), "s2".into()]), None).unwrap();
+        assert_eq!(
+            (p.rewritten, p.kept),
+            (0, 3),
+            "the oldest go: nothing depends on them"
+        );
+        let p = propose(
+            &settings,
+            &Selection::Refs(vec!["s1".into(), "s2".into()]),
+            None,
+        )
+        .unwrap();
         assert_eq!(p.rewritten, 1, "s0 is rewritten against s3");
         assert!(propose(&settings, &Selection::Retention(Retention::default()), None).is_err());
         assert!(parse_day("1 Oct").is_err());
@@ -322,6 +552,9 @@ mod tests {
         let left: Vec<String> = store.list().unwrap().into_iter().map(|m| m.name).collect();
         assert_eq!(left, vec!["s0", "s3", "x"]);
         let c = compact(&settings, &AtomicBool::new(false), &mut |_| {}).unwrap();
-        assert!(!c.cancelled && c.checked == 2, "{c:?}");
+        assert!(
+            !c.compaction.cancelled && c.compaction.checked == 2,
+            "{c:?}"
+        );
     }
 }

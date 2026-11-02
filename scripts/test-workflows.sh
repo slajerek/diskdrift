@@ -57,6 +57,22 @@ assert(portability.fetch("permissions") == {"contents" => "read", "pull-requests
 portability_job = portability.fetch("jobs").fetch("workspace")
 assert(portability_job.fetch("name") == "${{ github.event_name }} / ${{ matrix.os }}",
        "portability job name must identify the event and runner")
+assert(portability_job.fetch("env").fetch("DISKDRIFT_WINDOWS_FIXTURE") ==
+       '${{ github.workspace }}\\target\\windows-fixture',
+       "workspace job must set the Windows fixture path explicitly")
+fixture_step = portability_job.fetch("steps").find do |step|
+  step["name"].to_s.include?("Windows native fixture")
+end
+fixture_builders = portability_text.scan('mountvol "$env:SystemDrive').length
+assert(fixture_step && fixture_step.fetch("if").include?("windows-latest") &&
+        fixture_step.fetch("run").include?("DISKDRIFT_WINDOWS_FIXTURE") &&
+        fixture_builders == 2 &&
+        portability_text.scan("[uint32]::MaxValue").length == 2 &&
+        !portability_text.include?("[uint32]0xFFFFFFFF") &&
+        fixture_builders == 2,
+        "both Windows fixture builders must create and mount the scanned fixture volume")
+assert(portability_text.include?("cargo test -p diskdrift-storage --lib fsops"),
+       "portability must run the storage fsops contract tests on every runner")
 assert(portability_text.include?('"sha256":'),
        "portability manifest must include the archive sha256 field")
 assert(portability_text.include?("shasum -a 256") || portability_text.include?("sha256sum"),

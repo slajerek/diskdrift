@@ -6,11 +6,16 @@
 //! restarts the op front-coding. Each block carries a CRC of its compressed bytes.
 
 use diskdrift_core::delta::{DeltaOp, OpDecoder, OpEncoder};
+use diskdrift_core::native::NativeName;
 use diskdrift_core::paths::PathStack;
 use diskdrift_core::record::{Record, get_varint, put_varint};
 use std::io;
 
 pub const BLOCK_RAW: usize = 256 * 1024;
+
+fn unix_path(path: &[NativeName]) -> Vec<NativeName> {
+    path.to_vec()
+}
 
 #[derive(Debug, Clone)]
 pub struct Block {
@@ -19,7 +24,7 @@ pub struct Block {
     pub count: u32,
     pub crc: u32,
     /// Full path of the first entry (records) or first op.
-    pub first_path: Vec<Vec<u8>>,
+    pub first_path: Vec<NativeName>,
 }
 
 pub struct RecordBlockEncoder {
@@ -27,12 +32,18 @@ pub struct RecordBlockEncoder {
     raw: Vec<u8>,
     count: u32,
     stack: PathStack,
-    first_path: Vec<Vec<u8>>,
+    first_path: Vec<NativeName>,
 }
 
 impl RecordBlockEncoder {
     pub fn new(level: i32) -> Self {
-        RecordBlockEncoder { level, raw: Vec::with_capacity(BLOCK_RAW + 4096), count: 0, stack: PathStack::new(), first_path: Vec::new() }
+        RecordBlockEncoder {
+            level,
+            raw: Vec::with_capacity(BLOCK_RAW + 4096),
+            count: 0,
+            stack: PathStack::new(),
+            first_path: Vec::new(),
+        }
     }
 
     /// Adds a record; returns a finished block when the current one is full.
@@ -47,12 +58,15 @@ impl RecordBlockEncoder {
             put_varint(&mut self.raw, ctx.len() as u64);
             for c in ctx {
                 put_varint(&mut self.raw, c.len() as u64);
-                self.raw.extend_from_slice(c);
+                let NativeName::Unix(bytes) = c else {
+                    return Err(corrupt("DDS1 only supports Unix-native path components"));
+                };
+                self.raw.extend_from_slice(bytes);
             }
         }
-        self.stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default())?;
+        self.stack.set(r.depth, &r.name)?;
         if self.count == 0 {
-            self.first_path = self.stack.components().to_vec();
+            self.first_path = unix_path(self.stack.components());
         }
         r.encode_dds1(&mut self.raw)?;
         self.count += 1;
@@ -60,7 +74,11 @@ impl RecordBlockEncoder {
     }
 
     pub fn finish(&mut self) -> io::Result<Option<Block>> {
-        if self.count == 0 { Ok(None) } else { self.flush().map(Some) }
+        if self.count == 0 {
+            Ok(None)
+        } else {
+            self.flush().map(Some)
+        }
     }
 
     fn flush(&mut self) -> io::Result<Block> {
@@ -83,12 +101,18 @@ pub struct OpBlockEncoder {
     raw: Vec<u8>,
     count: u32,
     enc: OpEncoder,
-    first_path: Vec<Vec<u8>>,
+    first_path: Vec<NativeName>,
 }
 
 impl OpBlockEncoder {
     pub fn new(level: i32) -> Self {
-        OpBlockEncoder { level, raw: Vec::new(), count: 0, enc: OpEncoder::new(), first_path: Vec::new() }
+        OpBlockEncoder {
+            level,
+            raw: Vec::new(),
+            count: 0,
+            enc: OpEncoder::new(),
+            first_path: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, op: &DeltaOp) -> io::Result<Option<Block>> {
@@ -98,7 +122,7 @@ impl OpBlockEncoder {
         }
         if self.count == 0 {
             self.first_path = op.parent.clone();
-            self.first_path.push(op.record.name.as_unix_bytes().unwrap_or_default().to_vec());
+            self.first_path.push(op.record.name.clone());
         }
         self.enc.encode(op, &mut self.raw)?;
         self.count += 1;
@@ -106,7 +130,11 @@ impl OpBlockEncoder {
     }
 
     pub fn finish(&mut self) -> io::Result<Option<Block>> {
-        if self.count == 0 { Ok(None) } else { self.flush().map(Some) }
+        if self.count == 0 {
+            Ok(None)
+        } else {
+            self.flush().map(Some)
+        }
     }
 
     fn flush(&mut self) -> io::Result<Block> {
@@ -137,7 +165,11 @@ pub fn decompress(data: &[u8], raw_len: u32, crc: u32) -> io::Result<Vec<u8>> {
 }
 
 /// Decodes a records block; returns the context (ancestors of the first record).
-pub fn decode_records(raw: &[u8], count: u32, out: &mut Vec<Record>) -> io::Result<Vec<Vec<u8>>> {
+pub fn decode_records(
+    raw: &[u8],
+    count: u32,
+    out: &mut Vec<Record>,
+) -> io::Result<Vec<NativeName>> {
     let mut s = raw;
     let n = get_varint(&mut s)? as usize;
     let mut ctx = Vec::with_capacity(n);
@@ -146,7 +178,7 @@ pub fn decode_records(raw: &[u8], count: u32, out: &mut Vec<Record>) -> io::Resu
         if s.len() < len {
             return Err(corrupt("bad block context"));
         }
-        ctx.push(s[..len].to_vec());
+        ctx.push(NativeName::unix(s[..len].to_vec()));
         s = &s[len..];
     }
     for _ in 0..count {
@@ -167,15 +199,19 @@ pub fn decode_ops(raw: &[u8], count: u32, out: &mut Vec<DeltaOp>) -> io::Result<
     Ok(())
 }
 
-pub fn encode_path(p: &[Vec<u8>], out: &mut Vec<u8>) {
+pub fn encode_path(p: &[NativeName], out: &mut Vec<u8>) -> io::Result<()> {
     put_varint(out, p.len() as u64);
     for c in p {
-        put_varint(out, c.len() as u64);
-        out.extend_from_slice(c);
+        let NativeName::Unix(bytes) = c else {
+            return Err(corrupt("DDS1 only supports Unix-native path components"));
+        };
+        put_varint(out, bytes.len() as u64);
+        out.extend_from_slice(bytes);
     }
+    Ok(())
 }
 
-pub fn decode_path(s: &mut &[u8]) -> io::Result<Vec<Vec<u8>>> {
+pub fn decode_path(s: &mut &[u8]) -> io::Result<Vec<NativeName>> {
     let n = get_varint(s)? as usize;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
@@ -183,7 +219,7 @@ pub fn decode_path(s: &mut &[u8]) -> io::Result<Vec<Vec<u8>>> {
         if s.len() < len {
             return Err(corrupt("bad path"));
         }
-        v.push(s[..len].to_vec());
+        v.push(NativeName::unix(s[..len].to_vec()));
         *s = &s[len..];
     }
     Ok(v)
@@ -208,7 +244,7 @@ pub mod columnar {
         count: u32,
         stack: PathStack,
         ctx: Vec<u8>,
-        first_path: Vec<Vec<u8>>,
+        first_path: Vec<NativeName>,
         prev: (u16, i64, u64),
         approx: usize,
     }
@@ -234,21 +270,28 @@ pub mod columnar {
             }
             if self.count == 0 {
                 self.ctx.clear();
-                encode_path(&self.stack.components()[..r.depth as usize], &mut self.ctx);
+                let context = unix_path(&self.stack.components()[..r.depth as usize]);
+                encode_path(&context, &mut self.ctx)?;
                 self.prev = (r.depth, 0, 0);
             }
-            self.stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default())?;
+            self.stack.set(r.depth, &r.name)?;
             if self.count == 0 {
-                self.first_path = self.stack.components().to_vec();
+                self.first_path = unix_path(self.stack.components());
             }
             let c = &mut self.cols;
             let before: usize = c.iter().map(Vec::len).sum();
             put_varint(&mut c[0], zigzag(r.depth as i64 - self.prev.0 as i64));
             c[1].push((r.kind as u8) | (r.flags << 2));
             put_varint(&mut c[2], r.name.len() as u64);
-            c[3].extend_from_slice(r.name.as_unix_bytes().unwrap_or_default());
+            let NativeName::Unix(name) = &r.name else {
+                return Err(corrupt("DDS1 only supports Unix-native names"));
+            };
+            c[3].extend_from_slice(name);
             put_varint(&mut c[4], r.size);
-            put_varint(&mut c[5], zigzag(r.alloc as i64 - expected_alloc(r.size) as i64));
+            put_varint(
+                &mut c[5],
+                zigzag(r.alloc as i64 - expected_alloc(r.size) as i64),
+            );
             put_varint(&mut c[6], zigzag(r.mtime - self.prev.1));
             put_varint(&mut c[7], zigzag(r.mtime - r.btime));
             put_varint(&mut c[8], zigzag(r.ino as i64 - self.prev.2 as i64));
@@ -260,7 +303,11 @@ pub mod columnar {
         }
 
         pub fn finish(&mut self) -> io::Result<Option<Block>> {
-            if self.count == 0 { Ok(None) } else { self.flush().map(Some) }
+            if self.count == 0 {
+                Ok(None)
+            } else {
+                self.flush().map(Some)
+            }
         }
 
         fn flush(&mut self) -> io::Result<Block> {
@@ -344,10 +391,12 @@ pub mod columnar {
     }
 
     /// Context (ancestors of the first record) of a columnar block.
-    pub fn context(raw: &[u8]) -> io::Result<Vec<Vec<u8>>> {
+    pub fn context(raw: &[u8]) -> io::Result<Vec<NativeName>> {
         let mut s = raw;
         let ctx_len = get_varint(&mut s)? as usize;
-        let mut ctx = s.get(..ctx_len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad block"))?;
+        let mut ctx = s
+            .get(..ctx_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad block"))?;
         decode_path(&mut ctx)
     }
 }

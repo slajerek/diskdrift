@@ -18,7 +18,9 @@ pub struct LmdbStore {
 
 fn err(e: heed::Error) -> io::Error {
     match e {
-        heed::Error::Mdb(heed::MdbError::MapFull) => io::Error::new(io::ErrorKind::StorageFull, "LMDB map full"),
+        heed::Error::Mdb(heed::MdbError::MapFull) => {
+            io::Error::new(io::ErrorKind::StorageFull, "LMDB map full")
+        }
         heed::Error::Io(e) => e,
         other => io::Error::other(other.to_string()),
     }
@@ -37,14 +39,25 @@ impl LmdbStore {
     pub fn open(dir: &Path) -> io::Result<Self> {
         let map_size = if cfg!(windows) { 64 << 20 } else { 256 << 30 };
         let env = unsafe {
-            EnvOpenOptions::new().map_size(map_size).max_dbs(4).open(dir).map_err(err)?
+            EnvOpenOptions::new()
+                .map_size(map_size)
+                .max_dbs(4)
+                .open(dir)
+                .map_err(err)?
         };
         let mut wtxn = env.write_txn().map_err(err)?;
-        let entries = env.create_database(&mut wtxn, Some("entries")).map_err(err)?;
+        let entries = env
+            .create_database(&mut wtxn, Some("entries"))
+            .map_err(err)?;
         let ops = env.create_database(&mut wtxn, Some("ops")).map_err(err)?;
         let snaps = env.create_database(&mut wtxn, Some("snaps")).map_err(err)?;
         wtxn.commit().map_err(err)?;
-        Ok(LmdbStore { env, entries, ops, snaps })
+        Ok(LmdbStore {
+            env,
+            entries,
+            ops,
+            snaps,
+        })
     }
 
     fn put_snap(&self, wtxn: &mut heed::RwTxn<'_>, id: u32, base: Option<u32>) -> io::Result<()> {
@@ -59,11 +72,19 @@ impl LmdbStore {
         self.snaps.put(wtxn, &id.to_be_bytes(), &v).map_err(err)
     }
 
-    fn chunk(&self, db: Database<Bytes, Bytes>, snap: u32, from: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+    fn chunk(
+        &self,
+        db: Database<Bytes, Bytes>,
+        snap: u32,
+        from: u64,
+    ) -> io::Result<Vec<(u64, Vec<u8>)>> {
         let rtxn = self.env.read_txn().map_err(err)?;
         let start = key(snap, from);
         let end = key(snap, u64::MAX);
-        let range = (std::ops::Bound::Included(&start[..]), std::ops::Bound::Included(&end[..]));
+        let range = (
+            std::ops::Bound::Included(&start[..]),
+            std::ops::Bound::Included(&end[..]),
+        );
         let mut out = Vec::with_capacity(CHUNK);
         for item in db.range(&rtxn, &range).map_err(err)? {
             let (k, v) = item.map_err(err)?;
@@ -107,7 +128,11 @@ impl<T> Iterator for Chunks<'_, T> {
                     if let Some((last, _)) = v.last() {
                         self.next = last + 1;
                     }
-                    self.cur = v.into_iter().map(|(_, b)| b).collect::<Vec<_>>().into_iter();
+                    self.cur = v
+                        .into_iter()
+                        .map(|(_, b)| b)
+                        .collect::<Vec<_>>()
+                        .into_iter();
                 }
                 Err(e) => {
                     self.done = true;
@@ -119,14 +144,20 @@ impl<T> Iterator for Chunks<'_, T> {
 }
 
 impl Store for LmdbStore {
-    fn write_full(&mut self, id: u32, records: &mut dyn Iterator<Item = Record>) -> io::Result<u64> {
+    fn write_full(
+        &mut self,
+        id: u32,
+        records: &mut dyn Iterator<Item = Record>,
+    ) -> io::Result<u64> {
         let mut wtxn = self.env.write_txn().map_err(err)?;
         let mut buf = Vec::new();
         let mut n = 0u64;
         for (seq, r) in records.enumerate() {
             buf.clear();
             r.encode_dds1(&mut buf)?;
-            self.entries.put_with_flags(&mut wtxn, PutFlags::APPEND, &key(id, seq as u64), &buf).map_err(err)?;
+            self.entries
+                .put_with_flags(&mut wtxn, PutFlags::APPEND, &key(id, seq as u64), &buf)
+                .map_err(err)?;
             n += 1;
         }
         self.put_snap(&mut wtxn, id, None)?;
@@ -134,7 +165,12 @@ impl Store for LmdbStore {
         Ok(n)
     }
 
-    fn write_delta(&mut self, id: u32, base: u32, ops: &mut dyn Iterator<Item = DeltaOp>) -> io::Result<u64> {
+    fn write_delta(
+        &mut self,
+        id: u32,
+        base: u32,
+        ops: &mut dyn Iterator<Item = DeltaOp>,
+    ) -> io::Result<u64> {
         let mut wtxn = self.env.write_txn().map_err(err)?;
         let mut enc = OpEncoder::new();
         let mut buf = Vec::new();
@@ -142,7 +178,9 @@ impl Store for LmdbStore {
         for (seq, op) in ops.enumerate() {
             buf.clear();
             enc.encode(&op, &mut buf)?;
-            self.ops.put_with_flags(&mut wtxn, PutFlags::APPEND, &key(id, seq as u64), &buf).map_err(err)?;
+            self.ops
+                .put_with_flags(&mut wtxn, PutFlags::APPEND, &key(id, seq as u64), &buf)
+                .map_err(err)?;
             n += 1;
         }
         self.put_snap(&mut wtxn, id, Some(base))?;

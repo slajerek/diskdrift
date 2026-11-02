@@ -20,6 +20,7 @@ libc.workspace = true
 memchr.workspace = true
 regex-automata.workspace = true
 unicode-normalization.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 diskdrift-core = { workspace = true, features = ["testutil"] }

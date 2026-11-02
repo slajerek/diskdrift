@@ -3,7 +3,9 @@
 //! registry when the device reports one. Read-only: nothing is mounted,
 //! claimed or changed.
 
-use super::cf::{self, CFAllocatorRef, CFDictionaryRef, CFStringRef, CFTypeRef, CFURLRef, Owned, Url};
+use super::cf::{
+    self, CFAllocatorRef, CFDictionaryRef, CFStringRef, CFTypeRef, CFURLRef, Owned, Url,
+};
 use crate::DeviceInfo;
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
@@ -15,7 +17,11 @@ type IoObject = u32;
 #[link(name = "DiskArbitration", kind = "framework")]
 unsafe extern "C" {
     pub(crate) fn DASessionCreate(allocator: CFAllocatorRef) -> DASessionRef;
-    fn DADiskCreateFromVolumePath(allocator: CFAllocatorRef, session: DASessionRef, path: CFURLRef) -> DADiskRef;
+    fn DADiskCreateFromVolumePath(
+        allocator: CFAllocatorRef,
+        session: DASessionRef,
+        path: CFURLRef,
+    ) -> DADiskRef;
     pub(crate) fn DADiskCopyDescription(disk: DADiskRef) -> CFDictionaryRef;
     pub(crate) fn DADiskCopyWholeDisk(disk: DADiskRef) -> DADiskRef;
     fn DADiskGetBSDName(disk: DADiskRef) -> *const c_char;
@@ -34,7 +40,13 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn IOBSDNameMatching(main_port: u32, options: u32, bsd_name: *const c_char) -> CFDictionaryRef;
     fn IOServiceGetMatchingService(main_port: u32, matching: CFDictionaryRef) -> IoObject;
-    fn IORegistryEntrySearchCFProperty(entry: IoObject, plane: *const c_char, key: CFStringRef, allocator: CFAllocatorRef, options: u32) -> CFTypeRef;
+    fn IORegistryEntrySearchCFProperty(
+        entry: IoObject,
+        plane: *const c_char,
+        key: CFStringRef,
+        allocator: CFAllocatorRef,
+        options: u32,
+    ) -> CFTypeRef;
     fn IOObjectRelease(object: IoObject) -> i32;
 }
 
@@ -53,7 +65,11 @@ pub fn describe(mount_point: &Path) -> Option<DaVolume> {
     let url = Url::new(mount_point, true)?;
     unsafe {
         let session = Owned::new(DASessionCreate(std::ptr::null()))?;
-        let disk = Owned::new(DADiskCreateFromVolumePath(std::ptr::null(), session.0, url.0.0))?;
+        let disk = Owned::new(DADiskCreateFromVolumePath(
+            std::ptr::null(),
+            session.0,
+            url.0.0,
+        ))?;
         let desc = Owned::new(DADiskCopyDescription(disk.0))?;
         Some(DaVolume {
             bsd_name: bsd_name(disk.0),
@@ -67,11 +83,16 @@ pub fn describe(mount_point: &Path) -> Option<DaVolume> {
 pub(crate) fn device_of(disk: DADiskRef, desc: CFDictionaryRef) -> DeviceInfo {
     unsafe {
         let whole = Owned::new(DADiskCopyWholeDisk(disk));
-        let whole_desc = whole.as_ref().and_then(|w| Owned::new(DADiskCopyDescription(w.0)));
+        let whole_desc = whole
+            .as_ref()
+            .and_then(|w| Owned::new(DADiskCopyDescription(w.0)));
         // Device keys are on the volume; the media size and serial belong to the whole disk.
         let dev = |key: CFStringRef| cf::dict_get(desc, key);
         let whole_or_vol = |key: CFStringRef| {
-            let v = whole_desc.as_ref().map(|d| cf::dict_get(d.0, key)).unwrap_or(std::ptr::null());
+            let v = whole_desc
+                .as_ref()
+                .map(|d| cf::dict_get(d.0, key))
+                .unwrap_or(std::ptr::null());
             if v.is_null() { dev(key) } else { v }
         };
         let whole_bsd = whole.as_ref().and_then(|w| bsd_name(w.0));
@@ -79,7 +100,10 @@ pub(crate) fn device_of(disk: DADiskRef, desc: CFDictionaryRef) -> DeviceInfo {
             model: cf::string_of(whole_or_vol(kDADiskDescriptionDeviceModelKey)),
             vendor: cf::string_of(whole_or_vol(kDADiskDescriptionDeviceVendorKey)),
             bus: cf::string_of(whole_or_vol(kDADiskDescriptionDeviceProtocolKey)),
-            serial: whole_bsd.as_deref().or(bsd_name(disk).as_deref()).and_then(serial_number),
+            serial: whole_bsd
+                .as_deref()
+                .or(bsd_name(disk).as_deref())
+                .and_then(serial_number),
             media_bytes: cf::number_of(whole_or_vol(kDADiskDescriptionMediaSizeKey)),
             internal: cf::bool_of(whole_or_vol(kDADiskDescriptionDeviceInternalKey)),
             removable: cf::bool_of(whole_or_vol(kDADiskDescriptionMediaRemovableKey)),
@@ -110,9 +134,21 @@ fn serial_number(bsd: &str) -> Option<String> {
         }
         let plane = c"IOService";
         let opts = K_IO_REGISTRY_ITERATE_RECURSIVELY | K_IO_REGISTRY_ITERATE_PARENTS;
-        let search = |key: &str| Owned::new(IORegistryEntrySearchCFProperty(entry, plane.as_ptr(), cf::cfstr(key).0, std::ptr::null(), opts));
+        let search = |key: &str| {
+            Owned::new(IORegistryEntrySearchCFProperty(
+                entry,
+                plane.as_ptr(),
+                cf::cfstr(key).0,
+                std::ptr::null(),
+                opts,
+            ))
+        };
         let mut found = None;
-        for key in ["USB Serial Number", "kUSBSerialNumberString", "Serial Number"] {
+        for key in [
+            "USB Serial Number",
+            "kUSBSerialNumberString",
+            "Serial Number",
+        ] {
             if let Some(s) = search(key).and_then(|v| cf::string_of(v.0)) {
                 found = Some(s);
                 break;
@@ -120,7 +156,8 @@ fn serial_number(bsd: &str) -> Option<String> {
         }
         if found.is_none() {
             // SATA and NVMe devices keep it in a dictionary.
-            found = search("Device Characteristics").and_then(|d| cf::string_of(cf::dict_get(d.0, cf::cfstr("Serial Number").0)));
+            found = search("Device Characteristics")
+                .and_then(|d| cf::string_of(cf::dict_get(d.0, cf::cfstr("Serial Number").0)));
         }
         IOObjectRelease(entry);
         found
@@ -133,11 +170,11 @@ mod tests {
 
     #[test]
     fn the_data_volume_is_described() {
-        let v = describe(Path::new("/System/Volumes/Data")).expect("Disk Arbitration knows the Data volume");
+        let v = describe(Path::new("/System/Volumes/Data"))
+            .expect("Disk Arbitration knows the Data volume");
         assert!(v.bsd_name.as_deref().is_some_and(|b| b.starts_with("disk")));
         assert!(v.volume_uuid.is_some());
         assert_eq!(v.device.internal, Some(true));
         assert!(v.device.media_bytes.unwrap_or(0) > 0);
     }
 }
-

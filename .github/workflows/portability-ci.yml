@@ -21,6 +21,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
+    env:
+      DISKDRIFT_WINDOWS_FIXTURE: ${{ github.workspace }}\target\windows-fixture
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,13 +31,59 @@ jobs:
           toolchain: stable
           components: clippy
 
+      - name: Windows native fixture
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $fixture = $env:DISKDRIFT_WINDOWS_FIXTURE
+          New-Item -ItemType Directory -Force -Path $fixture | Out-Null
+          Set-Content -LiteralPath (Join-Path $fixture "regular.txt") -Value "fixture"
+          Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class NativeFixture { [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr CreateFileW(char[] path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template); [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr handle); [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetFileAttributesW(char[] path); }'
+          $lonePath = [char[]]($fixture + "\" + [char]0xD800 + ".txt" + [char]0)
+          $handle = [NativeFixture]::CreateFileW($lonePath, [uint32]0x40000000, [uint32]0x3, [IntPtr]::Zero, [uint32]2, [uint32]0x80, [IntPtr]::Zero)
+          if ($handle -eq [IntPtr](-1)) { throw "required lone-surrogate fixture unavailable: CreateFileW failed $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+          try { } finally { [void][NativeFixture]::CloseHandle($handle) }
+          if ([NativeFixture]::GetFileAttributesW($lonePath) -eq [uint32]::MaxValue) { throw "required lone-surrogate fixture unavailable: GetFileAttributesW failed $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+          New-Item -ItemType SymbolicLink -Path (Join-Path $fixture "reparse-link") -Target $fixture | Out-Null
+          fsutil file createnew (Join-Path $fixture "sparse.bin") 1048576 | Out-Null
+          fsutil sparse setflag (Join-Path $fixture "sparse.bin") | Out-Null
+          $alias = Join-Path $fixture "mounted-folder-alias"
+          New-Item -ItemType Directory -Force -Path $alias | Out-Null
+          $fixtureVolume = (& mountvol "$env:SystemDrive\" /L).Trim()
+          if ([string]::IsNullOrWhiteSpace($fixtureVolume) -or !$fixtureVolume.StartsWith("\\?\Volume{")) {
+            throw "required native Windows fixture unavailable: fixture volume GUID is empty"
+          }
+          & mountvol $alias $fixtureVolume
+          if ($LASTEXITCODE -ne 0) {
+            throw "required native Windows mounted-folder alias unavailable: mountvol exited $LASTEXITCODE"
+          }
+
       - name: Check workspace
         shell: bash
         run: cargo check --workspace --all-targets 2>&1 | tee target-check.log
 
-      - name: Test workspace
+      - name: Test workspace with released DDS2/store-v4 and fault seams
         shell: bash
-        run: cargo test --workspace 2>&1 | tee target-test.log
+        run: set -o pipefail; cargo test --workspace --all-targets --features diskdrift-storage/test-seams 2>&1 | tee target-test.log
+
+      - name: Frozen v3 reader commit-boundary evidence
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! DISKDRIFT_V3_READER="$(scripts/build_frozen_v3_reader.sh)" cargo test -p diskdrift-storage --features diskdrift-storage/test-seams --test legacy_fixtures -- --ignored --exact frozen_v3_reader_observes_commit_boundary; then
+            echo "::error title=Frozen v3 reader evidence failed::The required standalone v3 reader could not be built or the commit-boundary test failed on ${RUNNER_OS}." >&2
+            exit 1
+          fi
+
+      - name: Test storage filesystem contracts
+        shell: bash
+        run: cargo test -p diskdrift-storage --lib fsops 2>&1 | tee target-fsops.log
+
+      - name: Test Windows native filesystem contracts
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: bash
+        run: cargo test -p diskdrift-storage --lib fsops::windows::tests 2>&1 | tee target-fsops-windows.log
 
       - name: Test portable record pipeline
         shell: bash
@@ -56,6 +104,24 @@ jobs:
       - name: Build release binary
         shell: bash
         run: cargo build --release -p diskdrift-cli 2>&1 | tee target-build.log
+
+      - name: Audit read-only commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/release/diskdrift"
+          if [ "$RUNNER_OS" = "Windows" ]; then binary="${binary}.exe"; fi
+          HOME="$PWD/target/read-only-audit/home" USERPROFILE="$PWD/target/read-only-audit/home" python3 scripts/read_only_audit.py --binary "$binary" --config target/read-only-audit/config.json --db target/read-only-audit/store 2>&1 | tee target-read-only-audit.log
+
+      - name: Test POSIX TUI smoke
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: python3 scripts/tui_smoke.py target/release/diskdrift 2>&1 | tee target-tui-smoke.log
+
+      - name: Test Windows TUI noninteractive guard
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: scripts/tui_smoke_windows.ps1 -Binary target\release\diskdrift.exe
 
       - name: Package native release
         shell: bash
@@ -127,3 +193,75 @@ jobs:
           name: portability-logs-${{ matrix.os }}
           path: target-*.log
           if-no-files-found: warn
+
+  windows-native-fixture:
+    name: windows-native-fixture
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - name: Create disposable native fixture
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:GITHUB_WORKSPACE "target\windows-fixture"
+          New-Item -ItemType Directory -Force -Path $fixture | Out-Null
+          Set-Content -LiteralPath (Join-Path $fixture "regular.txt") -Value "fixture"
+          Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class NativeFixture { [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern IntPtr CreateFileW(char[] path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template); [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr handle); [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] public static extern uint GetFileAttributesW(char[] path); }'
+          $lonePath = [char[]]($fixture + "\" + [char]0xD800 + ".txt" + [char]0)
+          $handle = [NativeFixture]::CreateFileW($lonePath, [uint32]0x40000000, [uint32]0x3, [IntPtr]::Zero, [uint32]2, [uint32]0x80, [IntPtr]::Zero)
+          if ($handle -eq [IntPtr](-1)) { throw "required lone-surrogate fixture unavailable: CreateFileW failed $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+          try { } finally { [void][NativeFixture]::CloseHandle($handle) }
+          if ([NativeFixture]::GetFileAttributesW($lonePath) -eq [uint32]::MaxValue) { throw "required lone-surrogate fixture unavailable: GetFileAttributesW failed $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+          New-Item -ItemType SymbolicLink -Path (Join-Path $fixture "reparse-link") -Target $fixture | Out-Null
+          fsutil file createnew (Join-Path $fixture "sparse.bin") 1048576 | Out-Null
+          fsutil sparse setflag (Join-Path $fixture "sparse.bin") | Out-Null
+          $alias = Join-Path $fixture "mounted-folder-alias"
+          New-Item -ItemType Directory -Force -Path $alias | Out-Null
+          $fixtureVolume = (& mountvol "$env:SystemDrive\" /L).Trim()
+          if ([string]::IsNullOrWhiteSpace($fixtureVolume) -or !$fixtureVolume.StartsWith("\\?\Volume{")) {
+            throw "required native Windows fixture unavailable: fixture volume GUID is empty"
+          }
+          & mountvol $alias $fixtureVolume
+          if ($LASTEXITCODE -ne 0) {
+            throw "required native Windows mounted-folder alias unavailable: mountvol exited $LASTEXITCODE"
+          }
+      - name: Run native Windows baseline
+        shell: pwsh
+        env:
+          DISKDRIFT_WINDOWS_FIXTURE: ${{ github.workspace }}\target\windows-fixture
+        run: |
+          cargo test -p diskdrift-platform --test windows_baseline
+          cargo test -p diskdrift-app --test windows_propagation
+
+  production-store-benchmark:
+    name: production-store-benchmark / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+      - name: Record production-store evidence
+        shell: bash
+        run: cargo run --release -p diskdrift-bench -- run --suite full --only production --out target/bench-results/portability-production.json
+      - name: Enforce the Unix DDS1/DDS2 production gate
+        if: ${{ matrix.os == 'macos-latest' }}
+        shell: bash
+        run: cargo run -p diskdrift-bench -- gate target/bench-results/portability-production.json --out target/bench-results/portability-gate.json
+      - name: Render production-store evidence
+        if: ${{ always() }}
+        shell: bash
+        run: cargo run -p diskdrift-bench -- report target/bench-results/portability-production.json --out target/bench-results/portability-production.md
+      - name: Upload production-store evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: production-store-benchmark-${{ matrix.os }}
+          path: target/bench-results/
+          if-no-files-found: error

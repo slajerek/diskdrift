@@ -17,9 +17,23 @@ pub fn shown_verdict(v: &str) -> &str {
 pub fn item_size(i: &AnalyzeItem, u: SizeUnits) -> String {
     match i.status {
         MeasureStatus::Complete => format_size(i.allocated_bytes, u),
-        MeasureStatus::Partial | MeasureStatus::TimedOut => format!("≥ {}", format_size(i.allocated_bytes, u)),
+        MeasureStatus::Partial | MeasureStatus::TimedOut => {
+            format!("≥ {}", format_size(i.allocated_bytes, u))
+        }
         MeasureStatus::Inaccessible => "unreadable".into(),
         MeasureStatus::Absent | MeasureStatus::Skipped => "not measured".into(),
+    }
+}
+
+fn report_size(r: &DirAnalysis, u: SizeUnits) -> String {
+    match r.status {
+        MeasureStatus::Complete => format_size(r.allocated_bytes, u),
+        MeasureStatus::Partial | MeasureStatus::TimedOut => {
+            format!("≥ {}", format_size(r.allocated_bytes, u))
+        }
+        MeasureStatus::Inaccessible | MeasureStatus::Absent | MeasureStatus::Skipped => {
+            "unknown".into()
+        }
     }
 }
 
@@ -64,9 +78,16 @@ pub fn item_detail(i: &AnalyzeItem, analyzed_at: i64) -> Vec<String> {
         );
     }
     if let Some(t) = i.newest_mtime {
-        out.push(format!("Last change inside: {} · {}.", changed_ago(t, analyzed_at), entries(i.entries)));
+        out.push(format!(
+            "Last change inside: {} · {}.",
+            changed_ago(t, analyzed_at),
+            entries(i.entries)
+        ));
         if a.no_installed_owner && analyzed_at - t > 365 * 86_400 {
-            out.push("Unchanged for over a year and no matching app installed: a likely leftover.".into());
+            out.push(
+                "Unchanged for over a year and no matching app installed: a likely leftover."
+                    .into(),
+            );
         }
     }
     if let Some(adv) = &a.advice {
@@ -85,23 +106,53 @@ pub fn analyze(r: &DirAnalysis, u: SizeUnits) -> String {
     };
     let _ = writeln!(
         out,
-        "{}: {} allocated in {} entries — {} · {:.1}s",
+        "{}: {} allocated in {} — {} · {:.1}s",
         r.path,
-        format_size(r.allocated_bytes, u),
-        r.entries,
+        report_size(r, u),
+        match r.status {
+            MeasureStatus::Inaccessible | MeasureStatus::Absent | MeasureStatus::Skipped => {
+                "unknown".into()
+            }
+            _ => entries(r.entries),
+        },
         status,
         r.elapsed_ms as f64 / 1000.0
     );
     if let Some(c) = &r.context {
-        let _ = writeln!(out, "Inside: {} [{}] — {}", c.what, verdict(Some(c.risk)), c.from);
+        let _ = writeln!(
+            out,
+            "Inside: {} [{}] — {}",
+            c.what,
+            verdict(Some(c.risk)),
+            c.from
+        );
     }
     out.push_str("By verdict: ");
-    let parts: Vec<String> =
-        r.by_verdict.iter().map(|v| format!("{} {} ({})", shown_verdict(&v.verdict), format_size(v.allocated_bytes, u), v.items)).collect();
+    let parts: Vec<String> = r
+        .by_verdict
+        .iter()
+        .map(|v| {
+            format!(
+                "{} {} ({})",
+                shown_verdict(&v.verdict),
+                if v.verdict == "unknown" {
+                    "unknown".into()
+                } else {
+                    format_size(v.allocated_bytes, u)
+                },
+                v.items
+            )
+        })
+        .collect();
     out.push_str(&parts.join(" · "));
     out.push_str("\n\n");
     let owners = has_owners(r);
-    let mut cols = vec![("On disk", Align::Right), ("Last change", Align::Right), ("Verdict", Align::Left), ("What", Align::Left)];
+    let mut cols = vec![
+        ("On disk", Align::Right),
+        ("Last change", Align::Right),
+        ("Verdict", Align::Left),
+        ("What", Align::Left),
+    ];
     if owners {
         cols.push(("Owner", Align::Left));
     }
@@ -122,10 +173,27 @@ pub fn analyze(r: &DirAnalysis, u: SizeUnits) -> String {
     }
     out.push_str(&t.render());
     if r.more_items > 0 {
-        let _ = writeln!(out, "  … {} more item(s), {} in total", r.more_items, format_size(r.more_allocated_bytes, u));
+        let _ = writeln!(
+            out,
+            "  … {} more item(s), {} in total",
+            r.more_items,
+            if matches!(
+                r.status,
+                MeasureStatus::Inaccessible | MeasureStatus::Absent | MeasureStatus::Skipped
+            ) {
+                "unknown".into()
+            } else {
+                format_size(r.more_allocated_bytes, u)
+            }
+        );
     }
     out.push('\n');
-    for i in r.items.iter().filter(|i| i.assessment.advice.is_some()).take(10) {
+    for i in r
+        .items
+        .iter()
+        .filter(|i| i.assessment.advice.is_some())
+        .take(10)
+    {
         let mut lines = item_detail(i, r.analyzed_at).into_iter();
         if let Some(first) = lines.next() {
             let _ = writeln!(out, "• {first}");

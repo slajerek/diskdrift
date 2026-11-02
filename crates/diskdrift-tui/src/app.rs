@@ -1,25 +1,30 @@
 //! TUI state and keyboard handling, independent of the terminal so it can be tested.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use diskdrift_app::analyze::{AnalyzeStep, DirAnalysis};
+use diskdrift_app::careful::{CarefulOutcome, Held};
 use diskdrift_app::config::{self, Config, Effective, FIELDS, Field};
+use diskdrift_app::core::diff::DiffItem;
 use diskdrift_app::core::diff::DiffSort;
+use diskdrift_app::core::measurement::Quality;
+use diskdrift_app::core::record::Kind;
 use diskdrift_app::core::top::SizeMetric;
+use diskdrift_app::core::units::{SizeUnits, format_size};
 use diskdrift_app::core::walk::Progress;
 use diskdrift_app::diagnostics::doctor::{DoctorReport, DoctorStep};
-use diskdrift_app::diagnostics::usage::UsageReport;
-use diskdrift_app::analyze::{AnalyzeStep, DirAnalysis};
-use diskdrift_app::core::units::{SizeUnits, format_size};
 use diskdrift_app::diagnostics::suspects::MeasureStatus;
+use diskdrift_app::diagnostics::usage::UsageReport;
+use diskdrift_app::disks::{
+    self, ConnectAction, DiskChoice, DiskList, Edit, Forget, Volume, VolumeInventory,
+};
 use diskdrift_app::investigate::RecoverReport;
-use diskdrift_app::core::diff::DiffItem;
-use diskdrift_app::snapshots::{self, AutoScan, BrowseResult, DiffBrowseResult, DiffResult, ScanOutcome, SnapshotList, TopResult, comparable, latest_pair};
-use diskdrift_app::disks::{self, ConnectAction, DiskChoice, DiskList, Edit, Forget, Volume};
+use diskdrift_app::prune::{CompactionResult, Proposal, Removed};
+use diskdrift_app::search::{Current, History, Hit, Lifetime, Query};
+use diskdrift_app::snapshots::{
+    self, AutoScan, BrowseResult, DiffBrowseResult, DiffResult, ScanOutcome, SnapshotList,
+    TopResult, comparable, latest_pair,
+};
 use diskdrift_app::storage::{SnapshotMeta, Status};
-use diskdrift_app::prune::{Proposal, Removed};
-use diskdrift_app::search::{Current, Hit, History, Lifetime, Query};
-use diskdrift_app::storage::Compaction;
-use diskdrift_app::careful::{CarefulOutcome, Held};
-use diskdrift_app::core::record::Kind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -197,32 +202,72 @@ pub enum Command {
     /// A volume appeared: decide whether to rescan it.
     DiskConnected(Volume),
     /// `live`: measure every location now instead of using a recent scan.
-    RunDoctor { live: bool },
+    RunDoctor {
+        live: bool,
+    },
     /// `background`: the automatic scan at start (low priority).
     /// `disk`: the answer to "is this the known disk?", when it was asked.
-    StartScan { root: String, name: Option<String>, background: bool, disk: Option<DiskChoice> },
+    StartScan {
+        root: String,
+        name: Option<String>,
+        background: bool,
+        disk: Option<DiskChoice>,
+    },
     CancelScan,
-    RunDiff { old: u64, new: u64, sort: DiffSort, min_size: u64 },
-    RunTop { snapshot: u64, metric: SizeMetric },
+    RunDiff {
+        old: u64,
+        new: u64,
+        sort: DiffSort,
+        min_size: u64,
+    },
+    RunTop {
+        snapshot: u64,
+        metric: SizeMetric,
+    },
     /// `live`: measure now even if a recent scan has the folder.
-    RunAnalyze { id: u64, path: PathBuf, live: bool },
+    RunAnalyze {
+        id: u64,
+        path: PathBuf,
+        live: bool,
+    },
     /// One level of a snapshot or comparison; `path` `None` is the scan root.
-    RunBrowse { id: u64, source: BrowseSource, path: Option<PathBuf> },
+    RunBrowse {
+        id: u64,
+        source: BrowseSource,
+        path: Option<PathBuf>,
+    },
     /// Search the newest scans for `pattern` (run `id`), on one disk when `disk` is set.
-    RunFind { id: u64, pattern: String, disk: Option<String>, set: Option<String> },
+    RunFind {
+        id: u64,
+        pattern: String,
+        disk: Option<String>,
+        set: Option<String>,
+    },
     /// Search the history of the last search; `always`: also when it found something now.
-    RunFindHistory { id: u64, always: bool },
+    RunFindHistory {
+        id: u64,
+        always: bool,
+    },
     CancelFind,
     /// Careful mode on (the guard starts) or off (it stops).
     Careful(bool),
     /// Mount the held volume `bsd` read-only, scan it with one thread, eject it.
-    CarefulScan { bsd: String, choice: Option<DiskChoice> },
+    CarefulScan {
+        bsd: String,
+        choice: Option<DiskChoice>,
+    },
     /// Mount it read-only and visible in Finder.
-    CarefulMount { bsd: String },
-    CarefulEject { bsd: String },
+    CarefulMount {
+        bsd: String,
+    },
+    CarefulEject {
+        bsd: String,
+    },
     CancelCareful,
     /// Remove these snapshots (the user confirmed what removing them does).
-    RemoveSnapshots { ids: Vec<u64> },
+    RemoveSnapshots {
+        ids: Vec<u64>,
+    },
     /// Compact the store.
     Compact,
     /// Stop the removal (before anything is removed) or the compaction.
@@ -245,36 +290,68 @@ pub enum Msg {
     ScanDoubt(String),
     Disks(Box<Result<DiskList, String>>),
     /// The volumes that count as disks, sent when the mounts change (the first
-    /// one is the baseline at start).
-    Volumes(Vec<Volume>),
-    Connected { volume: Volume, action: Box<Result<ConnectAction, String>> },
+    /// one is the baseline at start), including discovery errors.
+    Volumes(VolumeInventory),
+    Connected {
+        volume: Volume,
+        action: Box<Result<ConnectAction, String>>,
+    },
     Diff(Box<Result<DiffResult, String>>),
     Top(Box<Result<TopResult, String>>),
     /// Suggestions derived from the diagnosis just finished.
     Recover(Box<Result<RecoverReport, String>>),
-    AnalyzeStep { id: u64, step: AnalyzeStep },
-    Analyze { id: u64, result: Box<Result<DirAnalysis, String>> },
-    Browse { id: u64, result: Box<Result<BrowseData, String>> },
-    FindCurrent { id: u64, result: Box<Result<Current, String>> },
+    AnalyzeStep {
+        id: u64,
+        step: AnalyzeStep,
+    },
+    Analyze {
+        id: u64,
+        result: Box<Result<DirAnalysis, String>>,
+    },
+    Browse {
+        id: u64,
+        result: Box<Result<BrowseData, String>>,
+    },
+    FindCurrent {
+        id: u64,
+        result: Box<Result<Current, String>>,
+    },
     /// Pairs of scans read so far by the history search.
-    FindProgress { id: u64, done: usize, total: usize },
-    FindHistory { id: u64, result: Box<Result<History, String>> },
+    FindProgress {
+        id: u64,
+        done: usize,
+        total: usize,
+    },
+    FindHistory {
+        id: u64,
+        result: Box<Result<History, String>>,
+    },
     /// Careful mode started (or could not).
     CarefulStarted(Result<(), String>),
     /// A volume was held back (with what the store knows about it).
     CarefulHeld(Box<Result<Held, String>>),
     CarefulGone(String),
-    CarefulDone { bsd: String, result: Box<Result<CarefulOutcome, String>> },
+    CarefulDone {
+        bsd: String,
+        result: Box<Result<CarefulOutcome, String>>,
+    },
     /// Mounted for Finder (`Ok(where)`) or ejected (`Ok(None)`).
-    CarefulAction { bsd: String, result: Result<Option<PathBuf>, String> },
+    CarefulAction {
+        bsd: String,
+        result: Result<Option<PathBuf>, String>,
+    },
     /// What the removal or compaction is doing.
     StoreProgress(String),
     Removed(Box<Result<Removed, String>>),
-    Compacted(Box<Result<Compaction, String>>),
+    Compacted(Box<Result<CompactionResult, String>>),
 }
 
 fn scans_text(n: usize) -> String {
-    if n == 1 { "1 scan".into() } else { format!("{n} scans") }
+    if n == 1 {
+        "1 scan".into()
+    } else {
+        format!("{n} scans")
+    }
 }
 
 /// One timestamped line of a background job's log.
@@ -286,30 +363,74 @@ pub struct LogLine {
 
 impl LogLine {
     pub fn now(text: String) -> LogLine {
-        LogLine { at: chrono::Local::now().format("%H:%M:%S").to_string(), text }
+        LogLine {
+            at: chrono::Local::now().format("%H:%M:%S").to_string(),
+            text,
+        }
     }
 }
 
 /// Log text for a doctor/recover progress step.
 pub fn step_text(step: &DoctorStep, u: SizeUnits) -> String {
     match step {
-        DoctorStep::Volumes => "reading volumes and APFS containers".into(),
-        DoctorStep::Snapshots => "listing local snapshots, checking Full Disk Access".into(),
-        DoctorStep::Measuring { label, index, total } => format!("measuring {label} ({}/{total})", index + 1),
-        DoctorStep::Measured { label, path, status, allocated_bytes, entries, elapsed } => {
+        DoctorStep::Volumes => if cfg!(target_os = "macos") {
+            "reading volumes and APFS containers"
+        } else {
+            "reading volume information"
+        }
+        .into(),
+        DoctorStep::Snapshots => if cfg!(target_os = "macos") {
+            "listing local snapshots, checking Full Disk Access"
+        } else {
+            "checking local volume snapshots and permissions"
+        }
+        .into(),
+        DoctorStep::Measuring {
+            label,
+            index,
+            total,
+        } => format!("measuring {label} ({}/{total})", index + 1),
+        DoctorStep::Measured {
+            label,
+            path,
+            status,
+            allocated_bytes,
+            quality,
+            entries,
+            elapsed,
+        } => {
             let size = match status {
                 MeasureStatus::Absent => "not present".to_string(),
                 MeasureStatus::Inaccessible => "not readable".to_string(),
-                MeasureStatus::Complete => format_size(*allocated_bytes, u),
-                MeasureStatus::Partial | MeasureStatus::TimedOut => format!("≥ {}", format_size(*allocated_bytes, u)),
-                MeasureStatus::Skipped => format!("SKIPPED after {}", format_size(*allocated_bytes, u)),
+                MeasureStatus::Complete => measured_progress_size(*allocated_bytes, *quality, u),
+                MeasureStatus::Partial | MeasureStatus::TimedOut => {
+                    measured_progress_size(*allocated_bytes, *quality, u)
+                }
+                MeasureStatus::Skipped => format!(
+                    "SKIPPED after {}",
+                    measured_progress_size(*allocated_bytes, *quality, u)
+                ),
             };
-            format!("  {label}: {size}, {entries} entries, {:.1}s — {}", elapsed.as_secs_f64(), path.display())
+            format!(
+                "  {label}: {size}, {entries} entries, {:.1}s — {}",
+                elapsed.as_secs_f64(),
+                path.display()
+            )
         }
         DoctorStep::OpenFiles => "checking deleted-but-open files (lsof)".into(),
         DoctorStep::FromScan { source, locations } => {
-            format!("using sizes of {locations} locations from {source}; F5 measures them all now instead")
+            format!(
+                "using sizes of {locations} locations from {source}; F5 measures them all now instead"
+            )
         }
+    }
+}
+
+fn measured_progress_size(bytes: Option<u64>, quality: Quality, u: SizeUnits) -> String {
+    match (quality, bytes) {
+        (Quality::Observed, Some(bytes)) => format_size(bytes, u),
+        (Quality::LowerBound, Some(bytes)) => format!("≥ {}", format_size(bytes, u)),
+        _ => "unknown".into(),
     }
 }
 
@@ -379,7 +500,10 @@ pub struct AnalysisUi {
 pub enum BrowseSource {
     Snapshot(u64),
     /// Changes from the older to the newer snapshot.
-    Diff { old: u64, new: u64 },
+    Diff {
+        old: u64,
+        new: u64,
+    },
 }
 
 pub enum BrowseData {
@@ -402,10 +526,22 @@ impl BrowseData {
     /// Path, name and whether it is a directory, of the child at `i`.
     fn child(&self, i: usize) -> Option<(PathBuf, String, bool)> {
         let (path, name, dir) = match self {
-            BrowseData::Snapshot(r) => r.listing.items.get(i).map(|c| (c.path.0.clone(), c.name(), c.is_dir()))?,
-            BrowseData::Diff(r) => r.listing.items.get(i).map(|c| (c.path.0.clone(), c.name(), c.is_dir()))?,
+            BrowseData::Snapshot(r) => r
+                .listing
+                .items
+                .get(i)
+                .map(|c| (c.path.clone(), c.name(), c.is_dir()))?,
+            BrowseData::Diff(r) => r
+                .listing
+                .items
+                .get(i)
+                .map(|c| (c.path.clone(), c.name(), c.is_dir()))?,
         };
-        Some((native(&path), name, dir))
+        Some((
+            diskdrift_app::platform::path_from_native(&path).ok()?,
+            name,
+            dir,
+        ))
     }
 
     fn root(&self) -> PathBuf {
@@ -416,25 +552,19 @@ impl BrowseData {
     }
 }
 
-#[cfg(unix)]
-fn native(bytes: &[u8]) -> PathBuf {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(OsStr::from_bytes(bytes))
-}
-
-#[cfg(not(unix))]
-fn native(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-}
-
 /// Opening `path` from a list: a directory is opened, a file shows its parent
 /// with the file selected.
-fn open_target(path: &[u8], is_dir: bool) -> (PathBuf, Option<String>) {
-    let p = native(path);
+fn open_target(
+    path: &diskdrift_app::core::native::NativePath,
+    is_dir: bool,
+) -> Option<(PathBuf, Option<String>)> {
+    let p = diskdrift_app::platform::path_from_native(path).ok()?;
     match (is_dir, p.parent(), p.file_name()) {
-        (false, Some(parent), Some(name)) => (parent.to_path_buf(), Some(name.to_string_lossy().into_owned())),
-        _ => (p, None),
+        (false, Some(parent), Some(name)) => Some((
+            parent.to_path_buf(),
+            Some(name.to_string_lossy().into_owned()),
+        )),
+        _ => Some((p, None)),
     }
 }
 
@@ -478,7 +608,9 @@ impl BrowseUi {
             return None;
         }
         let parent = n.checked_sub(2).map(|i| &self.stack[i]);
-        parent.or(self.previous.as_ref()).filter(|l| l.result.done().is_some())
+        parent
+            .or(self.previous.as_ref())
+            .filter(|l| l.result.done().is_some())
     }
 }
 
@@ -490,11 +622,23 @@ pub enum ScanField {
 
 pub enum ScanStage {
     /// `error`: why the typed root cannot be scanned, shown under it.
-    Setup { root: String, name: String, field: ScanField, error: Option<String> },
-    Confirm { root: String, name: String },
+    Setup {
+        root: String,
+        name: String,
+        field: ScanField,
+        error: Option<String>,
+    },
+    Confirm {
+        root: String,
+        name: String,
+    },
     /// The disk looks like a copy of a known one, or is recognised only
     /// weakly: is it that disk? (asked every time, ADR 0002).
-    AskDisk { root: String, name: String, message: String },
+    AskDisk {
+        root: String,
+        name: String,
+        message: String,
+    },
     Running {
         progress: Arc<Progress>,
         started: Instant,
@@ -526,11 +670,22 @@ pub enum DiffTab {
     Summary,
 }
 
-pub const DIFF_TABS: [DiffTab; 4] = [DiffTab::Summary, DiffTab::GrowingDirs, DiffTab::Files, DiffTab::Shrinking];
+pub const DIFF_TABS: [DiffTab; 4] = [
+    DiffTab::Summary,
+    DiffTab::GrowingDirs,
+    DiffTab::Files,
+    DiffTab::Shrinking,
+];
 /// Most items each Compare list holds.
 pub const DIFF_LIMIT: usize = 200;
 pub const MIN_SIZES: [u64; 4] = [0, 1_000_000, 100_000_000, 1_000_000_000];
-pub const SORTS: [DiffSort; 5] = [DiffSort::Growth, DiffSort::Size, DiffSort::Modified, DiffSort::Created, DiffSort::Path];
+pub const SORTS: [DiffSort; 5] = [
+    DiffSort::Growth,
+    DiffSort::Size,
+    DiffSort::Modified,
+    DiffSort::Created,
+    DiffSort::Path,
+];
 
 pub struct DiffUi {
     /// Indices into the usable snapshots (oldest first).
@@ -673,7 +828,11 @@ pub struct DiskFilter {
 
 impl DiskFilter {
     pub fn disk(d: &diskdrift_app::storage::Disk) -> DiskFilter {
-        DiskFilter { ids: vec![d.id.clone()], name: d.display_name().to_string(), set: None }
+        DiskFilter {
+            ids: vec![d.id.clone()],
+            name: d.display_name().to_string(),
+            set: None,
+        }
     }
 
     pub fn shows(&self, disk: Option<&str>) -> bool {
@@ -720,6 +879,8 @@ pub struct App {
     scan_request: Option<(String, String)>,
     /// The volumes mounted now that count as disks (`None` until the first look).
     pub volumes: Option<Vec<Volume>>,
+    /// Mounts that could not be enumerated or described.
+    pub mount_errors: Vec<String>,
     /// The latest disk event ("backupy-2014 connected…"), for the dashboard.
     pub disk_event: Option<LogLine>,
     disk_event_at: Option<Instant>,
@@ -773,22 +934,48 @@ impl App {
             doctor: Job::Idle,
             recover: Job::Idle,
             recover_ui: RecoverUi { sel: 0 },
-            analysis: AnalysisUi { stack: Vec::new(), next_id: 1, back: Screen::Recover },
+            analysis: AnalysisUi {
+                stack: Vec::new(),
+                next_id: 1,
+                back: Screen::Recover,
+            },
             auto_status: None,
             usage_at: None,
             last_root: None,
             auto_checked: false,
-            settings_ui: SettingsUi { sel: 0, file: Ok(Config::default()), edit: None, message: None },
+            settings_ui: SettingsUi {
+                sel: 0,
+                file: Ok(Config::default()),
+                edit: None,
+                message: None,
+            },
             doctor_log: Vec::new(),
             doctor_current: None,
             doctor_started: Instant::now(),
             snapshots: Job::Idle,
-            disks: DisksUi { list: Job::Idle, sel: 0, edit: None, forget: None, note: None },
+            disks: DisksUi {
+                list: Job::Idle,
+                sel: 0,
+                edit: None,
+                forget: None,
+                note: None,
+            },
             careful: CarefulUi::default(),
-            find: FindUi { input: String::new(), editing: true, query: None, current: Job::Idle, history: Job::Idle, progress: None, id: 0, sel: 0, note: None },
+            find: FindUi {
+                input: String::new(),
+                editing: true,
+                query: None,
+                current: Job::Idle,
+                history: Job::Idle,
+                progress: None,
+                id: 0,
+                sel: 0,
+                note: None,
+            },
             disk_filter: None,
             scan_request: None,
             volumes: None,
+            mount_errors: Vec::new(),
             disk_event: None,
             disk_event_at: None,
             pending_connect: Default::default(),
@@ -810,7 +997,16 @@ impl App {
                 result: Job::Idle,
                 sel: 0,
             },
-            top: TopUi { snapshot: 0, focus: TopFocus::List, cursor: 0, chosen: false, view: TopView::Files, metric: SizeMetric::Allocated, result: Job::Idle, sel: 0 },
+            top: TopUi {
+                snapshot: 0,
+                focus: TopFocus::List,
+                cursor: 0,
+                chosen: false,
+                view: TopView::Files,
+                metric: SizeMetric::Allocated,
+                result: Job::Idle,
+                sel: 0,
+            },
             browse: None,
             next_browse_id: 1,
             scroll: 0,
@@ -826,7 +1022,11 @@ impl App {
         self.usage = Job::Running("reading volumes…".into());
         self.snapshots = Job::Running("loading snapshots…".into());
         self.disks.list = Job::Running("reading disks…".into());
-        vec![Command::LoadUsage, Command::LoadSnapshots, Command::LoadDisks]
+        vec![
+            Command::LoadUsage,
+            Command::LoadSnapshots,
+            Command::LoadDisks,
+        ]
     }
 
     pub fn scan_running(&self) -> bool {
@@ -848,7 +1048,11 @@ impl App {
             Job::Done(l) => l
                 .snapshots
                 .iter()
-                .filter(|r| self.disk_filter.as_ref().is_none_or(|f| f.shows(r.meta.disk.as_deref())))
+                .filter(|r| {
+                    self.disk_filter
+                        .as_ref()
+                        .is_none_or(|f| f.shows(r.meta.disk.as_deref()))
+                })
                 .collect(),
             _ => Vec::new(),
         }
@@ -857,7 +1061,10 @@ impl App {
     /// Snapshots with data (COMPLETED or PARTIAL), oldest first, of the
     /// filtered disk when History is filtered.
     pub fn usable(&self) -> Vec<&diskdrift_app::snapshots::SnapshotRow> {
-        self.history().into_iter().filter(|r| r.meta.status.is_usable()).collect()
+        self.history()
+            .into_iter()
+            .filter(|r| r.meta.status.is_usable())
+            .collect()
     }
 
     pub fn text_input_active(&self) -> bool {
@@ -889,19 +1096,30 @@ impl App {
     pub fn open(&mut self, screen: Screen) -> Vec<Command> {
         self.screen = screen;
         self.scroll = 0;
-        if let Some(i) = MENU.iter().position(|item| matches!(item, MenuItem::Screen(candidate) if *candidate == screen)) {
+        if let Some(i) = MENU
+            .iter()
+            .position(|item| matches!(item, MenuItem::Screen(candidate) if *candidate == screen))
+        {
             self.menu_index = i;
         }
         match screen {
-            Screen::Doctor if matches!(self.doctor, Job::Idle | Job::Failed(_)) => self.run_doctor(false),
-            Screen::Recover if matches!(self.recover, Job::Idle | Job::Failed(_)) && !self.doctor.is_running() => self.run_doctor(false),
+            Screen::Doctor if matches!(self.doctor, Job::Idle | Job::Failed(_)) => {
+                self.run_doctor(false)
+            }
+            Screen::Recover
+                if matches!(self.recover, Job::Idle | Job::Failed(_))
+                    && !self.doctor.is_running() =>
+            {
+                self.run_doctor(false)
+            }
             Screen::Usage if matches!(self.usage, Job::Idle | Job::Failed(_)) => {
                 self.usage = Job::Running("reading volumes…".into());
                 vec![Command::LoadUsage]
             }
             Screen::Settings => {
                 let ui = &mut self.settings_ui;
-                ui.file = config::load_file(&self.settings.config_path.value).map_err(|e| e.to_string());
+                ui.file =
+                    config::load_file(&self.settings.config_path.value).map_err(|e| e.to_string());
                 ui.edit = None;
                 ui.message = None;
                 Vec::new()
@@ -940,7 +1158,9 @@ impl App {
         self.doctor = Job::Running("starting…".into());
         self.recover = Job::Running("measuring candidate locations…".into());
         self.recover_ui.sel = 0;
-        self.doctor_log = vec![LogLine::now("measuring (shared by Doctor and Recovery suggestions)".into())];
+        self.doctor_log = vec![LogLine::now(
+            "measuring (shared by Doctor and Recovery suggestions)".into(),
+        )];
         self.doctor_started = Instant::now();
         vec![Command::RunDoctor { live }]
     }
@@ -949,7 +1169,8 @@ impl App {
     fn skip_doctor_step(&mut self) -> Vec<Command> {
         match self.doctor_current.take() {
             Some(label) => {
-                self.doctor_log.push(LogLine::now(format!("skipping {label} (n pressed)")));
+                self.doctor_log
+                    .push(LogLine::now(format!("skipping {label} (n pressed)")));
                 vec![Command::SkipDoctorStep]
             }
             None => Vec::new(),
@@ -972,7 +1193,10 @@ impl App {
         let id = a.next_id;
         a.next_id += 1;
         a.stack.push(AnalysisView::new(id, path.clone()));
-        vec![Command::CancelAnalyze, Command::RunAnalyze { id, path, live }]
+        vec![
+            Command::CancelAnalyze,
+            Command::RunAnalyze { id, path, live },
+        ]
     }
 
     /// Progress counters of the analysis on screen (shared with the worker).
@@ -983,15 +1207,31 @@ impl App {
     /// Something on screen changes without new messages (live counters, timers).
     pub fn needs_ticks(&self) -> bool {
         self.scan_running()
-            || (self.screen == Screen::Browse && self.browse.as_ref().and_then(|b| b.stack.last()).is_some_and(|l| l.result.is_running()))
+            || (self.screen == Screen::Browse
+                && self
+                    .browse
+                    .as_ref()
+                    .and_then(|b| b.stack.last())
+                    .is_some_and(|l| l.result.is_running()))
             || (matches!(self.screen, Screen::Recover | Screen::Doctor) && self.doctor.is_running())
-            || (self.screen == Screen::Analyze && self.analysis.stack.last().is_some_and(|v| v.result.is_running()))
-            || (self.screen == Screen::Find && (self.find.current.is_running() || self.find.history.is_running()))
+            || (self.screen == Screen::Analyze
+                && self
+                    .analysis
+                    .stack
+                    .last()
+                    .is_some_and(|v| v.result.is_running()))
+            || (self.screen == Screen::Find
+                && (self.find.current.is_running() || self.find.history.is_running()))
             || self.careful.running.is_some()
     }
 
     /// Opens a browser of `source` at `path` (`None`: the scan root).
-    pub fn open_browse(&mut self, source: BrowseSource, path: Option<PathBuf>, select: Option<String>) -> Vec<Command> {
+    pub fn open_browse(
+        &mut self,
+        source: BrowseSource,
+        path: Option<PathBuf>,
+        select: Option<String>,
+    ) -> Vec<Command> {
         let back = match &self.browse {
             Some(b) if self.screen == Screen::Browse => b.back,
             _ => self.screen,
@@ -999,19 +1239,46 @@ impl App {
         let id = match source {
             BrowseSource::Snapshot(id) | BrowseSource::Diff { new: id, .. } => id,
         };
-        let root = self.snapshots.done().and_then(|l| l.snapshots.iter().find(|r| r.meta.id == id)).map(|r| PathBuf::from(&r.meta.root));
-        self.browse = Some(BrowseUi { source, stack: Vec::new(), back, root, previous: None, note: None });
+        let root = self
+            .snapshots
+            .done()
+            .and_then(|l| l.snapshots.iter().find(|r| r.meta.id == id))
+            .map(|r| PathBuf::from(&r.meta.root));
+        self.browse = Some(BrowseUi {
+            source,
+            stack: Vec::new(),
+            back,
+            root,
+            previous: None,
+            note: None,
+        });
         self.screen = Screen::Browse;
         self.push_level(path, select)
     }
 
     fn push_level(&mut self, path: Option<PathBuf>, select: Option<String>) -> Vec<Command> {
-        let Some(b) = self.browse.as_mut() else { return Vec::new() };
+        let Some(b) = self.browse.as_mut() else {
+            return Vec::new();
+        };
         let id = self.next_browse_id;
         self.next_browse_id += 1;
-        let what = path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "the scan root".into());
-        b.stack.push(BrowseLevel { id, path: path.clone(), result: Job::Running(format!("reading {what}…")), sel: 0, select, started: Instant::now() });
-        vec![Command::RunBrowse { id, source: b.source, path }]
+        let what = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "the scan root".into());
+        b.stack.push(BrowseLevel {
+            id,
+            path: path.clone(),
+            result: Job::Running(format!("reading {what}…")),
+            sel: 0,
+            select,
+            started: Instant::now(),
+        });
+        vec![Command::RunBrowse {
+            id,
+            source: b.source,
+            path,
+        }]
     }
 
     /// Leaves the browser for the screen it was opened from.
@@ -1022,7 +1289,13 @@ impl App {
     }
 
     fn browse_key(&mut self, key: KeyEvent) -> Option<Vec<Command>> {
-        let page = |k: KeyCode| if matches!(k, KeyCode::PageUp | KeyCode::PageDown) { 10 } else { 1 };
+        let page = |k: KeyCode| {
+            if matches!(k, KeyCode::PageUp | KeyCode::PageDown) {
+                10
+            } else {
+                1
+            }
+        };
         let b = self.browse.as_mut()?;
         let Some(level) = b.stack.last_mut() else {
             self.close_browse();
@@ -1032,14 +1305,18 @@ impl App {
         b.note = None;
         match key.code {
             KeyCode::Up | KeyCode::PageUp => level.sel = level.sel.saturating_sub(page(key.code)),
-            KeyCode::Down | KeyCode::PageDown => level.sel = (level.sel + page(key.code)).min(n.saturating_sub(1)),
+            KeyCode::Down | KeyCode::PageDown => {
+                level.sel = (level.sel + page(key.code)).min(n.saturating_sub(1))
+            }
             KeyCode::Home => level.sel = 0,
             KeyCode::End => level.sel = n.saturating_sub(1),
             KeyCode::Enter | KeyCode::Right => {
                 return Some(match level.result.done().and_then(|r| r.child(level.sel)) {
                     Some((path, _, true)) => self.push_level(Some(path), None),
                     Some((_, name, false)) => {
-                        b.note = Some(format!("{name} is a file: nothing to open. a analyses the folder it is in."));
+                        b.note = Some(format!(
+                            "{name} is a file: nothing to open. a analyses the folder it is in."
+                        ));
                         Vec::new()
                     }
                     None => Vec::new(),
@@ -1048,16 +1325,35 @@ impl App {
             // The same folder in the other view: what changed here, or the scan itself.
             KeyCode::Char('c') => {
                 let (source, path) = (b.source, level.path.clone());
-                let select = level.result.done().and_then(|r| r.child(level.sel)).map(|(_, name, _)| name);
+                let select = level
+                    .result
+                    .done()
+                    .and_then(|r| r.child(level.sel))
+                    .map(|(_, name, _)| name);
                 return Some(match source {
-                    BrowseSource::Diff { new, .. } => self.open_browse(BrowseSource::Snapshot(new), path, select),
+                    BrowseSource::Diff { new, .. } => {
+                        self.open_browse(BrowseSource::Snapshot(new), path, select)
+                    }
                     BrowseSource::Snapshot(id) => {
-                        let meta = self.usable().iter().find(|r| r.meta.id == id).map(|r| r.meta.clone());
+                        let meta = self
+                            .usable()
+                            .iter()
+                            .find(|r| r.meta.id == id)
+                            .map(|r| r.meta.clone());
                         match meta.and_then(|m| self.previous_comparable(&m)) {
-                            Some(old) => self.open_browse(BrowseSource::Diff { old: old.id, new: id }, path, select),
+                            Some(old) => self.open_browse(
+                                BrowseSource::Diff {
+                                    old: old.id,
+                                    new: id,
+                                },
+                                path,
+                                select,
+                            ),
                             None => {
                                 if let Some(b) = self.browse.as_mut() {
-                                    b.note = Some(format!("No earlier scan of the same folder to compare #{id} with."));
+                                    b.note = Some(format!(
+                                        "No earlier scan of the same folder to compare #{id} with."
+                                    ));
                                 }
                                 Vec::new()
                             }
@@ -1078,8 +1374,16 @@ impl App {
                 if let Some(p) = target.as_ref().filter(|p| !p.exists())
                     && !self.disk_connected_now(id)
                 {
-                    let disk = self.snapshots.done().and_then(|l| l.snapshots.iter().find(|r| r.meta.id == id)).and_then(|r| r.disk_name.clone());
-                    let note = format!("{} is not connected: connect it to analyse {} as it is now.", disk.as_deref().unwrap_or("Its disk"), p.display());
+                    let disk = self
+                        .snapshots
+                        .done()
+                        .and_then(|l| l.snapshots.iter().find(|r| r.meta.id == id))
+                        .and_then(|r| r.disk_name.clone());
+                    let note = format!(
+                        "{} is not connected: connect it to analyse {} as it is now.",
+                        disk.as_deref().unwrap_or("Its disk"),
+                        p.display()
+                    );
                     if let Some(b) = self.browse.as_mut() {
                         b.note = Some(note);
                     }
@@ -1093,9 +1397,12 @@ impl App {
             KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
                 // At the level the browser was opened on: go on up to the scan root.
                 let up = match (&level.path, &b.root) {
-                    (Some(p), Some(root)) if p != root => {
-                        p.parent().map(|parent| (parent.to_path_buf(), p.file_name().map(|n| n.to_string_lossy().into_owned())))
-                    }
+                    (Some(p), Some(root)) if p != root => p.parent().map(|parent| {
+                        (
+                            parent.to_path_buf(),
+                            p.file_name().map(|n| n.to_string_lossy().into_owned()),
+                        )
+                    }),
                     _ => None,
                 };
                 if b.stack.len() > 1 {
@@ -1121,7 +1428,9 @@ impl App {
 
     /// The comparison's entries in the current list tab, as shown.
     pub fn diff_items(&self) -> Vec<DiffItem> {
-        let Some(r) = self.diff.result.done() else { return Vec::new() };
+        let Some(r) = self.diff.result.done() else {
+            return Vec::new();
+        };
         match self.diff.tab {
             DiffTab::GrowingDirs => r.report.growing_dirs.clone(),
             DiffTab::Files => r.report.files.clone(),
@@ -1136,7 +1445,13 @@ impl App {
     }
 
     fn analysis_key(&mut self, key: KeyEvent) -> Option<Vec<Command>> {
-        let page = |k: KeyCode| if matches!(k, KeyCode::PageUp | KeyCode::PageDown) { 10 } else { 1 };
+        let page = |k: KeyCode| {
+            if matches!(k, KeyCode::PageUp | KeyCode::PageDown) {
+                10
+            } else {
+                1
+            }
+        };
         let Some(view) = self.analysis.stack.last_mut() else {
             self.screen = self.analysis.back;
             return Some(Vec::new());
@@ -1146,7 +1461,9 @@ impl App {
             view.note = None;
             match key.code {
                 KeyCode::Up | KeyCode::PageUp => view.sel = view.sel.saturating_sub(page(key.code)),
-                KeyCode::Down | KeyCode::PageDown => view.sel = (view.sel + page(key.code)).min(n.saturating_sub(1)),
+                KeyCode::Down | KeyCode::PageDown => {
+                    view.sel = (view.sel + page(key.code)).min(n.saturating_sub(1))
+                }
                 KeyCode::Home => view.sel = 0,
                 KeyCode::End => view.sel = n.saturating_sub(1),
                 KeyCode::Enter | KeyCode::Right => {
@@ -1166,7 +1483,11 @@ impl App {
                     if self.analysis.stack.is_empty() {
                         self.screen = self.analysis.back;
                     }
-                    return Some(if running { vec![Command::CancelAnalyze] } else { Vec::new() });
+                    return Some(if running {
+                        vec![Command::CancelAnalyze]
+                    } else {
+                        Vec::new()
+                    });
                 }
                 KeyCode::F(5) => {
                     let path = view.path.clone();
@@ -1180,7 +1501,13 @@ impl App {
     }
 
     fn recover_key(&mut self, key: KeyEvent) -> Option<Vec<Command>> {
-        let page = |k: KeyCode| if matches!(k, KeyCode::PageUp | KeyCode::PageDown) { 10 } else { 1 };
+        let page = |k: KeyCode| {
+            if matches!(k, KeyCode::PageUp | KeyCode::PageDown) {
+                10
+            } else {
+                1
+            }
+        };
         if key.code == KeyCode::F(5) && !self.doctor.is_running() {
             return Some(self.run_doctor(true));
         }
@@ -1194,17 +1521,28 @@ impl App {
         let ui = &mut self.recover_ui;
         match key.code {
             KeyCode::Up | KeyCode::PageUp => ui.sel = ui.sel.saturating_sub(page(key.code)),
-            KeyCode::Down | KeyCode::PageDown => ui.sel = (ui.sel + page(key.code)).min(n.saturating_sub(1)),
+            KeyCode::Down | KeyCode::PageDown => {
+                ui.sel = (ui.sel + page(key.code)).min(n.saturating_sub(1))
+            }
             KeyCode::Home => ui.sel = 0,
             KeyCode::End => ui.sel = n.saturating_sub(1),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('a') => {
-                let c = self.recover.done().and_then(|r| r.candidates.get(self.recover_ui.sel));
+                let c = self
+                    .recover
+                    .done()
+                    .and_then(|r| r.candidates.get(self.recover_ui.sel));
                 // Growth opens on what changed there; `a` analyses the folder as it is now.
-                if let Some((c, (old, new))) = c.and_then(|c| Some((c, c.growth?))).filter(|_| key.code != KeyCode::Char('a')) {
+                if let Some((c, (old, new))) = c
+                    .and_then(|c| Some((c, c.growth?)))
+                    .filter(|_| key.code != KeyCode::Char('a'))
+                {
                     let path = c.path.as_ref().map(PathBuf::from);
                     return Some(self.open_browse(BrowseSource::Diff { old, new }, path, None));
                 }
-                let path = c.and_then(|c| c.path.as_ref()).map(PathBuf::from).filter(|p| p.is_dir());
+                let path = c
+                    .and_then(|c| c.path.as_ref())
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir());
                 return Some(match path {
                     Some(p) => self.push_analysis(p),
                     None => Vec::new(),
@@ -1217,12 +1555,17 @@ impl App {
 
     fn run_top(&mut self) -> Vec<Command> {
         let ids: Vec<u64> = self.usable().iter().map(|r| r.meta.id).collect();
-        let Some(&id) = ids.get(self.top.snapshot) else { return Vec::new() };
+        let Some(&id) = ids.get(self.top.snapshot) else {
+            return Vec::new();
+        };
         self.top.result = Job::Running(format!("reading scan #{id}…"));
         self.top.focus = TopFocus::List;
         self.scroll = 0;
         self.top.sel = 0;
-        vec![Command::RunTop { snapshot: id, metric: self.top.metric }]
+        vec![Command::RunTop {
+            snapshot: id,
+            metric: self.top.metric,
+        }]
     }
 
     fn run_diff(&mut self) -> Vec<Command> {
@@ -1234,7 +1577,12 @@ impl App {
         self.diff.focus = DiffFocus::Results;
         self.scroll = 0;
         self.diff.sel = 0;
-        vec![Command::RunDiff { old, new, sort: self.diff.sort, min_size: self.diff.min_size }]
+        vec![Command::RunDiff {
+            old,
+            new,
+            sort: self.diff.sort,
+            min_size: self.diff.min_size,
+        }]
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Command> {
@@ -1243,7 +1591,10 @@ impl App {
         }
         if self.confirm_exit {
             self.confirm_exit = false;
-            if matches!(key.code, KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')) {
+            if matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
+            ) {
                 self.should_quit = true;
                 return vec![Command::CancelJobs, Command::Quit];
             }
@@ -1267,12 +1618,20 @@ impl App {
             return vec![Command::CancelScan];
         }
         // On Careful mode, x stops the careful scan (the disk is still ejected).
-        if self.screen == Screen::Careful && key.code == KeyCode::Char('x') && self.careful.running.is_some() {
-            self.careful.log("stopping the careful scan; the disk is ejected after it".into());
+        if self.screen == Screen::Careful
+            && key.code == KeyCode::Char('x')
+            && self.careful.running.is_some()
+        {
+            self.careful
+                .log("stopping the careful scan; the disk is ejected after it".into());
             return vec![Command::CancelCareful];
         }
         // On Find, x stops the history search first.
-        if self.screen == Screen::Find && !self.find.editing && key.code == KeyCode::Char('x') && self.find.history.is_running() {
+        if self.screen == Screen::Find
+            && !self.find.editing
+            && key.code == KeyCode::Char('x')
+            && self.find.history.is_running()
+        {
             return self.stop_find_history();
         }
         // x stops a running scan from anywhere, after asking.
@@ -1315,7 +1674,8 @@ impl App {
             KeyCode::Enter if self.screen == Screen::Dashboard => self.activate_menu_item(),
             KeyCode::Up if self.screen == Screen::Dashboard => {
                 if (DISKS_RANGE.contains(&self.menu_index) && self.menu_index > DISKS_RANGE.start)
-                    || (EXPLORE_RANGE.contains(&self.menu_index) && self.menu_index > EXPLORE_RANGE.start)
+                    || (EXPLORE_RANGE.contains(&self.menu_index)
+                        && self.menu_index > EXPLORE_RANGE.start)
                 {
                     self.select_menu(self.menu_index - 1);
                 } else if DISKDRIFT_RANGE.contains(&self.menu_index) {
@@ -1343,7 +1703,9 @@ impl App {
                 if EXPLORE_RANGE.contains(&self.menu_index) {
                     let row = self.menu_index - EXPLORE_RANGE.start;
                     self.select_menu(DISKS_RANGE.start + row.min(DISKS_RANGE.len() - 1));
-                } else if DISKDRIFT_RANGE.contains(&self.menu_index) && self.menu_index > DISKDRIFT_RANGE.start {
+                } else if DISKDRIFT_RANGE.contains(&self.menu_index)
+                    && self.menu_index > DISKDRIFT_RANGE.start
+                {
                     self.select_menu(self.menu_index - 1);
                 }
                 Vec::new()
@@ -1352,7 +1714,9 @@ impl App {
                 if DISKS_RANGE.contains(&self.menu_index) {
                     let row = self.menu_index - DISKS_RANGE.start;
                     self.select_menu(EXPLORE_RANGE.start + row);
-                } else if DISKDRIFT_RANGE.contains(&self.menu_index) && self.menu_index + 1 < DISKDRIFT_RANGE.end {
+                } else if DISKDRIFT_RANGE.contains(&self.menu_index)
+                    && self.menu_index + 1 < DISKDRIFT_RANGE.end
+                {
                     self.select_menu(self.menu_index + 1);
                 }
                 Vec::new()
@@ -1397,27 +1761,50 @@ impl App {
     fn screen_key(&mut self, key: KeyEvent) -> Option<Vec<Command>> {
         match self.screen {
             // Measuring again takes a while: only F5 does it, not a stray Enter.
-            Screen::Doctor if key.code == KeyCode::F(5) && !self.doctor.is_running() => Some(self.run_doctor(true)),
-            Screen::Doctor if key.code == KeyCode::Char('n') && self.doctor.is_running() => Some(self.skip_doctor_step()),
-            Screen::Doctor if matches!(key.code, KeyCode::Tab | KeyCode::Enter) => Some(self.open(Screen::Recover)),
+            Screen::Doctor if key.code == KeyCode::F(5) && !self.doctor.is_running() => {
+                Some(self.run_doctor(true))
+            }
+            Screen::Doctor if key.code == KeyCode::Char('n') && self.doctor.is_running() => {
+                Some(self.skip_doctor_step())
+            }
+            Screen::Doctor if matches!(key.code, KeyCode::Tab | KeyCode::Enter) => {
+                Some(self.open(Screen::Recover))
+            }
             Screen::Recover => self.recover_key(key),
             Screen::Scan => match (&self.scan, key.code) {
                 (ScanStage::Confirm { root, name }, KeyCode::Enter) => {
                     let (root, name) = (root.clone(), name.clone());
                     Some(self.start_scan(root, name))
                 }
-                (ScanStage::AskDisk { root, name, .. }, KeyCode::Char(c @ ('s' | 'S' | 'n' | 'N'))) => {
+                (
+                    ScanStage::AskDisk { root, name, .. },
+                    KeyCode::Char(c @ ('s' | 'S' | 'n' | 'N')),
+                ) => {
                     let (root, name) = (root.clone(), name.clone());
-                    let choice = if c.eq_ignore_ascii_case(&'s') { DiskChoice::Same } else { DiskChoice::New };
+                    let choice = if c.eq_ignore_ascii_case(&'s') {
+                        DiskChoice::Same
+                    } else {
+                        DiskChoice::New
+                    };
                     Some(self.start_scan_with(root, name, Some(choice)))
                 }
                 (ScanStage::AskDisk { root, name, .. }, KeyCode::Esc) => {
-                    self.scan = ScanStage::Setup { root: root.clone(), name: name.clone(), field: ScanField::Root, error: None };
+                    self.scan = ScanStage::Setup {
+                        root: root.clone(),
+                        name: name.clone(),
+                        field: ScanField::Root,
+                        error: None,
+                    };
                     Some(Vec::new())
                 }
                 (ScanStage::AskDisk { .. }, _) => Some(Vec::new()),
                 (ScanStage::Confirm { root, name }, KeyCode::Esc) => {
-                    self.scan = ScanStage::Setup { root: root.clone(), name: name.clone(), field: ScanField::Root, error: None };
+                    self.scan = ScanStage::Setup {
+                        root: root.clone(),
+                        name: name.clone(),
+                        field: ScanField::Root,
+                        error: None,
+                    };
                     Some(Vec::new())
                 }
                 (ScanStage::Running { .. }, KeyCode::Esc | KeyCode::Char('c')) => {
@@ -1436,7 +1823,11 @@ impl App {
                 (ScanStage::Finished(Ok(o)), KeyCode::Char('c')) => {
                     let new = o.snapshot.clone();
                     match self.previous_comparable(&new).map(|m| m.id) {
-                        Some(old) => Some(self.open_browse(BrowseSource::Diff { old, new: new.id }, None, None)),
+                        Some(old) => Some(self.open_browse(
+                            BrowseSource::Diff { old, new: new.id },
+                            None,
+                            None,
+                        )),
                         None => Some(Vec::new()),
                     }
                 }
@@ -1463,12 +1854,21 @@ impl App {
                     let what = match m.status {
                         Status::Cancelled => "was cancelled",
                         Status::Failed => "failed",
+                        Status::Damaged => "is damaged",
                         _ => "did not finish",
                     };
-                    format!("Scan #{} {what}: it holds no data, nothing to open.", m.id)
+                    format!(
+                        "Scan #{} {what}: it holds no usable data, nothing to open.",
+                        m.id
+                    )
                 };
                 match key.code {
-                    KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+                    KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End => {
                         self.snap_note = None;
                         self.snap_sel = match key.code {
                             KeyCode::Up => self.snap_sel.saturating_sub(1),
@@ -1481,7 +1881,13 @@ impl App {
                         .min(n.saturating_sub(1));
                     }
                     KeyCode::Enter => match sel {
-                        Some(m) if m.status.is_usable() => return Some(self.open_browse(BrowseSource::Snapshot(m.id), None, None)),
+                        Some(m) if m.status.is_usable() => {
+                            return Some(self.open_browse(
+                                BrowseSource::Snapshot(m.id),
+                                None,
+                                None,
+                            ));
+                        }
                         Some(m) => self.snap_note = Some(unusable(&m)),
                         None => {}
                     },
@@ -1489,8 +1895,19 @@ impl App {
                         Some(m) if m.status.is_usable() => {
                             // The selected snapshot against the previous comparable one.
                             match self.previous_comparable(&m).map(|p| p.id) {
-                                Some(old) => return Some(self.open_browse(BrowseSource::Diff { old, new: m.id }, None, None)),
-                                None => self.snap_note = Some(format!("No earlier scan of {} to compare #{} with.", m.root, m.id)),
+                                Some(old) => {
+                                    return Some(self.open_browse(
+                                        BrowseSource::Diff { old, new: m.id },
+                                        None,
+                                        None,
+                                    ));
+                                }
+                                None => {
+                                    self.snap_note = Some(format!(
+                                        "No earlier scan of {} to compare #{} with.",
+                                        m.root, m.id
+                                    ))
+                                }
                             }
                         }
                         Some(m) => self.snap_note = Some(unusable(&m)),
@@ -1503,7 +1920,11 @@ impl App {
                     }
                     KeyCode::Char('t') => match sel {
                         Some(m) if m.status.is_usable() => {
-                            let pos = self.usable().iter().position(|r| r.meta.id == m.id).unwrap_or(0);
+                            let pos = self
+                                .usable()
+                                .iter()
+                                .position(|r| r.meta.id == m.id)
+                                .unwrap_or(0);
                             self.screen = Screen::Top;
                             self.menu_index = MENU.iter().position(|item| matches!(item, MenuItem::Screen(candidate) if *candidate == Screen::Top)).unwrap();
                             self.top.snapshot = pos;
@@ -1555,7 +1976,10 @@ impl App {
         }
         let metas: Vec<&SnapshotMeta> = self.usable().iter().map(|r| &r.meta).collect();
         match latest_pair(&metas) {
-            Some(pair) if matches!(self.diff.result, Job::Idle) || pair != (self.diff.old, self.diff.new) => {
+            Some(pair)
+                if matches!(self.diff.result, Job::Idle)
+                    || pair != (self.diff.old, self.diff.new) =>
+            {
                 (self.diff.old, self.diff.new) = pair;
                 self.diff.focus = DiffFocus::Results;
                 self.run_diff()
@@ -1567,9 +1991,13 @@ impl App {
     /// Whether row `i` of the picker can be chosen in the current step.
     pub fn diff_choosable(&self, i: usize) -> bool {
         let usable = self.usable();
-        let Some(m) = usable.get(i).map(|r| &r.meta) else { return false };
+        let Some(m) = usable.get(i).map(|r| &r.meta) else {
+            return false;
+        };
         match self.diff.focus {
-            DiffFocus::PickNew => usable.get(self.diff.old).is_some_and(|o| comparable(&o.meta, m)),
+            DiffFocus::PickNew => usable
+                .get(self.diff.old)
+                .is_some_and(|o| comparable(&o.meta, m)),
             _ => usable[i + 1..].iter().any(|r| comparable(m, &r.meta)),
         }
     }
@@ -1582,14 +2010,27 @@ impl App {
     fn diff_key(&mut self, key: KeyEvent) -> Option<Vec<Command>> {
         let n = self.usable().len();
         match (self.diff.focus, key.code) {
-            (DiffFocus::PickOld | DiffFocus::PickNew, KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown) => {
+            (
+                DiffFocus::PickOld | DiffFocus::PickNew,
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::PageUp
+                | KeyCode::PageDown,
+            ) => {
                 let c = self.diff.cursor;
                 // Move to the nearest row that can be chosen, skipping greyed ones.
                 let next = match key.code {
                     KeyCode::Up => (0..c).rev().find(|&i| self.diff_choosable(i)),
                     KeyCode::Down => (c + 1..n).find(|&i| self.diff_choosable(i)),
-                    KeyCode::PageUp => (0..c.saturating_sub(9)).rev().find(|&i| self.diff_choosable(i)).or_else(|| (0..c).find(|&i| self.diff_choosable(i))),
-                    KeyCode::PageDown => (c + 10..n).find(|&i| self.diff_choosable(i)).or_else(|| (c + 1..n).rev().find(|&i| self.diff_choosable(i))),
+                    KeyCode::PageUp => (0..c.saturating_sub(9))
+                        .rev()
+                        .find(|&i| self.diff_choosable(i))
+                        .or_else(|| (0..c).find(|&i| self.diff_choosable(i))),
+                    KeyCode::PageDown => (c + 10..n)
+                        .find(|&i| self.diff_choosable(i))
+                        .or_else(|| (c + 1..n).rev().find(|&i| self.diff_choosable(i))),
                     KeyCode::Home => (0..n).find(|&i| self.diff_choosable(i)),
                     _ => (0..n).rev().find(|&i| self.diff_choosable(i)),
                 };
@@ -1621,11 +2062,17 @@ impl App {
                 self.diff.cursor = self.diff.old;
             }
             // Back to the comparison on screen, if there is one.
-            (DiffFocus::PickOld, KeyCode::Esc | KeyCode::Left | KeyCode::Backspace) if !matches!(self.diff.result, Job::Idle) => {
+            (DiffFocus::PickOld, KeyCode::Esc | KeyCode::Left | KeyCode::Backspace)
+                if !matches!(self.diff.result, Job::Idle) =>
+            {
                 self.diff.focus = DiffFocus::Results;
             }
             (DiffFocus::PickOld | DiffFocus::PickNew, _) => return None,
-            (_, KeyCode::Char('p') | KeyCode::Char('b')) | (DiffFocus::Header, KeyCode::Enter) if n >= 2 => self.diff_pick(),
+            (_, KeyCode::Char('p') | KeyCode::Char('b')) | (DiffFocus::Header, KeyCode::Enter)
+                if n >= 2 =>
+            {
+                self.diff_pick()
+            }
             (DiffFocus::Header, KeyCode::Down) => self.diff.focus = DiffFocus::Results,
             (DiffFocus::Header, KeyCode::Up) => {}
             (DiffFocus::Header | DiffFocus::Results, KeyCode::Right | KeyCode::Tab) => {
@@ -1641,12 +2088,25 @@ impl App {
                 self.scroll = 0;
             }
             // ↑ at the top of the results moves up to the scans being compared.
-            (DiffFocus::Results, KeyCode::Up) if n >= 2 && (if self.diff.tab == DiffTab::Summary { self.scroll == 0 } else { self.diff.sel == 0 }) => {
+            (DiffFocus::Results, KeyCode::Up)
+                if n >= 2
+                    && (if self.diff.tab == DiffTab::Summary {
+                        self.scroll == 0
+                    } else {
+                        self.diff.sel == 0
+                    }) =>
+            {
                 self.diff.focus = DiffFocus::Header;
             }
-            (DiffFocus::Results, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End)
-                if self.diff.tab != DiffTab::Summary =>
-            {
+            (
+                DiffFocus::Results,
+                KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End,
+            ) if self.diff.tab != DiffTab::Summary => {
                 let n = self.diff_items().len();
                 let d = &mut self.diff;
                 d.sel = match key.code {
@@ -1661,14 +2121,19 @@ impl App {
             }
             (DiffFocus::Results, KeyCode::Enter) => {
                 let d = &self.diff;
-                let Some(r) = d.result.done() else { return Some(Vec::new()) };
-                let source = BrowseSource::Diff { old: r.old.id, new: r.new.id };
+                let Some(r) = d.result.done() else {
+                    return Some(Vec::new());
+                };
+                let source = BrowseSource::Diff {
+                    old: r.old.id,
+                    new: r.new.id,
+                };
                 let target = if d.tab == DiffTab::Summary {
                     Some((r.path.clone(), None))
                 } else {
-                    self.diff_items().get(self.diff.sel).map(|i| {
-                        let (p, sel) = open_target(&i.path, i.is_dir);
-                        (Some(p), sel)
+                    self.diff_items().get(self.diff.sel).and_then(|i| {
+                        let (p, sel) = open_target(&i.path, i.is_dir)?;
+                        Some((Some(p), sel))
                     })
                 };
                 return Some(match target {
@@ -1676,13 +2141,20 @@ impl App {
                     None => Vec::new(),
                 });
             }
-            (DiffFocus::Header | DiffFocus::Results, KeyCode::Char('o')) if self.diff.result.done().is_some() => {
+            (DiffFocus::Header | DiffFocus::Results, KeyCode::Char('o'))
+                if self.diff.result.done().is_some() =>
+            {
                 let i = SORTS.iter().position(|s| *s == self.diff.sort).unwrap();
                 self.diff.sort = SORTS[(i + 1) % SORTS.len()];
                 return Some(self.run_diff());
             }
-            (DiffFocus::Header | DiffFocus::Results, KeyCode::Char('f')) if self.diff.result.done().is_some() => {
-                let i = MIN_SIZES.iter().position(|s| *s == self.diff.min_size).unwrap_or(0);
+            (DiffFocus::Header | DiffFocus::Results, KeyCode::Char('f'))
+                if self.diff.result.done().is_some() =>
+            {
+                let i = MIN_SIZES
+                    .iter()
+                    .position(|s| *s == self.diff.min_size)
+                    .unwrap_or(0);
                 self.diff.min_size = MIN_SIZES[(i + 1) % MIN_SIZES.len()];
                 return Some(self.run_diff());
             }
@@ -1694,7 +2166,10 @@ impl App {
     /// Opening Largest files: the newest scan, until the user picks one.
     fn top_latest(&mut self) -> Vec<Command> {
         let n = self.usable().len();
-        if n == 0 || self.top.focus == TopFocus::Pick || (self.top.chosen && !matches!(self.top.result, Job::Idle)) {
+        if n == 0
+            || self.top.focus == TopFocus::Pick
+            || (self.top.chosen && !matches!(self.top.result, Job::Idle))
+        {
             return Vec::new();
         }
         if matches!(self.top.result, Job::Idle) || self.top.snapshot != n - 1 {
@@ -1706,7 +2181,18 @@ impl App {
 
     fn top_key(&mut self, key: KeyEvent) -> Option<Vec<Command>> {
         let n = self.usable().len();
-        let items = |t: &TopUi| t.result.done().map(|r| if t.view == TopView::Dirs { r.report.dirs.len() } else { r.report.files.len() }).unwrap_or(0);
+        let items = |t: &TopUi| {
+            t.result
+                .done()
+                .map(|r| {
+                    if t.view == TopView::Dirs {
+                        r.report.dirs.len()
+                    } else {
+                        r.report.files.len()
+                    }
+                })
+                .unwrap_or(0)
+        };
         let rows = items(&self.top);
         let t = &mut self.top;
         if t.focus == TopFocus::Pick {
@@ -1732,12 +2218,18 @@ impl App {
         }
         match key.code {
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
-                t.view = if t.view == TopView::Dirs { TopView::Files } else { TopView::Dirs };
+                t.view = if t.view == TopView::Dirs {
+                    TopView::Files
+                } else {
+                    TopView::Dirs
+                };
                 t.sel = 0;
                 self.scroll = 0;
                 Some(Vec::new())
             }
-            KeyCode::Char('p') | KeyCode::Enter if n > 0 && (key.code != KeyCode::Enter || t.focus == TopFocus::Header) => {
+            KeyCode::Char('p') | KeyCode::Enter
+                if n > 0 && (key.code != KeyCode::Enter || t.focus == TopFocus::Header) =>
+            {
                 t.focus = TopFocus::Pick;
                 t.cursor = t.snapshot;
                 Some(Vec::new())
@@ -1753,24 +2245,41 @@ impl App {
                 Some(Vec::new())
             }
             KeyCode::Up | KeyCode::PageUp => {
-                t.sel = t.sel.saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
+                t.sel = t
+                    .sel
+                    .saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
                 Some(Vec::new())
             }
             KeyCode::Down | KeyCode::PageDown => {
-                t.sel = (t.sel + if key.code == KeyCode::Down { 1 } else { 10 }).min(rows.saturating_sub(1));
+                t.sel = (t.sel + if key.code == KeyCode::Down { 1 } else { 10 })
+                    .min(rows.saturating_sub(1));
                 Some(Vec::new())
             }
             KeyCode::Home | KeyCode::End => {
-                t.sel = if key.code == KeyCode::Home { 0 } else { rows.saturating_sub(1) };
+                t.sel = if key.code == KeyCode::Home {
+                    0
+                } else {
+                    rows.saturating_sub(1)
+                };
                 Some(Vec::new())
             }
             KeyCode::Enter => {
-                let Some(r) = t.result.done() else { return Some(Vec::new()) };
-                let list = if t.view == TopView::Dirs { &r.report.dirs } else { &r.report.files };
-                let target = list.get(t.sel).map(|i| open_target(&i.path, i.kind == diskdrift_app::core::record::Kind::Dir));
+                let Some(r) = t.result.done() else {
+                    return Some(Vec::new());
+                };
+                let list = if t.view == TopView::Dirs {
+                    &r.report.dirs
+                } else {
+                    &r.report.files
+                };
+                let target = list.get(t.sel).and_then(|i| {
+                    open_target(&i.path, i.kind == diskdrift_app::core::record::Kind::Dir)
+                });
                 let id = r.snapshot.id;
                 Some(match target {
-                    Some((path, select)) => self.open_browse(BrowseSource::Snapshot(id), Some(path), select),
+                    Some((path, select)) => {
+                        self.open_browse(BrowseSource::Snapshot(id), Some(path), select)
+                    }
                     None => Vec::new(),
                 })
             }
@@ -1799,7 +2308,9 @@ impl App {
                 ui.message = None;
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                let Ok(file) = &ui.file else { return Some(Vec::new()) };
+                let Ok(file) = &ui.file else {
+                    return Some(Vec::new());
+                };
                 match field.next(file) {
                     Some(v) => return Some(self.save_setting(field, v)),
                     None => ui.edit = Some(field.get(file)),
@@ -1812,7 +2323,9 @@ impl App {
 
     fn settings_edit_key(&mut self, key: KeyEvent) -> Vec<Command> {
         let ui = &mut self.settings_ui;
-        let Some(text) = ui.edit.as_mut() else { return Vec::new() };
+        let Some(text) = ui.edit.as_mut() else {
+            return Vec::new();
+        };
         match key.code {
             KeyCode::Esc => {
                 ui.edit = None;
@@ -1842,7 +2355,9 @@ impl App {
 
     /// Sets one field, writes the config file and applies the result.
     fn save_setting(&mut self, field: Field, value: String) -> Vec<Command> {
-        let Ok(file) = &self.settings_ui.file else { return Vec::new() };
+        let Ok(file) = &self.settings_ui.file else {
+            return Vec::new();
+        };
         let mut cfg = file.clone();
         let path = self.settings.config_path.value.clone();
         let saved = field
@@ -1853,9 +2368,18 @@ impl App {
         match saved {
             Ok(effective) => {
                 ui.file = Ok(cfg);
-                let note = if field.overridden(&effective) { " A command-line flag overrides it this session." } else { "" };
-                ui.message = Some(Ok(format!("Saved: {} = {}.{note}", field.label, field.display(ui.file.as_ref().unwrap()))));
-                let store_changed = effective.storage_path.value != self.settings.storage_path.value;
+                let note = if field.overridden(&effective) {
+                    " A command-line flag overrides it this session."
+                } else {
+                    ""
+                };
+                ui.message = Some(Ok(format!(
+                    "Saved: {} = {}.{note}",
+                    field.label,
+                    field.display(ui.file.as_ref().unwrap())
+                )));
+                let store_changed =
+                    effective.storage_path.value != self.settings.storage_path.value;
                 self.settings = effective;
                 if store_changed {
                     self.snapshots = Job::Running("loading snapshots…".into());
@@ -1871,8 +2395,19 @@ impl App {
     }
 
     fn scan_setup_key(&mut self, key: KeyEvent) -> Vec<Command> {
-        let ScanStage::Setup { root, name, field, error } = &mut self.scan else { return Vec::new() };
-        if !matches!(key.code, KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down) {
+        let ScanStage::Setup {
+            root,
+            name,
+            field,
+            error,
+        } = &mut self.scan
+        else {
+            return Vec::new();
+        };
+        if !matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
+        ) {
             *error = None;
         }
         match key.code {
@@ -1881,18 +2416,34 @@ impl App {
                 self.scroll = 0;
             }
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                *field = if *field == ScanField::Root { ScanField::Name } else { ScanField::Root };
+                *field = if *field == ScanField::Root {
+                    ScanField::Name
+                } else {
+                    ScanField::Root
+                };
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let s = if *field == ScanField::Root { root } else { name };
+                let s = if *field == ScanField::Root {
+                    root
+                } else {
+                    name
+                };
                 s.clear();
             }
             KeyCode::Backspace => {
-                let s = if *field == ScanField::Root { root } else { name };
+                let s = if *field == ScanField::Root {
+                    root
+                } else {
+                    name
+                };
                 s.pop();
             }
             KeyCode::Char(c) => {
-                let s = if *field == ScanField::Root { root } else { name };
+                let s = if *field == ScanField::Root {
+                    root
+                } else {
+                    name
+                };
                 if s.chars().count() < 4096 {
                     s.push(c);
                 }
@@ -1923,26 +2474,50 @@ impl App {
         self.start_scan_with(root, name, None)
     }
 
-    fn start_scan_with(&mut self, root: String, name: String, disk: Option<DiskChoice>) -> Vec<Command> {
+    fn start_scan_with(
+        &mut self,
+        root: String,
+        name: String,
+        disk: Option<DiskChoice>,
+    ) -> Vec<Command> {
         if let Some(job) = &self.store_job {
             let why = format!("The store is busy ({job}); scan when it has finished.");
             self.new_scan_form(Some(why));
             return Vec::new();
         }
         let progress = Arc::new(Progress::default());
-        let expected = self.last_scan_of(&root).and_then(|m| m.counts).map(|c| c.entries);
+        let expected = self
+            .last_scan_of(&root)
+            .and_then(|m| m.counts)
+            .map(|c| c.entries);
         self.last_root = Some(root.clone());
         self.scan_request = Some((root.clone(), name.clone()));
-        self.scan = ScanStage::Running { progress, started: Instant::now(), root: root.clone(), auto: false, expected };
-        vec![Command::StartScan { root, name: if name.is_empty() { None } else { Some(name) }, background: false, disk }]
+        self.scan = ScanStage::Running {
+            progress,
+            started: Instant::now(),
+            root: root.clone(),
+            auto: false,
+            expected,
+        };
+        vec![Command::StartScan {
+            root,
+            name: if name.is_empty() { None } else { Some(name) },
+            background: false,
+            disk,
+        }]
     }
 
     /// A new scan offers the folder of the last one again (or, with History
     /// filtered to a disk, the folder last scanned on it); a failed one says why.
     fn new_scan_form(&mut self, error: Option<String>) {
         let mut form = initial_scan(&self.settings);
-        let disk_root = self.disk_filter.as_ref().and(self.usable().last().map(|r| r.meta.root.clone()));
-        if let (ScanStage::Setup { root, error: e, .. }, Some(last)) = (&mut form, disk_root.or_else(|| self.last_root.clone())) {
+        let disk_root = self
+            .disk_filter
+            .as_ref()
+            .and(self.usable().last().map(|r| r.meta.root.clone()));
+        if let (ScanStage::Setup { root, error: e, .. }, Some(last)) =
+            (&mut form, disk_root.or_else(|| self.last_root.clone()))
+        {
             *root = last;
             *e = error;
         }
@@ -1962,12 +2537,19 @@ impl App {
         if self.auto_checked || self.scan_running() {
             return Vec::new();
         }
-        let Some(list) = self.snapshots.done() else { return Vec::new() };
+        let Some(list) = self.snapshots.done() else {
+            return Vec::new();
+        };
         self.auto_checked = true;
         match snapshots::auto_scan(&self.settings, list, chrono::Local::now().timestamp()) {
-            AutoScan::Start { root, name, expected_entries } => {
+            AutoScan::Start {
+                root,
+                name,
+                expected_entries,
+            } => {
                 let root = root.display().to_string();
-                self.auto_status = Some(format!("scanning {root} in the background (low priority)"));
+                self.auto_status =
+                    Some(format!("scanning {root} in the background (low priority)"));
                 self.scan = ScanStage::Running {
                     progress: Arc::default(),
                     started: Instant::now(),
@@ -1975,7 +2557,12 @@ impl App {
                     auto: true,
                     expected: expected_entries,
                 };
-                vec![Command::StartScan { root, name: Some(name), background: true, disk: None }]
+                vec![Command::StartScan {
+                    root,
+                    name: Some(name),
+                    background: true,
+                    disk: None,
+                }]
             }
             AutoScan::Skip(why) => {
                 self.auto_status = Some(format!("no background scan: {why}"));
@@ -1999,15 +2586,23 @@ impl App {
 
     /// The latest disk event happened in the last minute (the header shows it).
     pub fn disk_event_is_recent(&self) -> bool {
-        self.disk_event_at.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
+        self.disk_event_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60))
     }
 
     /// The disk of snapshot `id` is mounted now. When it cannot be told (no
     /// disk recorded, the disk list not read yet), it counts as connected, so
     /// nothing is blocked on a guess.
     fn disk_connected_now(&self, id: u64) -> bool {
-        let disk = self.snapshots.done().and_then(|l| l.snapshots.iter().find(|r| r.meta.id == id)).and_then(|r| r.meta.disk.clone());
-        let row = self.disks.list.done().and_then(|l| disk.and_then(|d| l.disks.iter().find(|r| r.known && r.disk.id == d)).cloned());
+        let disk = self
+            .snapshots
+            .done()
+            .and_then(|l| l.snapshots.iter().find(|r| r.meta.id == id))
+            .and_then(|r| r.meta.disk.clone());
+        let row = self.disks.list.done().and_then(|l| {
+            disk.and_then(|d| l.disks.iter().find(|r| r.known && r.disk.id == d))
+                .cloned()
+        });
         row.is_none_or(|r| r.connected)
     }
 
@@ -2016,7 +2611,11 @@ impl App {
         self.disks
             .list
             .done()
-            .and_then(|l| l.disks.iter().find(|r| r.disk.identity == v.identity && r.known))
+            .and_then(|l| {
+                l.disks
+                    .iter()
+                    .find(|r| r.disk.identity == v.identity && r.known)
+            })
             .map(|r| r.disk.display_name().to_string())
             .or_else(|| v.name.clone())
             .unwrap_or_else(|| v.mount_point.display().to_string())
@@ -2024,15 +2623,23 @@ impl App {
 
     /// The mounts changed: new volumes are looked at, gone ones noted. The
     /// first list is the baseline (what is mounted at start is not "connected").
-    fn volumes_changed(&mut self, now: Vec<Volume>) -> Vec<Command> {
+    fn volumes_changed(&mut self, inventory: VolumeInventory) -> Vec<Command> {
+        let now = inventory.volumes;
+        self.mount_errors = inventory.errors;
         let before = self.volumes.replace(now.clone());
         let mut cmds = Vec::new();
         if let Some(before) = before {
-            for v in before.iter().filter(|v| !now.iter().any(|n| n.identity == v.identity)) {
+            for v in before
+                .iter()
+                .filter(|v| !now.iter().any(|n| n.identity == v.identity))
+            {
                 let name = self.volume_name(v);
                 self.note_disk(format!("{name} disconnected; its scans stay browsable"));
             }
-            for v in now.iter().filter(|v| !before.iter().any(|b| b.identity == v.identity)) {
+            for v in now
+                .iter()
+                .filter(|v| !before.iter().any(|b| b.identity == v.identity))
+            {
                 cmds.push(Command::DiskConnected(v.clone()));
             }
         }
@@ -2044,19 +2651,32 @@ impl App {
     }
 
     /// What to do about a volume just connected (decided by the app layer).
-    fn disk_connected(&mut self, volume: Volume, action: Result<ConnectAction, String>) -> Vec<Command> {
+    fn disk_connected(
+        &mut self,
+        volume: Volume,
+        action: Result<ConnectAction, String>,
+    ) -> Vec<Command> {
         let ago = |rfc: &str| {
             chrono::DateTime::parse_from_rfc3339(rfc)
-                .map(|t| diskdrift_app::analyze::ago(chrono::Local::now().timestamp() - t.timestamp()))
+                .map(|t| {
+                    diskdrift_app::analyze::ago(chrono::Local::now().timestamp() - t.timestamp())
+                })
                 .unwrap_or_else(|_| rfc.to_string())
         };
-        let shown = action.as_ref().ok().and_then(|a| a.disk()).map(|d| d.display_name().to_string()).unwrap_or_else(|| self.volume_name(&volume));
+        let shown = action
+            .as_ref()
+            .ok()
+            .and_then(|a| a.disk())
+            .map(|d| d.display_name().to_string())
+            .unwrap_or_else(|| self.volume_name(&volume));
         let at = volume.mount_point.display();
         match action {
-            Ok(ConnectAction::Rescan { .. }) if self.careful.is_on() => {
-                self.note_disk(format!("{shown} mounted at {at}; careful mode is on, so it is not rescanned"))
-            }
-            Ok(ConnectAction::Rescan { root, last_scan, .. }) => {
+            Ok(ConnectAction::Rescan { .. }) if self.careful.is_on() => self.note_disk(format!(
+                "{shown} mounted at {at}; careful mode is on, so it is not rescanned"
+            )),
+            Ok(ConnectAction::Rescan {
+                root, last_scan, ..
+            }) => {
                 let root = root.display().to_string();
                 if !self.can_scan_in_background() {
                     self.note_disk(format!("{shown} connected (last scanned {}); it is rescanned as soon as the scan screen is free", ago(&last_scan)));
@@ -2066,14 +2686,25 @@ impl App {
                 self.note_disk(format!("{shown} connected (last scanned {}): rescanning it to see what changed (x stops)", ago(&last_scan)));
                 return self.start_connect_scan(shown, root);
             }
-            Ok(ConnectAction::Recent { last_scan, .. }) => self.note_disk(format!("{shown} connected at {at}; scanned {}, no rescan needed", ago(&last_scan))),
-            Ok(ConnectAction::Off { .. }) => self.note_disk(format!("{shown} connected at {at}; rescanning on connect is off (Settings)")),
-            Ok(ConnectAction::New { disk: None }) => {
-                self.note_disk(format!("new disk {shown} connected at {at}: K to give it a label or make its first scan"))
-            }
-            Ok(ConnectAction::New { disk: Some(_) }) => self.note_disk(format!("{shown} connected at {at}; it has no scan yet: K, then g, scans it")),
-            Ok(ConnectAction::Doubt { message }) => self.note_disk(format!("{message} Scan it with S: DiskDrift asks which disk it is.")),
-            Err(e) => self.note_disk(format!("{shown} connected at {at}; cannot read the store: {e}")),
+            Ok(ConnectAction::Recent { last_scan, .. }) => self.note_disk(format!(
+                "{shown} connected at {at}; scanned {}, no rescan needed",
+                ago(&last_scan)
+            )),
+            Ok(ConnectAction::Off { .. }) => self.note_disk(format!(
+                "{shown} connected at {at}; rescanning on connect is off (Settings)"
+            )),
+            Ok(ConnectAction::New { disk: None }) => self.note_disk(format!(
+                "new disk {shown} connected at {at}: K to give it a label or make its first scan"
+            )),
+            Ok(ConnectAction::New { disk: Some(_) }) => self.note_disk(format!(
+                "{shown} connected at {at}; it has no scan yet: K, then g, scans it"
+            )),
+            Ok(ConnectAction::Doubt { message }) => self.note_disk(format!(
+                "{message} Scan it with S: DiskDrift asks which disk it is."
+            )),
+            Err(e) => self.note_disk(format!(
+                "{shown} connected at {at}; cannot read the store: {e}"
+            )),
         }
         Vec::new()
     }
@@ -2081,17 +2712,33 @@ impl App {
     /// Rescans a connected disk like the background scan at start (low
     /// priority, `x` stops it).
     fn start_connect_scan(&mut self, disk: String, root: String) -> Vec<Command> {
-        let expected = self.last_scan_of(&root).and_then(|m| m.counts).map(|c| c.entries);
+        let expected = self
+            .last_scan_of(&root)
+            .and_then(|m| m.counts)
+            .map(|c| c.entries);
         self.connect_scan = Some(disk);
         self.scan_request = Some((root.clone(), String::new()));
-        self.scan = ScanStage::Running { progress: Arc::default(), started: Instant::now(), root: root.clone(), auto: true, expected };
-        vec![Command::StartScan { root, name: Some(format!("auto-{}", snapshots::default_name())), background: true, disk: None }]
+        self.scan = ScanStage::Running {
+            progress: Arc::default(),
+            started: Instant::now(),
+            root: root.clone(),
+            auto: true,
+            expected,
+        };
+        vec![Command::StartScan {
+            root,
+            name: Some(format!("auto-{}", snapshots::default_name())),
+            background: true,
+            disk: None,
+        }]
     }
 
     /// A background scan may take the scan slot: nothing runs, and the scan
     /// screen is not showing a result, a question or a form being filled in.
     fn can_scan_in_background(&self) -> bool {
-        matches!(self.scan, ScanStage::Setup { .. }) && self.screen != Screen::Scan && self.store_job.is_none()
+        matches!(self.scan, ScanStage::Setup { .. })
+            && self.screen != Screen::Scan
+            && self.store_job.is_none()
     }
 
     /// Called by the event loop on every turn: starts a waiting rescan of a
@@ -2118,14 +2765,22 @@ impl App {
     /// disk History is filtered to).
     fn previous_in_store(&self, m: &SnapshotMeta) -> Option<SnapshotMeta> {
         let l = self.snapshots.done()?;
-        let metas: Vec<&SnapshotMeta> = l.snapshots.iter().map(|r| &r.meta).filter(|x| x.status.is_usable()).collect();
+        let metas: Vec<&SnapshotMeta> = l
+            .snapshots
+            .iter()
+            .map(|r| &r.meta)
+            .filter(|x| x.status.is_usable())
+            .collect();
         snapshots::previous_comparable(&metas, m).cloned()
     }
 
     /// History's cursor on the newest scan with data it lists.
     fn snap_sel_newest(&mut self) {
         let rows = self.history();
-        self.snap_sel = rows.iter().rposition(|r| r.meta.status.is_usable()).unwrap_or(rows.len().saturating_sub(1));
+        self.snap_sel = rows
+            .iter()
+            .rposition(|r| r.meta.status.is_usable())
+            .unwrap_or(rows.len().saturating_sub(1));
     }
 
     /// Filters History (and with it Compare, Largest files and the scan form)
@@ -2147,7 +2802,10 @@ impl App {
 
     /// The disk under the cursor on My disks.
     pub fn selected_disk(&self) -> Option<&disks::DiskRow> {
-        self.disks.list.done().and_then(|l| l.disks.get(self.disks.sel))
+        self.disks
+            .list
+            .done()
+            .and_then(|l| l.disks.get(self.disks.sel))
     }
 
     pub fn careful_selected(&self) -> Option<&Held> {
@@ -2196,7 +2854,14 @@ impl App {
             KeyCode::Down if ui.sel + 1 < ui.held.len() => ui.sel += 1,
             KeyCode::Char('g') | KeyCode::Enter => {
                 let Some(h) = self.careful_selected().cloned() else {
-                    self.careful.log(if self.careful.is_on() { "no disk held back: connect one" } else { "careful mode is off: o turns it on" }.into());
+                    self.careful.log(
+                        if self.careful.is_on() {
+                            "no disk held back: connect one"
+                        } else {
+                            "careful mode is off: o turns it on"
+                        }
+                        .into(),
+                    );
                     return Some(Vec::new());
                 };
                 if self.careful.running.is_some() || self.scan_running() {
@@ -2211,13 +2876,25 @@ impl App {
                 return Some(self.start_careful_scan(h.bsd().to_string(), None));
             }
             KeyCode::Char(c @ ('m' | 'j')) => {
-                let Some(h) = self.careful_selected().cloned() else { return Some(Vec::new()) };
-                if self.careful.running.as_ref().is_some_and(|r| r.0 == h.bsd()) {
-                    self.careful.log("it is being scanned: x stops the scan, then it is ejected".into());
+                let Some(h) = self.careful_selected().cloned() else {
+                    return Some(Vec::new());
+                };
+                if self
+                    .careful
+                    .running
+                    .as_ref()
+                    .is_some_and(|r| r.0 == h.bsd())
+                {
+                    self.careful
+                        .log("it is being scanned: x stops the scan, then it is ejected".into());
                     return Some(Vec::new());
                 }
                 let bsd = h.bsd().to_string();
-                return Some(vec![if c == 'm' { Command::CarefulMount { bsd } } else { Command::CarefulEject { bsd } }]);
+                return Some(vec![if c == 'm' {
+                    Command::CarefulMount { bsd }
+                } else {
+                    Command::CarefulEject { bsd }
+                }]);
             }
             _ => return None,
         }
@@ -2225,7 +2902,13 @@ impl App {
     }
 
     fn start_careful_scan(&mut self, bsd: String, choice: Option<DiskChoice>) -> Vec<Command> {
-        let name = self.careful.held.iter().find(|h| h.bsd() == bsd).map(|h| h.name()).unwrap_or_else(|| bsd.clone());
+        let name = self
+            .careful
+            .held
+            .iter()
+            .find(|h| h.bsd() == bsd)
+            .map(|h| h.name())
+            .unwrap_or_else(|| bsd.clone());
         self.careful.log(format!("{name}: mounting it read-only and scanning with one thread (x stops; it is ejected afterwards)"));
         self.careful.running = Some((bsd.clone(), Arc::default(), Instant::now()));
         vec![Command::CarefulScan { bsd, choice }]
@@ -2240,7 +2923,8 @@ impl App {
     fn start_find(&mut self) -> Vec<Command> {
         let pattern = self.find.input.trim().to_string();
         if pattern.is_empty() {
-            self.find.note = Some("type a part of a name, a glob (*.pdf) or re:regex, then Enter".into());
+            self.find.note =
+                Some("type a part of a name, a glob (*.pdf) or re:regex, then Enter".into());
             return Vec::new();
         }
         let (disk, set) = match &self.disk_filter {
@@ -2248,7 +2932,12 @@ impl App {
             Some(f) => (f.ids.first().cloned(), None),
             None => (None, None),
         };
-        let query = Query { disk: disk.clone(), set: set.clone(), limit: FIND_LIMIT, ..Query::new(&pattern) };
+        let query = Query {
+            disk: disk.clone(),
+            set: set.clone(),
+            limit: FIND_LIMIT,
+            ..Query::new(&pattern)
+        };
         if let Err(e) = diskdrift_app::search::Matcher::new(&query) {
             self.find.note = Some(e.to_string());
             return Vec::new();
@@ -2261,7 +2950,15 @@ impl App {
         self.find.sel = 0;
         self.find.editing = false;
         self.find.note = None;
-        vec![Command::CancelFind, Command::RunFind { id: self.find.id, pattern, disk, set }]
+        vec![
+            Command::CancelFind,
+            Command::RunFind {
+                id: self.find.id,
+                pattern,
+                disk,
+                set,
+            },
+        ]
     }
 
     fn start_find_history(&mut self, always: bool) -> Vec<Command> {
@@ -2270,7 +2967,10 @@ impl App {
         }
         self.find.history = Job::Running("searching the history…".into());
         self.find.progress = None;
-        vec![Command::RunFindHistory { id: self.find.id, always }]
+        vec![Command::RunFindHistory {
+            id: self.find.id,
+            always,
+        }]
     }
 
     fn stop_find_history(&mut self) -> Vec<Command> {
@@ -2279,15 +2979,27 @@ impl App {
     }
 
     fn find_rows(&self) -> usize {
-        self.find.current.done().map(|c| c.hits.len()).unwrap_or(0) + self.find.history.done().map(|h| h.gone.len()).unwrap_or(0)
+        self.find.current.done().map(|c| c.hits.len()).unwrap_or(0)
+            + self.find.history.done().map(|h| h.gone.len()).unwrap_or(0)
     }
 
     /// The result under the cursor.
     pub fn find_selected(&self) -> Option<FindRow<'_>> {
-        let now = self.find.current.done().map(|c| c.hits.as_slice()).unwrap_or_default();
+        let now = self
+            .find
+            .current
+            .done()
+            .map(|c| c.hits.as_slice())
+            .unwrap_or_default();
         match now.get(self.find.sel) {
             Some(h) => Some(FindRow::Now(h)),
-            None => self.find.history.done()?.gone.get(self.find.sel - now.len()).map(FindRow::Gone),
+            None => self
+                .find
+                .history
+                .done()?
+                .gone
+                .get(self.find.sel - now.len())
+                .map(FindRow::Gone),
         }
     }
 
@@ -2303,7 +3015,11 @@ impl App {
             KeyCode::Backspace => {
                 text.pop();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && text.chars().count() < 512 => text.push(c),
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && text.chars().count() < 512 =>
+            {
+                text.push(c)
+            }
             KeyCode::Enter => return self.start_find(),
             KeyCode::Tab | KeyCode::Down if self.find_rows() > 0 => self.find.editing = false,
             _ => {}
@@ -2324,7 +3040,8 @@ impl App {
             KeyCode::Enter => return Some(self.find_open()),
             KeyCode::Char('p') => {
                 if self.find.history.done().is_some() {
-                    self.find.note = Some("the history is searched already (F5 searches again)".into());
+                    self.find.note =
+                        Some("the history is searched already (F5 searches again)".into());
                 }
                 return Some(self.start_find_history(true));
             }
@@ -2343,15 +3060,26 @@ impl App {
                 let note = (!h.place.connected).then(|| {
                     format!("{} is not connected: this is scan #{}; connect the disk to get at the file.", h.place.disk_name, h.scan.id)
                 });
-                (h.scan.id, h.path.0.clone(), h.kind == Kind::Dir, note)
+                (h.scan.id, h.path.clone(), h.kind == Kind::Dir, note)
             }
             Some(FindRow::Gone(l)) => {
-                let gone = l.gone_in.as_ref().map(|g| format!(" It is not in scan #{}.", g.id)).unwrap_or_default();
+                let gone = l
+                    .gone_in
+                    .as_ref()
+                    .map(|g| format!(" It is not in scan #{}.", g.id))
+                    .unwrap_or_default();
                 let note = format!("Scan #{}, the last one that has it.{gone}", l.last_seen.id);
-                (l.last_seen.id, l.path.0.clone(), l.kind == Kind::Dir, Some(note))
+                (
+                    l.last_seen.id,
+                    l.path.clone(),
+                    l.kind == Kind::Dir,
+                    Some(note),
+                )
             }
         };
-        let (folder, select) = open_target(&path, dir);
+        let Some((folder, select)) = open_target(&path, dir) else {
+            return Vec::new();
+        };
         let cmds = self.open_browse(BrowseSource::Snapshot(scan), Some(folder), select);
         if let Some(b) = self.browse.as_mut() {
             b.note = note;
@@ -2381,21 +3109,32 @@ impl App {
         if self.store_job.is_some() {
             return match key.code {
                 KeyCode::Char('x') => Some(vec![Command::CancelStoreJob]),
-                KeyCode::Char(' ') | KeyCode::Char('o') | KeyCode::Char('n') | KeyCode::Char('p') | KeyCode::Char('z') | KeyCode::Delete | KeyCode::Backspace => {
+                KeyCode::Char(' ')
+                | KeyCode::Char('o')
+                | KeyCode::Char('n')
+                | KeyCode::Char('p')
+                | KeyCode::Char('z')
+                | KeyCode::Delete
+                | KeyCode::Backspace => {
                     self.snap_note = Some("Wait for the store to finish (x stops it).".into());
                     Some(Vec::new())
                 }
                 _ => None,
             };
         }
-        let listed: Vec<SnapshotMeta> = self.history().into_iter().map(|r| r.meta.clone()).collect();
+        let listed: Vec<SnapshotMeta> =
+            self.history().into_iter().map(|r| r.meta.clone()).collect();
         let sel = listed.get(self.snap_sel).cloned();
         let marked = |app: &mut App, ids: Vec<u64>, what: String| {
             let n = ids.len();
             app.snap_marks.extend(ids);
             app.snap_note = Some(match n {
                 0 => format!("No {what} to mark."),
-                _ => format!("Marked {} ({what}); {} marked in all. Del removes them, Esc clears the marks.", scans_text(n), app.snap_marks.len()),
+                _ => format!(
+                    "Marked {} ({what}); {} marked in all. Del removes them, Esc clears the marks.",
+                    scans_text(n),
+                    app.snap_marks.len()
+                ),
             });
         };
         match key.code {
@@ -2408,22 +3147,42 @@ impl App {
                 self.snap_sel = (self.snap_sel + 1).min(listed.len().saturating_sub(1));
             }
             KeyCode::Char('n') => {
-                let ids = listed.iter().filter(|m| matches!(m.status, Status::Failed | Status::Cancelled)).map(|m| m.id).collect();
+                let ids = listed
+                    .iter()
+                    .filter(|m| matches!(m.status, Status::Failed | Status::Cancelled))
+                    .map(|m| m.id)
+                    .collect();
                 marked(self, ids, "cancelled and failed scans".into());
             }
             KeyCode::Char('o') => {
                 let m = sel?;
                 let g = diskdrift_app::prune::scan_group(&m);
-                let ids = listed.iter().filter(|x| x.id < m.id && diskdrift_app::prune::scan_group(x) == g).map(|x| x.id).collect();
-                marked(self, ids, format!("scans of {} older than #{}", m.root, m.id));
+                let ids = listed
+                    .iter()
+                    .filter(|x| x.id < m.id && diskdrift_app::prune::scan_group(x) == g)
+                    .map(|x| x.id)
+                    .collect();
+                marked(
+                    self,
+                    ids,
+                    format!("scans of {} older than #{}", m.root, m.id),
+                );
             }
             KeyCode::Char('p') => {
                 let rules = self.settings.retention.value;
                 if rules.is_off() {
                     self.snap_note = Some("No retention rules yet: set them in Settings (E), Keep: the last scans, one a week, one a month.".into());
                 } else {
-                    let ids = diskdrift_app::prune::retention_removals(&listed, rules, chrono::Local::now().fixed_offset());
-                    marked(self, ids, format!("not kept by the rules: {}", rules.describe()));
+                    let ids = diskdrift_app::prune::retention_removals(
+                        &listed,
+                        rules,
+                        chrono::Local::now().fixed_offset(),
+                    );
+                    marked(
+                        self,
+                        ids,
+                        format!("not kept by the rules: {}", rules.describe()),
+                    );
                 }
             }
             KeyCode::Esc if !self.snap_marks.is_empty() => {
@@ -2434,23 +3193,34 @@ impl App {
                 let ids: Vec<u64> = if self.snap_marks.is_empty() {
                     sel.map(|m| m.id).into_iter().collect()
                 } else {
-                    listed.iter().map(|m| m.id).filter(|id| self.snap_marks.contains(id)).collect()
+                    listed
+                        .iter()
+                        .map(|m| m.id)
+                        .filter(|id| self.snap_marks.contains(id))
+                        .collect()
                 };
                 if ids.is_empty() {
                     return Some(Vec::new());
                 }
                 if self.scan_running() {
-                    self.snap_note = Some("A scan is running: remove scans when it has finished (x stops it).".into());
+                    self.snap_note = Some(
+                        "A scan is running: remove scans when it has finished (x stops it).".into(),
+                    );
                     return Some(Vec::new());
                 }
-                match diskdrift_app::prune::propose(&self.settings, &diskdrift_app::prune::Selection::Ids(ids), None) {
+                match diskdrift_app::prune::propose(
+                    &self.settings,
+                    &diskdrift_app::prune::Selection::Ids(ids),
+                    None,
+                ) {
                     Ok(p) => self.snap_remove = Some(p),
                     Err(e) => self.snap_note = Some(format!("Cannot remove them: {e}")),
                 }
             }
             KeyCode::Char('z') => {
                 if self.scan_running() {
-                    self.snap_note = Some("A scan is running: compact the store when it has finished.".into());
+                    self.snap_note =
+                        Some("A scan is running: compact the store when it has finished.".into());
                     return Some(Vec::new());
                 }
                 self.store_job = Some("compacting the store".into());
@@ -2467,8 +3237,17 @@ impl App {
             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 return Some(match disks::forget(&self.settings, &plan.disk.id, true) {
                     Ok(done) => {
-                        self.disks.note = Some(Ok(diskdrift_app::text::forget(&done, self.settings.size_units.value).trim_end().to_string()));
-                        if self.disk_filter.as_ref().is_some_and(|f| f.ids.contains(&done.disk.id)) {
+                        self.disks.note = Some(Ok(diskdrift_app::text::forget(
+                            &done,
+                            self.settings.size_units.value,
+                        )
+                        .trim_end()
+                        .to_string()));
+                        if self
+                            .disk_filter
+                            .as_ref()
+                            .is_some_and(|f| f.ids.contains(&done.disk.id))
+                        {
                             self.set_disk_filter(None);
                         }
                         self.disks.list = Job::Idle;
@@ -2489,7 +3268,12 @@ impl App {
         let n = self.disks.list.done().map(|l| l.disks.len()).unwrap_or(0);
         let row = self.selected_disk().cloned();
         match key.code {
-            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => {
                 self.disks.note = None;
                 self.disks.sel = match key.code {
                     KeyCode::Up => self.disks.sel.saturating_sub(1),
@@ -2507,24 +3291,52 @@ impl App {
                 let r = row?;
                 let sets = &r.disk.sets;
                 if sets.is_empty() {
-                    self.disks.note = Some(Err(format!("{} is in no set: + puts it in one.", r.disk.display_name())));
+                    self.disks.note = Some(Err(format!(
+                        "{} is in no set: + puts it in one.",
+                        r.disk.display_name()
+                    )));
                     return Some(Vec::new());
                 }
-                let now = self.disk_filter.as_ref().and_then(|f| f.set.as_ref()).and_then(|s| sets.iter().position(|x| x == s));
+                let now = self
+                    .disk_filter
+                    .as_ref()
+                    .and_then(|f| f.set.as_ref())
+                    .and_then(|s| sets.iter().position(|x| x == s));
                 let set = sets[now.map(|i| (i + 1) % sets.len()).unwrap_or(0)].clone();
-                let ids: Vec<String> = self.disks.list.done().map(|l| l.disks.iter().filter(|d| d.known && d.disk.sets.contains(&set)).map(|d| d.disk.id.clone()).collect()).unwrap_or_default();
+                let ids: Vec<String> = self
+                    .disks
+                    .list
+                    .done()
+                    .map(|l| {
+                        l.disks
+                            .iter()
+                            .filter(|d| d.known && d.disk.sets.contains(&set))
+                            .map(|d| d.disk.id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let n = ids.len();
-                self.set_disk_filter(Some(DiskFilter { ids, name: set.clone(), set: Some(set.clone()) }));
+                self.set_disk_filter(Some(DiskFilter {
+                    ids,
+                    name: set.clone(),
+                    set: Some(set.clone()),
+                }));
                 let mut cmds = self.open(Screen::Snapshots);
                 self.snap_sel_newest();
-                self.snap_note = Some(format!("set {set}: {n} {} (Find searches only them; * shows every disk)", if n == 1 { "disk" } else { "disks" }));
+                self.snap_note = Some(format!(
+                    "set {set}: {n} {} (Find searches only them; * shows every disk)",
+                    if n == 1 { "disk" } else { "disks" }
+                ));
                 cmds.retain(|c| *c != Command::LoadDisks);
                 return Some(cmds);
             }
             KeyCode::Enter => {
                 let r = row?;
                 if r.snapshots == 0 {
-                    self.disks.note = Some(Err(format!("{} has no scans in the store.", r.disk.display_name())));
+                    self.disks.note = Some(Err(format!(
+                        "{} has no scans in the store.",
+                        r.disk.display_name()
+                    )));
                     return Some(Vec::new());
                 }
                 self.set_disk_filter(Some(DiskFilter::disk(&r.disk)));
@@ -2537,14 +3349,23 @@ impl App {
             KeyCode::Char('l') | KeyCode::Char('o') | KeyCode::Char('+') | KeyCode::Char('-') => {
                 let r = row?;
                 let (field, text) = match key.code {
-                    KeyCode::Char('l') => (DiskField::Label, r.disk.label.clone().unwrap_or_default()),
-                    KeyCode::Char('o') => (DiskField::Describe, r.disk.description.clone().unwrap_or_default()),
+                    KeyCode::Char('l') => {
+                        (DiskField::Label, r.disk.label.clone().unwrap_or_default())
+                    }
+                    KeyCode::Char('o') => (
+                        DiskField::Describe,
+                        r.disk.description.clone().unwrap_or_default(),
+                    ),
                     KeyCode::Char('+') => (DiskField::AddToSet, String::new()),
                     _ if r.disk.sets.is_empty() => {
-                        self.disks.note = Some(Err(format!("{} is in no set.", r.disk.display_name())));
+                        self.disks.note =
+                            Some(Err(format!("{} is in no set.", r.disk.display_name())));
                         return Some(Vec::new());
                     }
-                    _ => (DiskField::RemoveFromSet, r.disk.sets.last().cloned().unwrap_or_default()),
+                    _ => (
+                        DiskField::RemoveFromSet,
+                        r.disk.sets.last().cloned().unwrap_or_default(),
+                    ),
                 };
                 self.disks.note = None;
                 self.disks.edit = Some((field, text));
@@ -2552,23 +3373,36 @@ impl App {
             KeyCode::Char('g') => {
                 let r = row?;
                 let Some(mount) = &r.mount_point else {
-                    self.disks.note = Some(Err(format!("{} is not connected: connect it to scan it.", r.disk.display_name())));
+                    self.disks.note = Some(Err(format!(
+                        "{} is not connected: connect it to scan it.",
+                        r.disk.display_name()
+                    )));
                     return Some(Vec::new());
                 };
                 // The folder last scanned on the disk, if it is still there; else the whole volume.
                 let last = self
                     .snapshots
                     .done()
-                    .and_then(|l| l.snapshots.iter().rev().find(|s| s.meta.disk.as_deref() == Some(r.disk.id.as_str()) && s.meta.status.is_usable()))
+                    .and_then(|l| {
+                        l.snapshots.iter().rev().find(|s| {
+                            s.meta.disk.as_deref() == Some(r.disk.id.as_str())
+                                && s.meta.status.is_usable()
+                        })
+                    })
                     .map(|s| s.meta.root.clone())
                     .filter(|p| std::path::Path::new(p).is_dir());
                 let root = last.unwrap_or_else(|| mount.display().to_string());
-                self.scan = ScanStage::Confirm { root, name: String::new() };
+                self.scan = ScanStage::Confirm {
+                    root,
+                    name: String::new(),
+                };
                 self.screen = Screen::Scan;
                 self.menu_index = MENU.iter().position(|item| matches!(item, MenuItem::Screen(candidate) if *candidate == Screen::Scan)).unwrap_or(0);
             }
             KeyCode::Char('f') if row.as_ref().is_some_and(|r| !r.known) => {
-                self.disks.note = Some(Err("This disk is not in the store yet: there is nothing to forget.".into()));
+                self.disks.note = Some(Err(
+                    "This disk is not in the store yet: there is nothing to forget.".into(),
+                ));
             }
             KeyCode::Char('f') => {
                 let r = row?;
@@ -2583,21 +3417,30 @@ impl App {
     }
 
     fn disks_edit_key(&mut self, key: KeyEvent) -> Vec<Command> {
-        let Some((field, text)) = self.disks.edit.as_mut() else { return Vec::new() };
+        let Some((field, text)) = self.disks.edit.as_mut() else {
+            return Vec::new();
+        };
         match key.code {
             KeyCode::Esc => self.disks.edit = None,
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => text.clear(),
             KeyCode::Backspace => {
                 text.pop();
             }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) && text.chars().count() < 512 => text.push(c),
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && text.chars().count() < 512 =>
+            {
+                text.push(c)
+            }
             KeyCode::Enter => {
                 let (field, text) = (*field, text.clone());
                 // A new volume is named by its mount point: the edit records it first.
-                let Some(id) = self.selected_disk().map(|r| match (&r.mount_point, r.known) {
-                    (Some(mp), false) => mp.display().to_string(),
-                    _ => r.disk.id.clone(),
-                }) else {
+                let Some(id) = self
+                    .selected_disk()
+                    .map(|r| match (&r.mount_point, r.known) {
+                        (Some(mp), false) => mp.display().to_string(),
+                        _ => r.disk.id.clone(),
+                    })
+                else {
                     self.disks.edit = None;
                     return Vec::new();
                 };
@@ -2609,10 +3452,19 @@ impl App {
                     DiskField::RemoveFromSet => Edit::RemoveFromSet(&text),
                 };
                 match disks::edit(&self.settings, &id, edit) {
-                    Ok(d) => {
+                    Ok((d, migration)) => {
                         self.disks.edit = None;
-                        self.disks.note = Some(Ok(diskdrift_app::text::disk_entry(&d).trim_end().to_string()));
-                        if let Some(f) = self.disk_filter.as_mut().filter(|f| f.set.is_none() && f.ids == [d.id.clone()]) {
+                        let mut note = diskdrift_app::text::disk_entry(&d).trim_end().to_string();
+                        if let Some(notice) = migration.notice() {
+                            note.push('\n');
+                            note.push_str(notice);
+                        }
+                        self.disks.note = Some(Ok(note));
+                        if let Some(f) = self
+                            .disk_filter
+                            .as_mut()
+                            .filter(|f| f.set.is_none() && f.ids == [d.id.clone()])
+                        {
                             f.name = d.display_name().to_string();
                         }
                         self.disks.list = Job::Idle;
@@ -2658,7 +3510,9 @@ impl App {
                         if !done.cancelled {
                             self.snap_marks.clear();
                         }
-                        diskdrift_app::text::prune::removed(&done, self.settings.size_units.value).trim_end().to_string()
+                        diskdrift_app::text::prune::removed(&done, self.settings.size_units.value)
+                            .trim_end()
+                            .to_string()
                     }
                     Err(e) => format!("Not removed: {e}"),
                 });
@@ -2667,7 +3521,12 @@ impl App {
             Msg::Compacted(r) => {
                 self.store_job = None;
                 self.snap_note = Some(match *r {
-                    Ok(c) => diskdrift_app::text::prune::compaction(&c, self.settings.size_units.value).trim_end().to_string(),
+                    Ok(c) => diskdrift_app::text::prune::compaction_result(
+                        &c,
+                        self.settings.size_units.value,
+                    )
+                    .trim_end()
+                    .to_string(),
                     Err(e) => format!("Compaction stopped: {e}. The store is valid as it is."),
                 });
                 return self.reload_store_views();
@@ -2676,7 +3535,11 @@ impl App {
                 let before = self.snapshots.done().map(|l| l.snapshots.len());
                 self.snapshots = Job::from(*r);
                 // History opens on the newest scan with data, and moves to a new one when it appears.
-                let n = self.snapshots.done().map(|l| l.snapshots.len()).unwrap_or(0);
+                let n = self
+                    .snapshots
+                    .done()
+                    .map(|l| l.snapshots.len())
+                    .unwrap_or(0);
                 if before != Some(n) {
                     self.snap_sel_newest();
                 }
@@ -2707,7 +3570,9 @@ impl App {
                 if self.doctor.is_running() {
                     self.doctor = Job::Done(r);
                     if self.recover.is_running() {
-                        self.recover = Job::Running("preparing suggestions (and recent growth from saved scans)…".into());
+                        self.recover = Job::Running(
+                            "preparing suggestions (and recent growth from saved scans)…".into(),
+                        );
                     }
                 }
             }
@@ -2719,15 +3584,28 @@ impl App {
                     };
                     let at = chrono::Local::now().format("%H:%M");
                     self.auto_status = Some(match (r.as_ref(), self.connect_scan.take()) {
-                        (Ok(o), Some(disk)) if o.cancelled => format!("rescan of {disk} stopped at {at}; nothing kept"),
+                        (Ok(o), Some(disk)) if o.cancelled => {
+                            format!("rescan of {disk} stopped at {at}; nothing kept")
+                        }
                         (Ok(o), Some(disk)) => {
                             let prev = self.previous_in_store(&o.snapshot);
-                            let change = diskdrift_app::text::snapshots::tracked_change(&o.snapshot, prev.as_ref(), self.settings.size_units.value);
-                            format!("{disk} rescanned at {at} in {secs:.0}s: {change}. DiskDrift no longer reads {disk}: you can eject it.")
+                            let change = diskdrift_app::text::snapshots::tracked_change(
+                                &o.snapshot,
+                                prev.as_ref(),
+                                self.settings.size_units.value,
+                            );
+                            format!(
+                                "{disk} rescanned at {at} in {secs:.0}s: {change}. DiskDrift no longer reads {disk}: you can eject it."
+                            )
                         }
                         (Err(e), Some(disk)) => format!("rescan of {disk} failed: {e}"),
-                        (Ok(o), None) if o.cancelled => format!("background scan stopped at {at}; nothing kept"),
-                        (Ok(o), None) => format!("background scan finished at {at} in {secs:.0}s: snapshot #{} ({})", o.snapshot.id, o.snapshot.status),
+                        (Ok(o), None) if o.cancelled => {
+                            format!("background scan stopped at {at}; nothing kept")
+                        }
+                        (Ok(o), None) => format!(
+                            "background scan finished at {at} in {secs:.0}s: snapshot #{} ({})",
+                            o.snapshot.id, o.snapshot.status
+                        ),
                         (Err(e), None) => format!("background scan failed: {e}"),
                     });
                     // The scan form stays ready for a scan of your own.
@@ -2740,16 +3618,26 @@ impl App {
                 self.diff.result = Job::Idle;
                 self.top.result = Job::Idle;
                 self.disks.list = Job::Running("reading disks…".into());
-                return vec![Command::LoadSnapshots, Command::LoadUsage, Command::LoadDisks];
+                return vec![
+                    Command::LoadSnapshots,
+                    Command::LoadUsage,
+                    Command::LoadDisks,
+                ];
             }
             Msg::ScanDoubt(message) => {
                 let (root, name) = self.scan_request.clone().unwrap_or_default();
                 if self.auto_scan_running() {
                     self.connect_scan = None;
-                    self.auto_status = Some(format!("background scan not started: {message} Scan it with S to answer."));
+                    self.auto_status = Some(format!(
+                        "background scan not started: {message} Scan it with S to answer."
+                    ));
                     self.scan = initial_scan(&self.settings);
                 } else {
-                    self.scan = ScanStage::AskDisk { root, name, message };
+                    self.scan = ScanStage::AskDisk {
+                        root,
+                        name,
+                        message,
+                    };
                 }
             }
             Msg::Volumes(now) => return self.volumes_changed(now),
@@ -2762,7 +3650,10 @@ impl App {
             Msg::Diff(r) => {
                 // A comparison overtaken by another choice of scans is dropped.
                 let ids: Vec<u64> = self.usable().iter().map(|r| r.meta.id).collect();
-                let current = (ids.get(self.diff.old).copied(), ids.get(self.diff.new).copied());
+                let current = (
+                    ids.get(self.diff.old).copied(),
+                    ids.get(self.diff.new).copied(),
+                );
                 if !matches!(&*r, Ok(d) if current != (Some(d.old.id), Some(d.new.id))) {
                     self.diff.result = Job::from(*r);
                 }
@@ -2781,11 +3672,25 @@ impl App {
                 let u = self.settings.size_units.value;
                 if let Some(v) = self.analysis.stack.last_mut().filter(|v| v.id == id) {
                     let text = match step {
-                        AnalyzeStep::Listed { children, installed_apps } => {
-                            format!("{children} items to measure; {installed_apps} installed apps indexed to match owners")
+                        AnalyzeStep::Listed {
+                            children,
+                            installed_apps,
+                        } => {
+                            format!(
+                                "{children} items to measure; {installed_apps} installed apps indexed to match owners"
+                            )
                         }
-                        AnalyzeStep::Measured { name, allocated_bytes, entries, elapsed } => {
-                            format!("  {name}: {}, {entries} entries, {:.1}s", format_size(allocated_bytes, u), elapsed.as_secs_f64())
+                        AnalyzeStep::Measured {
+                            name,
+                            allocated_bytes,
+                            entries,
+                            elapsed,
+                        } => {
+                            format!(
+                                "  {name}: {}, {entries} entries, {:.1}s",
+                                format_size(allocated_bytes, u),
+                                elapsed.as_secs_f64()
+                            )
                         }
                     };
                     v.log.push(LogLine::now(text));
@@ -2795,11 +3700,18 @@ impl App {
                 self.find.current = Job::from(*result);
                 self.find.sel = 0;
                 // Nothing now: the history is searched by itself.
-                if self.find.current.done().is_some_and(|c| c.total == 0 && c.store_exists) {
+                if self
+                    .find
+                    .current
+                    .done()
+                    .is_some_and(|c| c.total == 0 && c.store_exists)
+                {
                     return self.start_find_history(false);
                 }
             }
-            Msg::FindProgress { id, done, total } if id == self.find.id => self.find.progress = Some((done, total)),
+            Msg::FindProgress { id, done, total } if id == self.find.id => {
+                self.find.progress = Some((done, total))
+            }
             Msg::FindHistory { id, result } if id == self.find.id => {
                 self.find.history = Job::from(*result);
                 self.find.progress = None;
@@ -2807,29 +3719,42 @@ impl App {
             Msg::FindCurrent { .. } | Msg::FindProgress { .. } | Msg::FindHistory { .. } => {}
             Msg::CarefulStarted(Ok(())) => {
                 self.careful.on = Some(true);
-                self.careful.log("careful mode on: external disks connected now are held back, not mounted".into());
+                self.careful.log(
+                    "careful mode on: external disks connected now are held back, not mounted"
+                        .into(),
+                );
             }
             Msg::CarefulStarted(Err(e)) => {
                 self.careful.on = None;
-                self.careful.log(format!("careful mode could not start: {e}"));
+                self.careful
+                    .log(format!("careful mode could not start: {e}"));
             }
             Msg::CarefulHeld(r) => match *r {
                 Ok(h) if self.careful.is_on() => {
                     let u = self.settings.size_units.value;
-                    let line = diskdrift_app::text::careful::held(&h, u, chrono::Local::now().timestamp());
+                    let line =
+                        diskdrift_app::text::careful::held(&h, u, chrono::Local::now().timestamp());
                     self.careful.log(line.clone());
-                    self.note_disk(format!("careful mode: {} held back, not mounted (C to scan it)", h.name()));
+                    self.note_disk(format!(
+                        "careful mode: {} held back, not mounted (C to scan it)",
+                        h.name()
+                    ));
                     self.careful.held.retain(|x| x.bsd() != h.bsd());
                     self.careful.held.push(h);
                 }
                 Ok(_) => {}
-                Err(e) => self.careful.log(format!("a disk was held back, but the store cannot be read: {e}")),
+                Err(e) => self.careful.log(format!(
+                    "a disk was held back, but the store cannot be read: {e}"
+                )),
             },
             Msg::CarefulGone(bsd) => {
                 if let Some(i) = self.careful.held.iter().position(|h| h.bsd() == bsd) {
                     let h = self.careful.held.remove(i);
                     self.careful.log(format!("{} is gone", h.name()));
-                    self.careful.sel = self.careful.sel.min(self.careful.held.len().saturating_sub(1));
+                    self.careful.sel = self
+                        .careful
+                        .sel
+                        .min(self.careful.held.len().saturating_sub(1));
                 }
             }
             Msg::CarefulDone { bsd, result } => {
@@ -2837,12 +3762,18 @@ impl App {
                 let u = self.settings.size_units.value;
                 match *result {
                     Ok(o) => {
-                        for l in diskdrift_app::text::careful::outcome(&o, u).lines().filter(|l| !l.trim().is_empty()) {
+                        for l in diskdrift_app::text::careful::outcome(&o, u)
+                            .lines()
+                            .filter(|l| !l.trim().is_empty())
+                        {
                             self.careful.log(l.to_string());
                         }
                         if o.ejected.is_ok() {
                             self.careful.held.retain(|h| h.bsd() != bsd);
-                            self.careful.sel = self.careful.sel.min(self.careful.held.len().saturating_sub(1));
+                            self.careful.sel = self
+                                .careful
+                                .sel
+                                .min(self.careful.held.len().saturating_sub(1));
                         }
                     }
                     Err(e) => self.careful.log(e),
@@ -2855,11 +3786,17 @@ impl App {
                 return cmds;
             }
             Msg::CarefulAction { bsd, result } => match result {
-                Ok(Some(at)) => self.careful.log(format!("mounted read-only at {} (Finder shows it and cannot write to it); j ejects it", at.display())),
+                Ok(Some(at)) => self.careful.log(format!(
+                    "mounted read-only at {} (Finder shows it and cannot write to it); j ejects it",
+                    at.display()
+                )),
                 Ok(None) => {
                     self.careful.log("ejected: safe to unplug".into());
                     self.careful.held.retain(|h| h.bsd() != bsd);
-                    self.careful.sel = self.careful.sel.min(self.careful.held.len().saturating_sub(1));
+                    self.careful.sel = self
+                        .careful
+                        .sel
+                        .min(self.careful.held.len().saturating_sub(1));
                 }
                 Err(e) => self.careful.log(e),
             },
@@ -2872,7 +3809,9 @@ impl App {
                     if let Some(r) = level.result.done() {
                         b.root.get_or_insert_with(|| r.root());
                         let want = level.select.take();
-                        level.sel = (0..r.len()).find(|&i| r.child(i).is_some_and(|c| Some(&c.1) == want.as_ref())).unwrap_or(0);
+                        level.sel = (0..r.len())
+                            .find(|&i| r.child(i).is_some_and(|c| Some(&c.1) == want.as_ref()))
+                            .unwrap_or(0);
                     }
                 }
             }
@@ -2895,16 +3834,29 @@ pub(crate) mod tests {
     use std::path::Path;
 
     pub fn settings() -> Effective {
-        resolve_with(&Overrides::default(), Path::new("/nonexistent-home"), Path::new("/")).unwrap()
+        resolve_with(
+            &Overrides::default(),
+            Path::new("/nonexistent-home"),
+            Path::new("/"),
+        )
+        .unwrap()
     }
 
     #[cfg(not(windows))]
     pub fn root_path() -> String {
-        std::fs::canonicalize(Path::new("/")).unwrap_or_else(|_| Path::new("/").to_path_buf()).display().to_string()
+        std::fs::canonicalize(Path::new("/"))
+            .unwrap_or_else(|_| Path::new("/").to_path_buf())
+            .display()
+            .to_string()
     }
 
     pub fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent { code, modifiers: KeyModifiers::NONE, kind: KeyEventKind::Press, state: KeyEventState::NONE }
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
     }
 
     fn typed(app: &mut App, s: &str) {
@@ -2915,7 +3867,16 @@ pub(crate) mod tests {
 
     #[test]
     fn hotkeys_are_case_insensitive() {
-        for (c, screen) in [('u', Screen::Usage), ('U', Screen::Usage), ('?', Screen::Help), ('h', Screen::Snapshots), ('T', Screen::Top), ('d', Screen::Diff), ('r', Screen::Recover), ('S', Screen::Scan)] {
+        for (c, screen) in [
+            ('u', Screen::Usage),
+            ('U', Screen::Usage),
+            ('?', Screen::Help),
+            ('h', Screen::Snapshots),
+            ('T', Screen::Top),
+            ('d', Screen::Diff),
+            ('r', Screen::Recover),
+            ('S', Screen::Scan),
+        ] {
             let mut app = App::new(settings());
             app.handle_key(key(KeyCode::Char(c)));
             assert_eq!(app.screen, screen, "key {c}");
@@ -2925,34 +3886,66 @@ pub(crate) mod tests {
     #[test]
     fn doctor_hotkey_starts_diagnosis_once() {
         let mut app = App::new(settings());
-        assert_eq!(app.handle_key(key(KeyCode::Char('i'))), vec![Command::RunDoctor { live: false }]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('i'))),
+            vec![Command::RunDoctor { live: false }]
+        );
         assert!(app.doctor.is_running());
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Dashboard);
-        assert!(app.handle_key(key(KeyCode::Char('I'))).is_empty(), "already running");
+        assert!(
+            app.handle_key(key(KeyCode::Char('I'))).is_empty(),
+            "already running"
+        );
     }
 
     pub fn find_hit(path: &str, connected: bool) -> Hit {
         use diskdrift_app::search::{Place, ScanRef};
         Hit {
-            path: diskdrift_app::core::pathser::NativePath(path.as_bytes().to_vec()),
+            path: diskdrift_app::core::native::NativePath::unix(path.as_bytes().to_vec()),
             kind: Kind::File,
             size: 12_000,
             logical_size: 11_000,
             mtime: 1_700_000_000,
-            scan: ScanRef { id: 12, name: "s12".into(), started_at: "2026-10-03T14:20:00+02:00".into() },
-            place: Place { disk: Some("d1".into()), disk_name: "backupy-2014".into(), connected, mount_point: None, root: "/Volumes/backupy-2014".into() },
+            available: diskdrift_app::core::record::EntryFields::LOGICAL_SIZE
+                .union(diskdrift_app::core::record::EntryFields::ALLOCATED_SIZE)
+                .union(diskdrift_app::core::record::EntryFields::MTIME),
+            measurement: diskdrift_app::diagnostics::measurement::Envelope::observed(
+                "filesystem",
+                "snapshot record",
+                "test fixture",
+            ),
+            scan: ScanRef {
+                id: 12,
+                name: "s12".into(),
+                started_at: "2026-10-03T14:20:00+02:00".into(),
+            },
+            place: Place {
+                disk: Some("d1".into()),
+                disk_name: "backupy-2014".into(),
+                connected,
+                mount_point: None,
+                root: "/Volumes/backupy-2014".into(),
+            },
         }
     }
 
     pub fn find_gone(path: &str) -> Lifetime {
         let h = find_hit(path, false);
-        let scan = |id: u64, at: &str| diskdrift_app::search::ScanRef { id, name: format!("s{id}"), started_at: at.into() };
+        let scan = |id: u64, at: &str| diskdrift_app::search::ScanRef {
+            id,
+            name: format!("s{id}"),
+            started_at: at.into(),
+        };
         Lifetime {
             path: h.path,
             kind: Kind::File,
             size: 12_000,
             mtime: 1_700_000_000,
+            available: diskdrift_app::core::record::EntryFields::LOGICAL_SIZE
+                .union(diskdrift_app::core::record::EntryFields::ALLOCATED_SIZE)
+                .union(diskdrift_app::core::record::EntryFields::MTIME),
+            measurement: h.measurement,
             place: h.place,
             last_seen: scan(12, "2026-10-03T14:20:00+02:00"),
             gone_in: Some(scan(13, "2026-10-10T09:05:00+02:00")),
@@ -2974,49 +3967,144 @@ pub(crate) mod tests {
         typed(&mut app, "Ważna");
         assert_eq!(app.screen, Screen::Find);
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::CancelFind, Command::RunFind { id: 1, pattern: "Ważna".into(), disk: None, set: None }]);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CancelFind,
+                Command::RunFind {
+                    id: 1,
+                    pattern: "Ważna".into(),
+                    disk: None,
+                    set: None
+                }
+            ]
+        );
         assert!(!app.find.editing && app.find.current.is_running());
         // Nothing now: the history search starts by itself.
-        let cmds = app.handle_msg(Msg::FindCurrent { id: 1, result: Box::new(Ok(Current::for_test(Vec::new(), Vec::new(), 0))) });
-        assert_eq!(cmds, vec![Command::RunFindHistory { id: 1, always: false }]);
-        app.handle_msg(Msg::FindProgress { id: 1, done: 2, total: 7 });
+        let cmds = app.handle_msg(Msg::FindCurrent {
+            id: 1,
+            result: Box::new(Ok(Current::for_test(Vec::new(), Vec::new(), 0))),
+        });
+        assert_eq!(
+            cmds,
+            vec![Command::RunFindHistory {
+                id: 1,
+                always: false
+            }]
+        );
+        app.handle_msg(Msg::FindProgress {
+            id: 1,
+            done: 2,
+            total: 7,
+        });
         assert_eq!(app.find.progress, Some((2, 7)));
         // x stops the history search, not a scan.
-        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), vec![Command::CancelFind]);
-        let h = History { gone: vec![find_gone("/Volumes/backupy-2014/Docs/wazna.txt")], gone_total: 1, pairs: 7, pairs_done: 7, ..Default::default() };
-        app.handle_msg(Msg::FindHistory { id: 1, result: Box::new(Ok(h)) });
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('x'))),
+            vec![Command::CancelFind]
+        );
+        let h = History {
+            gone: vec![find_gone("/Volumes/backupy-2014/Docs/wazna.txt")],
+            gone_total: 1,
+            pairs: 7,
+            pairs_done: 7,
+            ..Default::default()
+        };
+        app.handle_msg(Msg::FindHistory {
+            id: 1,
+            result: Box::new(Ok(h)),
+        });
         assert!(matches!(app.find_selected(), Some(FindRow::Gone(_))));
         // A stale result of an older search is ignored.
-        app.handle_msg(Msg::FindCurrent { id: 0, result: Box::new(Ok(Current::for_test(Vec::new(), vec![find_hit("/x", true)], 1))) });
+        app.handle_msg(Msg::FindCurrent {
+            id: 0,
+            result: Box::new(Ok(Current::for_test(
+                Vec::new(),
+                vec![find_hit("/x", true)],
+                1,
+            ))),
+        });
         assert_eq!(app.find_rows(), 1);
         // Enter opens the last scan that has it, at its folder, with the file selected.
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::RunBrowse { id: 1, source: BrowseSource::Snapshot(12), path: Some("/Volumes/backupy-2014/Docs".into()) }]);
+        assert_eq!(
+            cmds,
+            vec![Command::RunBrowse {
+                id: 1,
+                source: BrowseSource::Snapshot(12),
+                path: Some("/Volumes/backupy-2014/Docs".into())
+            }]
+        );
         let b = app.browse.as_ref().unwrap();
         assert_eq!(b.back, Screen::Find);
-        assert!(b.note.as_deref().unwrap().contains("not in scan #13"), "{:?}", b.note);
+        assert!(
+            b.note.as_deref().unwrap().contains("not in scan #13"),
+            "{:?}",
+            b.note
+        );
     }
 
     #[test]
     fn find_results_keys() {
         let mut app = App::new(settings());
         app.open(Screen::Find);
-        assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "nothing typed");
+        assert!(
+            app.handle_key(key(KeyCode::Enter)).is_empty(),
+            "nothing typed"
+        );
         assert!(app.find.note.is_some());
         typed(&mut app, "re:(");
-        assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "an invalid regex is refused before searching");
-        assert!(app.find.note.as_deref().unwrap().contains("invalid"), "{:?}", app.find.note);
-        app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('u')) });
+        assert!(
+            app.handle_key(key(KeyCode::Enter)).is_empty(),
+            "an invalid regex is refused before searching"
+        );
+        assert!(
+            app.find.note.as_deref().unwrap().contains("invalid"),
+            "{:?}",
+            app.find.note
+        );
+        app.handle_key(KeyEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..key(KeyCode::Char('u'))
+        });
         typed(&mut app, "plan");
-        app.disk_filter = Some(DiskFilter { ids: vec!["d1".into()], name: "backupy-2014".into(), set: None });
-        assert_eq!(app.handle_key(key(KeyCode::Enter))[1], Command::RunFind { id: 1, pattern: "plan".into(), disk: Some("d1".into()), set: None });
-        let hits = vec![find_hit("/Volumes/backupy-2014/a/plan.doc", false), find_hit("/Volumes/backupy-2014/b/plan.doc", true)];
-        assert!(app.handle_msg(Msg::FindCurrent { id: 1, result: Box::new(Ok(Current::for_test(Vec::new(), hits, 2))) }).is_empty(), "found: no history");
+        app.disk_filter = Some(DiskFilter {
+            ids: vec!["d1".into()],
+            name: "backupy-2014".into(),
+            set: None,
+        });
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter))[1],
+            Command::RunFind {
+                id: 1,
+                pattern: "plan".into(),
+                disk: Some("d1".into()),
+                set: None
+            }
+        );
+        let hits = vec![
+            find_hit("/Volumes/backupy-2014/a/plan.doc", false),
+            find_hit("/Volumes/backupy-2014/b/plan.doc", true),
+        ];
+        assert!(
+            app.handle_msg(Msg::FindCurrent {
+                id: 1,
+                result: Box::new(Ok(Current::for_test(Vec::new(), hits, 2)))
+            })
+            .is_empty(),
+            "found: no history"
+        );
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.find.sel, 1, "stops at the last row");
         // p searches the history too; letters that are not Find's open their screens.
-        assert_eq!(app.handle_key(key(KeyCode::Char('p'))), vec![Command::RunFindHistory { id: 1, always: true }]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('p'))),
+            vec![Command::RunFindHistory {
+                id: 1,
+                always: true
+            }]
+        );
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Up));
         assert!(app.find.editing, "up from the first row goes to the field");
@@ -3032,7 +4120,11 @@ pub(crate) mod tests {
                 app.handle_key(key(KeyCode::Esc));
             }
         }
-        assert_eq!((app.screen, app.find.editing), (Screen::Find, false), "Esc from Browse returns to the results");
+        assert_eq!(
+            (app.screen, app.find.editing),
+            (Screen::Find, false),
+            "Esc from Browse returns to the results"
+        );
         app.handle_key(key(KeyCode::Char('k')));
         assert_eq!(app.screen, Screen::Disks);
     }
@@ -3050,7 +4142,12 @@ pub(crate) mod tests {
                     volume_uuid: Some("V1".into()),
                     capacity_bytes: Some(64_000_000_000),
                     bsd_name: Some(bsd.into()),
-                    device: DeviceInfo { bus: Some("USB".into()), model: Some("Old Stick".into()), ..Default::default() },
+                    device: DeviceInfo {
+                        bus: Some("USB".into()),
+                        model: Some("Old Stick".into()),
+                        ..Default::default()
+                    },
+                    ..DiskInfo::default()
                 },
             },
             disk: None,
@@ -3064,37 +4161,91 @@ pub(crate) mod tests {
         let mut app = App::new(settings());
         app.handle_key(key(KeyCode::Char('C')));
         assert_eq!(app.screen, Screen::Careful);
-        assert!(app.handle_key(key(KeyCode::Char('g'))).is_empty(), "off: nothing to scan");
-        assert_eq!(app.handle_key(key(KeyCode::Char('o'))), vec![Command::Careful(true)]);
+        assert!(
+            app.handle_key(key(KeyCode::Char('g'))).is_empty(),
+            "off: nothing to scan"
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            vec![Command::Careful(true)]
+        );
         app.handle_msg(Msg::CarefulStarted(Ok(())));
         assert!(app.careful.is_on());
         app.handle_msg(Msg::CarefulHeld(Box::new(Ok(held("disk9s1", "OLD", None)))));
-        app.handle_msg(Msg::CarefulHeld(Box::new(Ok(held("disk10s1", "COPY", Some("a copy of OLD?"))))));
+        app.handle_msg(Msg::CarefulHeld(Box::new(Ok(held(
+            "disk10s1",
+            "COPY",
+            Some("a copy of OLD?"),
+        )))));
         assert_eq!(app.careful.held.len(), 2);
-        assert!(app.disk_event.as_ref().unwrap().text.contains("COPY held back"));
+        assert!(
+            app.disk_event
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("COPY held back")
+        );
         // A doubtful disk asks first; any other key leaves it.
         app.handle_key(key(KeyCode::Down));
         assert!(app.handle_key(key(KeyCode::Char('g'))).is_empty());
         assert!(app.careful.ask.is_some());
-        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), vec![Command::CarefulScan { bsd: "disk10s1".into(), choice: Some(DiskChoice::New) }]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n'))),
+            vec![Command::CarefulScan {
+                bsd: "disk10s1".into(),
+                choice: Some(DiskChoice::New)
+            }]
+        );
         assert!(app.needs_ticks());
         // One at a time; x stops it; o cannot turn it off meanwhile.
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Char('g')));
-        assert!(app.careful.log.last().unwrap().text.contains("one at a time"));
-        assert!(!app.handle_key(key(KeyCode::Char('o'))).contains(&Command::Careful(false)));
-        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), vec![Command::CancelCareful]);
-        let cmds = app.handle_msg(Msg::CarefulDone { bsd: "disk10s1".into(), result: Box::new(Err("stopped".into())) });
+        assert!(
+            app.careful
+                .log
+                .last()
+                .unwrap()
+                .text
+                .contains("one at a time")
+        );
+        assert!(
+            !app.handle_key(key(KeyCode::Char('o')))
+                .contains(&Command::Careful(false))
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('x'))),
+            vec![Command::CancelCareful]
+        );
+        let cmds = app.handle_msg(Msg::CarefulDone {
+            bsd: "disk10s1".into(),
+            result: Box::new(Err("stopped".into())),
+        });
         assert!(cmds.contains(&Command::LoadSnapshots));
         assert!(app.careful.running.is_none());
         // m and j act on the selected disk; ejecting it removes it.
-        assert_eq!(app.handle_key(key(KeyCode::Char('m'))), vec![Command::CarefulMount { bsd: "disk9s1".into() }]);
-        assert_eq!(app.handle_key(key(KeyCode::Char('j'))), vec![Command::CarefulEject { bsd: "disk9s1".into() }]);
-        app.handle_msg(Msg::CarefulAction { bsd: "disk9s1".into(), result: Ok(None) });
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('m'))),
+            vec![Command::CarefulMount {
+                bsd: "disk9s1".into()
+            }]
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('j'))),
+            vec![Command::CarefulEject {
+                bsd: "disk9s1".into()
+            }]
+        );
+        app.handle_msg(Msg::CarefulAction {
+            bsd: "disk9s1".into(),
+            result: Ok(None),
+        });
         assert_eq!(app.careful.held.len(), 1);
         app.handle_msg(Msg::CarefulGone("disk10s1".into()));
         assert!(app.careful.held.is_empty());
-        assert_eq!(app.handle_key(key(KeyCode::Char('o'))), vec![Command::Careful(false)]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('o'))),
+            vec![Command::Careful(false)]
+        );
         assert!(!app.careful.is_on());
     }
 
@@ -3103,7 +4254,10 @@ pub(crate) mod tests {
         let mut app = App::new(settings());
         app.careful.on = Some(true);
         let v = Volume {
-            identity: diskdrift_app::storage::Identity::new(diskdrift_app::storage::Strength::Uuid, "U"),
+            identity: diskdrift_app::storage::Identity::new(
+                diskdrift_app::storage::Strength::Uuid,
+                "U",
+            ),
             mount_point: "/Volumes/OLD".into(),
             name: Some("OLD".into()),
             fs_type: "hfs".into(),
@@ -3123,37 +4277,71 @@ pub(crate) mod tests {
             aliases: Vec::new(),
             last_mount_path: None,
         };
-        let action = ConnectAction::Rescan { disk, root: "/Volumes/OLD".into(), last_scan: "2026-01-01T00:00:00+01:00".into() };
-        let cmds = app.handle_msg(Msg::Connected { volume: v, action: Box::new(Ok(action)) });
+        let action = ConnectAction::Rescan {
+            disk,
+            root: "/Volumes/OLD".into(),
+            last_scan: "2026-01-01T00:00:00+01:00".into(),
+        };
+        let cmds = app.handle_msg(Msg::Connected {
+            volume: v,
+            action: Box::new(Ok(action)),
+        });
         assert!(cmds.is_empty(), "{cmds:?}");
-        assert!(app.disk_event.as_ref().unwrap().text.contains("careful mode is on"));
+        assert!(
+            app.disk_event
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("careful mode is on")
+        );
     }
 
     #[test]
     fn dashboard_menu_has_three_groups_in_display_order() {
-        assert_eq!(DISKS_MENU.map(MenuItem::title), ["Scan disk", "My disks", "Snapshot history", "Careful mode"]);
-        assert_eq!(EXPLORE_MENU.map(MenuItem::title), ["Find a file", "Largest files", "Compare snapshots", "Investigate / Doctor", "Recovery suggestions", "Volume usage"]);
-        assert_eq!(DISKDRIFT_MENU.map(MenuItem::title), ["Settings", "Help", "Quit"]);
-        assert_eq!(MENU, [
-            MenuItem::Screen(Screen::Scan),
-            MenuItem::Screen(Screen::Disks),
-            MenuItem::Screen(Screen::Snapshots),
-            MenuItem::Screen(Screen::Careful),
-            MenuItem::Screen(Screen::Find),
-            MenuItem::Screen(Screen::Top),
-            MenuItem::Screen(Screen::Diff),
-            MenuItem::Screen(Screen::Doctor),
-            MenuItem::Screen(Screen::Recover),
-            MenuItem::Screen(Screen::Usage),
-            MenuItem::Screen(Screen::Settings),
-            MenuItem::Screen(Screen::Help),
-            MenuItem::Quit,
-        ]);
+        assert_eq!(
+            DISKS_MENU.map(MenuItem::title),
+            ["Scan disk", "My disks", "Snapshot history", "Careful mode"]
+        );
+        assert_eq!(
+            EXPLORE_MENU.map(MenuItem::title),
+            [
+                "Find a file",
+                "Largest files",
+                "Compare snapshots",
+                "Investigate / Doctor",
+                "Recovery suggestions",
+                "Volume usage"
+            ]
+        );
+        assert_eq!(
+            DISKDRIFT_MENU.map(MenuItem::title),
+            ["Settings", "Help", "Quit"]
+        );
+        assert_eq!(
+            MENU,
+            [
+                MenuItem::Screen(Screen::Scan),
+                MenuItem::Screen(Screen::Disks),
+                MenuItem::Screen(Screen::Snapshots),
+                MenuItem::Screen(Screen::Careful),
+                MenuItem::Screen(Screen::Find),
+                MenuItem::Screen(Screen::Top),
+                MenuItem::Screen(Screen::Diff),
+                MenuItem::Screen(Screen::Doctor),
+                MenuItem::Screen(Screen::Recover),
+                MenuItem::Screen(Screen::Usage),
+                MenuItem::Screen(Screen::Settings),
+                MenuItem::Screen(Screen::Help),
+                MenuItem::Quit,
+            ]
+        );
         assert_eq!(MENU.last(), Some(&MenuItem::Quit));
     }
 
     fn menu_index(item: MenuItem) -> usize {
-        MENU.iter().position(|candidate| *candidate == item).unwrap()
+        MENU.iter()
+            .position(|candidate| *candidate == item)
+            .unwrap()
     }
 
     fn selected_menu_item(app: &App) -> MenuItem {
@@ -3203,7 +4391,11 @@ pub(crate) mod tests {
         assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Settings));
         app.menu_index = menu_index(MenuItem::Quit);
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(selected_menu_item(&app), MenuItem::Quit, "Down in DiskDrift stops");
+        assert_eq!(
+            selected_menu_item(&app),
+            MenuItem::Quit,
+            "Down in DiskDrift stops"
+        );
     }
 
     #[test]
@@ -3224,16 +4416,32 @@ pub(crate) mod tests {
             let mut app = App::new(settings());
             app.menu_index = menu_index(MenuItem::Screen(from));
             app.handle_key(key(code));
-            assert_eq!(selected_menu_item(&app), MenuItem::Screen(to), "{from:?} {code:?}");
+            assert_eq!(
+                selected_menu_item(&app),
+                MenuItem::Screen(to),
+                "{from:?} {code:?}"
+            );
         }
 
-        for screen in [Screen::Scan, Screen::Disks, Screen::Snapshots, Screen::Careful] {
+        for screen in [
+            Screen::Scan,
+            Screen::Disks,
+            Screen::Snapshots,
+            Screen::Careful,
+        ] {
             let mut app = App::new(settings());
             app.menu_index = menu_index(MenuItem::Screen(screen));
             app.handle_key(key(KeyCode::Left));
             assert_eq!(selected_menu_item(&app), MenuItem::Screen(screen));
         }
-        for screen in [Screen::Find, Screen::Top, Screen::Diff, Screen::Doctor, Screen::Recover, Screen::Usage] {
+        for screen in [
+            Screen::Find,
+            Screen::Top,
+            Screen::Diff,
+            Screen::Doctor,
+            Screen::Recover,
+            Screen::Usage,
+        ] {
             let mut app = App::new(settings());
             app.menu_index = menu_index(MenuItem::Screen(screen));
             app.handle_key(key(KeyCode::Right));
@@ -3248,8 +4456,14 @@ pub(crate) mod tests {
         app.handle_key(key(KeyCode::Down));
         assert_eq!(selected_menu_item(&app), MenuItem::Screen(Screen::Settings));
         for (item, expected) in [
-            (MenuItem::Screen(Screen::Settings), MenuItem::Screen(Screen::Careful)),
-            (MenuItem::Screen(Screen::Help), MenuItem::Screen(Screen::Careful)),
+            (
+                MenuItem::Screen(Screen::Settings),
+                MenuItem::Screen(Screen::Careful),
+            ),
+            (
+                MenuItem::Screen(Screen::Help),
+                MenuItem::Screen(Screen::Careful),
+            ),
             (MenuItem::Quit, MenuItem::Screen(Screen::Careful)),
         ] {
             app.menu_index = menu_index(item);
@@ -3267,22 +4481,37 @@ pub(crate) mod tests {
         let mut fallback = App::new(settings());
         fallback.menu_index = menu_index(MenuItem::Screen(Screen::Settings));
         fallback.handle_key(key(KeyCode::Up));
-        assert_eq!(selected_menu_item(&fallback), MenuItem::Screen(Screen::Careful));
+        assert_eq!(
+            selected_menu_item(&fallback),
+            MenuItem::Screen(Screen::Careful)
+        );
 
         let mut horizontal = App::new(settings());
         horizontal.menu_index = menu_index(MenuItem::Screen(Screen::Settings));
         horizontal.handle_key(key(KeyCode::Right));
-        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Help));
+        assert_eq!(
+            selected_menu_item(&horizontal),
+            MenuItem::Screen(Screen::Help)
+        );
         horizontal.handle_key(key(KeyCode::Right));
         assert_eq!(selected_menu_item(&horizontal), MenuItem::Quit);
         horizontal.handle_key(key(KeyCode::Right));
         assert_eq!(selected_menu_item(&horizontal), MenuItem::Quit);
         horizontal.handle_key(key(KeyCode::Left));
-        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Help));
+        assert_eq!(
+            selected_menu_item(&horizontal),
+            MenuItem::Screen(Screen::Help)
+        );
         horizontal.handle_key(key(KeyCode::Left));
-        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Settings));
+        assert_eq!(
+            selected_menu_item(&horizontal),
+            MenuItem::Screen(Screen::Settings)
+        );
         horizontal.handle_key(key(KeyCode::Left));
-        assert_eq!(selected_menu_item(&horizontal), MenuItem::Screen(Screen::Settings));
+        assert_eq!(
+            selected_menu_item(&horizontal),
+            MenuItem::Screen(Screen::Settings)
+        );
     }
 
     #[test]
@@ -3318,14 +4547,20 @@ pub(crate) mod tests {
     #[test]
     fn enter_on_dashboard_quit_uses_dashboard_confirmation() {
         let mut app = App::new(settings());
-        app.menu_index = MENU.iter().position(|item| *item == MenuItem::Quit).unwrap();
+        app.menu_index = MENU
+            .iter()
+            .position(|item| *item == MenuItem::Quit)
+            .unwrap();
 
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         assert!(app.confirm_exit);
         assert!(!app.confirm_quit);
         assert!(!app.should_quit);
 
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Command::CancelJobs, Command::Quit]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Command::CancelJobs, Command::Quit]
+        );
     }
 
     #[test]
@@ -3333,18 +4568,36 @@ pub(crate) mod tests {
         let mut app = App::new(settings());
         assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
         assert!(app.confirm_exit && !app.should_quit);
-        assert!(app.handle_key(key(KeyCode::Esc)).is_empty(), "Esc again stays");
+        assert!(
+            app.handle_key(key(KeyCode::Esc)).is_empty(),
+            "Esc again stays"
+        );
         assert!(!app.confirm_exit && !app.should_quit);
         assert_eq!(app.screen, Screen::Dashboard);
         // Enter quits, stopping whatever runs, a scan included.
-        app.scan = ScanStage::Running { progress: Arc::default(), started: Instant::now(), root: "/".into(), auto: false, expected: None };
+        app.scan = ScanStage::Running {
+            progress: Arc::default(),
+            started: Instant::now(),
+            root: "/".into(),
+            auto: false,
+            expected: None,
+        };
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Command::CancelJobs, Command::Quit]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Command::CancelJobs, Command::Quit]
+        );
         assert!(app.should_quit);
         let mut app = App::new(settings());
-        app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('u')) });
+        app.handle_key(KeyEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..key(KeyCode::Char('u'))
+        });
         assert_eq!(app.screen, Screen::Dashboard, "Ctrl+U is not the U hotkey");
-        assert!(app.handle_key(key(KeyCode::Char('Q'))).contains(&Command::Quit));
+        assert!(
+            app.handle_key(key(KeyCode::Char('Q')))
+                .contains(&Command::Quit)
+        );
         assert!(app.should_quit);
     }
 
@@ -3356,7 +4609,10 @@ pub(crate) mod tests {
         assert_eq!(app.screen, Screen::Scan);
         assert!(app.text_input_active());
         // Clear the default root and type a new one; letters must not trigger hotkeys.
-        app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('u')) });
+        app.handle_key(KeyEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..key(KeyCode::Char('u'))
+        });
         typed(&mut app, "/nonexistent-diskdrift-q");
         assert_eq!(app.screen, Screen::Scan, "q while typing is text, not quit");
         assert!(!app.should_quit);
@@ -3364,14 +4620,37 @@ pub(crate) mod tests {
         typed(&mut app, "base");
         // A folder that does not exist is caught in the form, before any confirmation.
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(&app.scan, ScanStage::Setup { field: ScanField::Root, error: Some(_), .. }));
-        app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('u')) });
-        assert!(matches!(&app.scan, ScanStage::Setup { root, error: None, .. } if root.is_empty()), "Ctrl+U clears; typing clears the error");
+        assert!(matches!(
+            &app.scan,
+            ScanStage::Setup {
+                field: ScanField::Root,
+                error: Some(_),
+                ..
+            }
+        ));
+        app.handle_key(KeyEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..key(KeyCode::Char('u'))
+        });
+        assert!(
+            matches!(&app.scan, ScanStage::Setup { root, error: None, .. } if root.is_empty()),
+            "Ctrl+U clears; typing clears the error"
+        );
         typed(&mut app, "/");
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(&app.scan, ScanStage::Confirm { root, name } if root == &root_path() && name == "base"));
+        assert!(
+            matches!(&app.scan, ScanStage::Confirm { root, name } if root == &root_path() && name == "base")
+        );
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::StartScan { root: root_path(), name: Some("base".into()), background: false, disk: None }]);
+        assert_eq!(
+            cmds,
+            vec![Command::StartScan {
+                root: root_path(),
+                name: Some("base".into()),
+                background: false,
+                disk: None
+            }]
+        );
         assert!(app.scan_running());
     }
 
@@ -3379,24 +4658,39 @@ pub(crate) mod tests {
     fn quitting_or_cancelling_a_running_scan_asks_first() {
         let mut app = App::new(settings());
         app.screen = Screen::Scan;
-        app.scan = ScanStage::Running { progress: Arc::default(), started: Instant::now(), root: "/".into(), auto: false, expected: None };
+        app.scan = ScanStage::Running {
+            progress: Arc::default(),
+            started: Instant::now(),
+            root: "/".into(),
+            auto: false,
+            expected: None,
+        };
         assert!(app.handle_key(key(KeyCode::Char('q'))).is_empty());
         assert!(app.confirm_quit && !app.should_quit);
         app.handle_key(key(KeyCode::Char('n')));
         assert!(!app.confirm_quit && !app.should_quit);
         app.handle_key(key(KeyCode::Esc));
         assert!(app.confirm_cancel);
-        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), vec![Command::CancelScan]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            vec![Command::CancelScan]
+        );
         // ← leaves the scan running in the background; x (anywhere) asks to stop it.
         app.handle_key(key(KeyCode::Left));
         assert_eq!(app.screen, Screen::Dashboard);
         assert!(app.scan_running());
         assert!(app.handle_key(key(KeyCode::Char('x'))).is_empty());
         assert!(app.confirm_cancel);
-        assert!(app.handle_key(key(KeyCode::Char('n'))).is_empty(), "no keeps it running");
+        assert!(
+            app.handle_key(key(KeyCode::Char('n'))).is_empty(),
+            "no keeps it running"
+        );
         assert!(app.scan_running());
         app.handle_key(key(KeyCode::Char('q')));
-        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), vec![Command::CancelJobs, Command::Quit]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            vec![Command::CancelJobs, Command::Quit]
+        );
         assert!(app.should_quit);
     }
 
@@ -3404,7 +4698,10 @@ pub(crate) mod tests {
     fn quitting_while_doctor_runs_does_not_block() {
         let mut app = App::new(settings());
         app.handle_key(key(KeyCode::Char('i')));
-        assert!(app.handle_key(key(KeyCode::Char('q'))).contains(&Command::Quit));
+        assert!(
+            app.handle_key(key(KeyCode::Char('q')))
+                .contains(&Command::Quit)
+        );
     }
 
     pub fn recover_report(dir: &Path) -> RecoverReport {
@@ -3414,9 +4711,11 @@ pub(crate) mod tests {
             path,
             observed_bytes: Some(1_000_000_000),
             reclaimable: "up to 1 GB".into(),
+            reclaimable_measurement: Default::default(),
             risk: "medium".into(),
             confidence: "observed".into(),
             how: "look inside".into(),
+            measurement: Default::default(),
             skipped: false,
             growth: None,
             within: None,
@@ -3474,28 +4773,57 @@ pub(crate) mod tests {
         report.candidates[0].growth = Some((2, 4));
         app.handle_msg(Msg::Recover(Box::new(Ok(report))));
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::RunBrowse { id: 1, source: BrowseSource::Diff { old: 2, new: 4 }, path: Some(dir.clone()) }]);
+        assert_eq!(
+            cmds,
+            vec![Command::RunBrowse {
+                id: 1,
+                source: BrowseSource::Diff { old: 2, new: 4 },
+                path: Some(dir.clone())
+            }]
+        );
         assert_eq!(app.screen, Screen::Browse);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Recover);
         let cmds = app.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(cmds, vec![Command::CancelAnalyze, Command::RunAnalyze { id: 1, path: dir, live: false }], "a analyses it as it is now");
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CancelAnalyze,
+                Command::RunAnalyze {
+                    id: 1,
+                    path: dir,
+                    live: false
+                }
+            ],
+            "a analyses it as it is now"
+        );
         // Doctor: Enter goes to the suggestions; only F5 measures again.
         app.doctor = Job::Failed("measured before".into());
         app.screen = Screen::Doctor;
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         assert_eq!(app.screen, Screen::Recover);
         app.screen = Screen::Doctor;
-        assert_eq!(app.handle_key(key(KeyCode::F(5))), vec![Command::RunDoctor { live: true }]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::F(5))),
+            vec![Command::RunDoctor { live: true }]
+        );
     }
 
     #[test]
     fn recover_logs_steps_and_opens_folder_analyses() {
         let dir = std::env::temp_dir();
         let mut app = App::new(settings());
-        assert_eq!(app.handle_key(key(KeyCode::Char('r'))), vec![Command::RunDoctor { live: false }], "one measurement for Doctor and Recover");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r'))),
+            vec![Command::RunDoctor { live: false }],
+            "one measurement for Doctor and Recover"
+        );
         assert!(app.doctor.is_running() && app.recover.is_running());
-        app.handle_msg(Msg::DoctorStep(DoctorStep::Measuring { label: "Caches".into(), index: 0, total: 3 }));
+        app.handle_msg(Msg::DoctorStep(DoctorStep::Measuring {
+            label: "Caches".into(),
+            index: 0,
+            total: 3,
+        }));
         assert_eq!(app.doctor_log.len(), 2, "start line plus the step");
         assert!(app.doctor_log[1].text.contains("measuring Caches (1/3)"));
         assert_eq!(app.doctor_log[1].at.len(), 8, "HH:MM:SS");
@@ -3509,26 +4837,71 @@ pub(crate) mod tests {
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         app.handle_key(key(KeyCode::Up));
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::CancelAnalyze, Command::RunAnalyze { id: 1, path: dir.clone(), live: false }]);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CancelAnalyze,
+                Command::RunAnalyze {
+                    id: 1,
+                    path: dir.clone(),
+                    live: false
+                }
+            ]
+        );
         assert_eq!(app.analysis.stack.len(), 1);
 
         // A result of another run is ignored; the matching one is shown.
-        app.handle_msg(Msg::Analyze { id: 99, result: Box::new(Ok(analysis(&dir))) });
+        app.handle_msg(Msg::Analyze {
+            id: 99,
+            result: Box::new(Ok(analysis(&dir))),
+        });
         assert!(app.analysis.stack[0].result.is_running());
         app.handle_msg(Msg::AnalyzeStep {
             id: 1,
-            step: AnalyzeStep::Measured { name: "sub".into(), allocated_bytes: 5_000, entries: 3, elapsed: std::time::Duration::from_millis(5) },
+            step: AnalyzeStep::Measured {
+                name: "sub".into(),
+                allocated_bytes: 5_000,
+                entries: 3,
+                elapsed: std::time::Duration::from_millis(5),
+            },
         });
-        assert!(app.analysis.stack[0].log.last().unwrap().text.contains("sub: 5.0 kB"));
-        app.handle_msg(Msg::Analyze { id: 1, result: Box::new(Ok(analysis(&dir))) });
+        assert!(
+            app.analysis.stack[0]
+                .log
+                .last()
+                .unwrap()
+                .text
+                .contains("sub: 5.0 kB")
+        );
+        app.handle_msg(Msg::Analyze {
+            id: 1,
+            result: Box::new(Ok(analysis(&dir))),
+        });
         assert!(app.analysis.stack[0].result.done().is_some());
 
         // Enter opens a subfolder; a file does not; Esc goes back one level at a time.
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::CancelAnalyze, Command::RunAnalyze { id: 2, path: dir.join("sub"), live: false }]);
-        assert_eq!(app.handle_key(key(KeyCode::Esc)), vec![Command::CancelAnalyze], "leaving a running analysis cancels it");
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CancelAnalyze,
+                Command::RunAnalyze {
+                    id: 2,
+                    path: dir.join("sub"),
+                    live: false
+                }
+            ]
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)),
+            vec![Command::CancelAnalyze],
+            "leaving a running analysis cancels it"
+        );
         app.handle_key(key(KeyCode::Down));
-        assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "file.dmg is not a folder");
+        assert!(
+            app.handle_key(key(KeyCode::Enter)).is_empty(),
+            "file.dmg is not a folder"
+        );
         assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
         assert!(app.analysis.stack.is_empty());
         assert_eq!(app.screen, Screen::Recover);
@@ -3537,14 +4910,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn doctor_progress_does_not_render_missing_allocation_as_zero() {
+        let step = DoctorStep::Measured {
+            label: "Caches".into(),
+            path: "/tmp/Caches".into(),
+            status: MeasureStatus::Complete,
+            allocated_bytes: None,
+            quality: Quality::Unknown,
+            entries: 1,
+            elapsed: std::time::Duration::ZERO,
+        };
+
+        let text = step_text(&step, SizeUnits::Decimal);
+
+        assert!(text.contains("unknown"), "{text}");
+        assert!(!text.contains("0 B"), "{text}");
+    }
+
+    #[test]
     fn doctor_and_recover_share_one_measurement() {
         let mut app = App::new(settings());
-        assert_eq!(app.handle_key(key(KeyCode::Char('i'))), vec![Command::RunDoctor { live: false }]);
-        assert!(app.handle_key(key(KeyCode::Char('r'))).is_empty(), "Recover waits for the running measurement");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('i'))),
+            vec![Command::RunDoctor { live: false }]
+        );
+        assert!(
+            app.handle_key(key(KeyCode::Char('r'))).is_empty(),
+            "Recover waits for the running measurement"
+        );
         assert!(app.recover.is_running());
         assert!(app.handle_key(key(KeyCode::Tab)).is_empty());
-        assert_eq!(app.screen, Screen::Doctor, "Tab switches between diagnosis and suggestions");
-        app.handle_msg(Msg::Recover(Box::new(Ok(recover_report(Path::new("/tmp"))))));
+        assert_eq!(
+            app.screen,
+            Screen::Doctor,
+            "Tab switches between diagnosis and suggestions"
+        );
+        app.handle_msg(Msg::Recover(Box::new(Ok(recover_report(Path::new(
+            "/tmp",
+        ))))));
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.screen, Screen::Recover);
         assert!(app.recover.done().is_some());
@@ -3554,23 +4957,53 @@ pub(crate) mod tests {
     fn n_skips_the_location_being_measured() {
         let mut app = App::new(settings());
         app.handle_key(key(KeyCode::Char('r')));
-        assert!(app.handle_key(key(KeyCode::Char('n'))).is_empty(), "nothing being measured yet");
-        app.handle_msg(Msg::DoctorStep(DoctorStep::Measuring { label: "Application Support".into(), index: 11, total: 32 }));
-        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), vec![Command::SkipDoctorStep]);
-        assert!(app.doctor_log.last().unwrap().text.contains("skipping Application Support"));
-        assert!(app.handle_key(key(KeyCode::Char('n'))).is_empty(), "one skip per location");
+        assert!(
+            app.handle_key(key(KeyCode::Char('n'))).is_empty(),
+            "nothing being measured yet"
+        );
+        app.handle_msg(Msg::DoctorStep(DoctorStep::Measuring {
+            label: "Application Support".into(),
+            index: 11,
+            total: 32,
+        }));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n'))),
+            vec![Command::SkipDoctorStep]
+        );
+        assert!(
+            app.doctor_log
+                .last()
+                .unwrap()
+                .text
+                .contains("skipping Application Support")
+        );
+        assert!(
+            app.handle_key(key(KeyCode::Char('n'))).is_empty(),
+            "one skip per location"
+        );
         assert_eq!(app.screen, Screen::Recover);
 
         app.handle_key(key(KeyCode::Char('i')));
-        app.handle_msg(Msg::DoctorStep(DoctorStep::Measuring { label: "Caches".into(), index: 0, total: 32 }));
-        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), vec![Command::SkipDoctorStep]);
+        app.handle_msg(Msg::DoctorStep(DoctorStep::Measuring {
+            label: "Caches".into(),
+            index: 0,
+            total: 32,
+        }));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n'))),
+            vec![Command::SkipDoctorStep]
+        );
     }
 
     pub fn browse_listing(root: &str, path: &str, names: &[(&str, bool)]) -> BrowseData {
         use diskdrift_app::core::browse::{Child, Listing};
         let child = |p: String, dir: bool| Child {
-            path: p.into_bytes().into(),
-            kind: if dir { diskdrift_app::core::record::Kind::Dir } else { diskdrift_app::core::record::Kind::File },
+            path: diskdrift_app::core::native::NativePath::unix(p.into_bytes()),
+            kind: if dir {
+                diskdrift_app::core::record::Kind::Dir
+            } else {
+                diskdrift_app::core::record::Kind::File
+            },
             allocated_bytes: 1000,
             logical_bytes: 1000,
             entries: 1,
@@ -3582,12 +5015,17 @@ pub(crate) mod tests {
             id: 7,
             name: "base".into(),
             root: root.into(),
+            root_native: Some(diskdrift_core::native::NativeRoot::posix(
+                root.as_bytes().to_vec(),
+            )),
             disk: None,
             root_in_volume: None,
+            root_in_volume_native: None,
             status: diskdrift_app::storage::Status::Completed,
             started_at: "2026-10-21T10:00:00+02:00".into(),
             finished_at: None,
             volume: Default::default(),
+            volumes: Vec::new(),
             options: Default::default(),
             space_before: None,
             space_after: None,
@@ -3600,8 +5038,14 @@ pub(crate) mod tests {
             snapshot,
             path: path.into(),
             listing: Listing {
-                dir: Some(Child { allocated_bytes: 1000 * names.len() as u64, ..child(path.into(), true) }),
-                items: names.iter().map(|(n, d)| child(format!("{path}/{n}"), *d)).collect(),
+                dir: Some(Child {
+                    allocated_bytes: 1000 * names.len() as u64,
+                    ..child(path.into(), true)
+                }),
+                items: names
+                    .iter()
+                    .map(|(n, d)| child(format!("{path}/{n}"), *d))
+                    .collect(),
                 more_items: 0,
                 more_allocated_bytes: 0,
             },
@@ -3612,27 +5056,76 @@ pub(crate) mod tests {
     fn browse_drills_down_and_back_up_to_the_root() {
         let mut app = App::new(settings());
         app.screen = Screen::Top;
-        let cmds = app.open_browse(BrowseSource::Snapshot(7), Some("/r/a".into()), Some("y".into()));
-        assert_eq!(cmds, vec![Command::RunBrowse { id: 1, source: BrowseSource::Snapshot(7), path: Some("/r/a".into()) }]);
+        let cmds = app.open_browse(
+            BrowseSource::Snapshot(7),
+            Some("/r/a".into()),
+            Some("y".into()),
+        );
+        assert_eq!(
+            cmds,
+            vec![Command::RunBrowse {
+                id: 1,
+                source: BrowseSource::Snapshot(7),
+                path: Some("/r/a".into())
+            }]
+        );
         assert_eq!(app.screen, Screen::Browse);
-        app.handle_msg(Msg::Browse { id: 1, result: Box::new(Ok(browse_listing("/r", "/r/a", &[("x", true), ("y", false)]))) });
-        assert_eq!(app.browse.as_ref().unwrap().stack[0].sel, 1, "cursor on the file it was opened for");
+        app.handle_msg(Msg::Browse {
+            id: 1,
+            result: Box::new(Ok(browse_listing(
+                "/r",
+                "/r/a",
+                &[("x", true), ("y", false)],
+            ))),
+        });
+        assert_eq!(
+            app.browse.as_ref().unwrap().stack[0].sel,
+            1,
+            "cursor on the file it was opened for"
+        );
 
         // A file does not open; a folder does, as a new level.
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         app.handle_key(key(KeyCode::Up));
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds, vec![Command::RunBrowse { id: 2, source: BrowseSource::Snapshot(7), path: Some("/r/a/x".into()) }]);
-        app.handle_msg(Msg::Browse { id: 2, result: Box::new(Ok(browse_listing("/r", "/r/a/x", &[]))) });
+        assert_eq!(
+            cmds,
+            vec![Command::RunBrowse {
+                id: 2,
+                source: BrowseSource::Snapshot(7),
+                path: Some("/r/a/x".into())
+            }]
+        );
+        app.handle_msg(Msg::Browse {
+            id: 2,
+            result: Box::new(Ok(browse_listing("/r", "/r/a/x", &[]))),
+        });
 
         // Esc pops the level back (no reload), then goes above where it was opened.
         assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
         assert_eq!(app.browse.as_ref().unwrap().stack.len(), 1);
         let cmds = app.handle_key(key(KeyCode::Left));
-        assert_eq!(cmds, vec![Command::RunBrowse { id: 3, source: BrowseSource::Snapshot(7), path: Some("/r".into()) }]);
-        app.handle_msg(Msg::Browse { id: 3, result: Box::new(Ok(browse_listing("/r", "/r", &[("0", true), ("a", true)]))) });
-        assert_eq!(app.browse.as_ref().unwrap().stack[0].sel, 1, "cursor on the folder we came from");
-        app.handle_msg(Msg::Browse { id: 2, result: Box::new(Ok(browse_listing("/r", "/r/a/x", &[]))) });
+        assert_eq!(
+            cmds,
+            vec![Command::RunBrowse {
+                id: 3,
+                source: BrowseSource::Snapshot(7),
+                path: Some("/r".into())
+            }]
+        );
+        app.handle_msg(Msg::Browse {
+            id: 3,
+            result: Box::new(Ok(browse_listing("/r", "/r", &[("0", true), ("a", true)]))),
+        });
+        assert_eq!(
+            app.browse.as_ref().unwrap().stack[0].sel,
+            1,
+            "cursor on the folder we came from"
+        );
+        app.handle_msg(Msg::Browse {
+            id: 2,
+            result: Box::new(Ok(browse_listing("/r", "/r/a/x", &[]))),
+        });
 
         // At the root Esc returns to where the browser was opened from.
         app.handle_key(key(KeyCode::Esc));
@@ -3645,19 +5138,53 @@ pub(crate) mod tests {
         let mut app = App::new(settings());
         app.screen = Screen::Snapshots;
         app.open_browse(BrowseSource::Snapshot(7), None, None);
-        app.handle_msg(Msg::Browse { id: 1, result: Box::new(Ok(browse_listing("/r", "/r", &[("Library", true), ("big.iso", false)]))) });
+        app.handle_msg(Msg::Browse {
+            id: 1,
+            result: Box::new(Ok(browse_listing(
+                "/r",
+                "/r",
+                &[("Library", true), ("big.iso", false)],
+            ))),
+        });
         let cmds = app.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(cmds, vec![Command::CancelAnalyze, Command::RunAnalyze { id: 1, path: "/r/Library".into(), live: false }]);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CancelAnalyze,
+                Command::RunAnalyze {
+                    id: 1,
+                    path: "/r/Library".into(),
+                    live: false
+                }
+            ]
+        );
         assert_eq!(app.screen, Screen::Analyze);
-        app.handle_msg(Msg::Analyze { id: 1, result: Box::new(Ok(analysis(Path::new("/r/Library")))) });
+        app.handle_msg(Msg::Analyze {
+            id: 1,
+            result: Box::new(Ok(analysis(Path::new("/r/Library")))),
+        });
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.screen, Screen::Browse, "back to the browser, its state kept");
+        assert_eq!(
+            app.screen,
+            Screen::Browse,
+            "back to the browser, its state kept"
+        );
         assert_eq!(app.browse.as_ref().unwrap().stack.len(), 1);
 
         // On a file, the folder shown is analysed.
         app.handle_key(key(KeyCode::Down));
         let cmds = app.handle_key(key(KeyCode::Char('a')));
-        assert_eq!(cmds, vec![Command::CancelAnalyze, Command::RunAnalyze { id: 2, path: "/r".into(), live: false }]);
+        assert_eq!(
+            cmds,
+            vec![
+                Command::CancelAnalyze,
+                Command::RunAnalyze {
+                    id: 2,
+                    path: "/r".into(),
+                    live: false
+                }
+            ]
+        );
         assert_eq!(app.analysis.stack.len(), 1, "a fresh analysis stack");
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(key(KeyCode::Esc));
@@ -3673,7 +5200,11 @@ pub(crate) mod tests {
                 BrowseData::Diff(_) => unreachable!(),
             };
             v.id = id;
-            diskdrift_app::snapshots::SnapshotRow { meta: v, size_on_disk: 0, disk_name: None }
+            diskdrift_app::snapshots::SnapshotRow {
+                meta: v,
+                size_on_disk: 0,
+                disk_name: None,
+            }
         };
         app.snapshots = Job::Done(Box::new(SnapshotList {
             store_path: "/s".into(),
@@ -3683,7 +5214,14 @@ pub(crate) mod tests {
             disk_count: 1,
             disk: None,
         }));
-        let run = |old, new| vec![Command::RunDiff { old, new, sort: DiffSort::Growth, min_size: 0 }];
+        let run = |old, new| {
+            vec![Command::RunDiff {
+                old,
+                new,
+                sort: DiffSort::Growth,
+                min_size: 0,
+            }]
+        };
         // Opening compares the newest scan with the previous one, no Enter needed.
         assert_eq!(app.handle_key(key(KeyCode::Char('d'))), run(3, 4));
         // ↑ at the top of the results reaches the scans line; Enter opens the list.
@@ -3695,13 +5233,21 @@ pub(crate) mod tests {
         app.handle_key(key(KeyCode::Up));
         assert_eq!(app.diff.cursor, 0, "greyed #2 is skipped");
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!((app.diff.focus, app.diff.cursor), (DiffFocus::PickNew, 3), "the later scan stays");
+        assert_eq!(
+            (app.diff.focus, app.diff.cursor),
+            (DiffFocus::PickNew, 3),
+            "the later scan stays"
+        );
         app.handle_key(key(KeyCode::Up));
         assert_eq!(app.diff.cursor, 2);
         app.handle_key(key(KeyCode::Up));
         assert_eq!(app.diff.cursor, 2, "nothing earlier fits");
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!((app.diff.focus, app.diff.cursor), (DiffFocus::PickOld, 0), "Esc goes back one step");
+        assert_eq!(
+            (app.diff.focus, app.diff.cursor),
+            (DiffFocus::PickOld, 0),
+            "Esc goes back one step"
+        );
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), run(1, 4));
         assert_eq!(app.diff.focus, DiffFocus::Results);
@@ -3709,7 +5255,10 @@ pub(crate) mod tests {
         app.handle_key(key(KeyCode::Char('p')));
         assert_eq!(app.diff.focus, DiffFocus::PickOld);
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!((app.screen, app.diff.focus), (Screen::Diff, DiffFocus::Results));
+        assert_eq!(
+            (app.screen, app.diff.focus),
+            (Screen::Diff, DiffFocus::Results)
+        );
         // The user's choice is kept when coming back.
         app.handle_key(key(KeyCode::Esc));
         assert!(app.handle_key(key(KeyCode::Char('d'))).is_empty());
@@ -3725,26 +5274,62 @@ pub(crate) mod tests {
                     BrowseData::Diff(_) => unreachable!(),
                 };
                 (v.id, v.status) = (id, status);
-                diskdrift_app::snapshots::SnapshotRow { meta: v, size_on_disk: 0, disk_name: None }
+                diskdrift_app::snapshots::SnapshotRow {
+                    meta: v,
+                    size_on_disk: 0,
+                    disk_name: None,
+                }
             })
             .collect();
-        SnapshotList { store_path: "/s".into(), store_exists: true, store_bytes: 0, snapshots, disk_count: 1, disk: None }
+        SnapshotList {
+            store_path: "/s".into(),
+            store_exists: true,
+            store_bytes: 0,
+            snapshots,
+            disk_count: 1,
+            disk: None,
+        }
     }
 
     #[test]
     fn browse_switches_to_the_changes_here_and_says_why_a_file_does_not_open() {
         let mut app = App::new(settings());
         app.auto_checked = true;
-        app.handle_msg(Msg::Snapshots(Box::new(Ok(rows(&[(1, "/r", Status::Completed), (2, "/r", Status::Completed), (3, "/q", Status::Completed)])))));
+        app.handle_msg(Msg::Snapshots(Box::new(Ok(rows(&[
+            (1, "/r", Status::Completed),
+            (2, "/r", Status::Completed),
+            (3, "/q", Status::Completed),
+        ])))));
         app.screen = Screen::Snapshots;
         let cmds = app.open_browse(BrowseSource::Snapshot(2), Some("/r/a".into()), None);
-        let Command::RunBrowse { id, .. } = cmds[0] else { panic!("{cmds:?}") };
-        app.handle_msg(Msg::Browse { id, result: Box::new(Ok(browse_listing("/r", "/r/a", &[("dir", true), ("file.txt", false)]))) });
+        let Command::RunBrowse { id, .. } = cmds[0] else {
+            panic!("{cmds:?}")
+        };
+        app.handle_msg(Msg::Browse {
+            id,
+            result: Box::new(Ok(browse_listing(
+                "/r",
+                "/r/a",
+                &[("dir", true), ("file.txt", false)],
+            ))),
+        });
         app.handle_key(key(KeyCode::Down));
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
-        assert!(app.browse.as_ref().unwrap().note.as_deref().unwrap().contains("file.txt is a file"));
+        assert!(
+            app.browse
+                .as_ref()
+                .unwrap()
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("file.txt is a file")
+        );
         app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.browse.as_ref().unwrap().note, None, "the next key clears the note");
+        assert_eq!(
+            app.browse.as_ref().unwrap().note,
+            None,
+            "the next key clears the note"
+        );
         // c: the same folder, what changed there since the previous scan of it.
         let cmds = app.handle_key(key(KeyCode::Char('c')));
         assert!(
@@ -3753,20 +5338,45 @@ pub(crate) mod tests {
         );
         // c again: back to the scan; Esc at the top still returns to History.
         let cmds = app.handle_key(key(KeyCode::Char('c')));
-        assert!(matches!(&cmds[..], [Command::RunBrowse { source: BrowseSource::Snapshot(2), .. }]), "{cmds:?}");
+        assert!(
+            matches!(
+                &cmds[..],
+                [Command::RunBrowse {
+                    source: BrowseSource::Snapshot(2),
+                    ..
+                }]
+            ),
+            "{cmds:?}"
+        );
         assert_eq!(app.browse.as_ref().unwrap().back, Screen::Snapshots);
         // A scan with no earlier one of the same folder says so.
         app.open_browse(BrowseSource::Snapshot(3), None, None);
         assert!(app.handle_key(key(KeyCode::Char('c'))).is_empty());
-        assert!(app.browse.as_ref().unwrap().note.as_deref().unwrap().contains("No earlier scan"));
+        assert!(
+            app.browse
+                .as_ref()
+                .unwrap()
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("No earlier scan")
+        );
     }
 
     #[test]
     fn usage_reads_again_on_f5_only() {
         let mut app = App::new(settings());
         assert_eq!(app.open(Screen::Usage), vec![Command::LoadUsage]);
-        assert!(app.handle_key(key(KeyCode::F(5))).is_empty(), "already reading");
-        app.handle_msg(Msg::Usage(Box::new(UsageReport { containers: Vec::new(), other_volumes: Vec::new(), apfs_error: None })));
+        assert!(
+            app.handle_key(key(KeyCode::F(5))).is_empty(),
+            "already reading"
+        );
+        app.handle_msg(Msg::Usage(Box::new(UsageReport {
+            containers: Vec::new(),
+            other_volumes: Vec::new(),
+            apfs_error: None,
+            mounts_error: None,
+        })));
         assert!(app.usage_at.is_some());
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
         assert_eq!(app.handle_key(key(KeyCode::F(5))), vec![Command::LoadUsage]);
@@ -3779,7 +5389,10 @@ pub(crate) mod tests {
         app.auto_checked = true;
         app.handle_key(key(KeyCode::Char('s')));
         app.handle_key(key(KeyCode::Enter));
-        assert!(!app.handle_key(key(KeyCode::Enter)).is_empty(), "the default root / starts");
+        assert!(
+            !app.handle_key(key(KeyCode::Enter)).is_empty(),
+            "the default root / starts"
+        );
         let root = root_path();
         let both = rows(&[(1, &root, Status::Completed), (2, &root, Status::Completed)]);
         let outcome = ScanOutcome {
@@ -3790,36 +5403,64 @@ pub(crate) mod tests {
             rebase: diskdrift_app::storage::Rebase::Nothing,
             rebase_error: None,
             disk: None,
+            migration: diskdrift_app::storage::MigrationOutcome::None,
         };
         app.handle_msg(Msg::ScanDone(Box::new(Ok(outcome))));
         app.handle_msg(Msg::Snapshots(Box::new(Ok(both))));
         let cmds = app.handle_key(key(KeyCode::Char('c')));
-        assert!(matches!(cmds.as_slice(), [Command::RunBrowse { source: BrowseSource::Diff { old: 1, new: 2 }, .. }]), "{cmds:?}");
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Command::RunBrowse {
+                    source: BrowseSource::Diff { old: 1, new: 2 },
+                    ..
+                }]
+            ),
+            "{cmds:?}"
+        );
         // Leaving the result: S next time is a new scan of the same folder.
         app.screen = Screen::Scan;
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Dashboard);
-        assert!(matches!(&app.scan, ScanStage::Setup { root, error: None, .. } if root == &root_path()));
+        assert!(
+            matches!(&app.scan, ScanStage::Setup { root, error: None, .. } if root == &root_path())
+        );
         // A failed scan goes back to the form, saying why.
         app.screen = Screen::Scan;
         app.scan = ScanStage::Finished(Err("boom".into()));
         app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(&app.scan, ScanStage::Setup { root, error: Some(e), .. } if root == &root_path() && e == "boom"));
+        assert!(
+            matches!(&app.scan, ScanStage::Setup { root, error: Some(e), .. } if root == &root_path() && e == "boom")
+        );
     }
 
     #[test]
     fn history_starts_on_the_newest_usable_scan_and_says_why_nothing_opens() {
         let mut app = App::new(settings());
         app.screen = Screen::Snapshots;
-        let list = rows(&[(1, "/a", Status::Completed), (2, "/b", Status::Completed), (3, "/a", Status::Cancelled)]);
+        let list = rows(&[
+            (1, "/a", Status::Completed),
+            (2, "/b", Status::Completed),
+            (3, "/a", Status::Cancelled),
+        ]);
         app.handle_msg(Msg::Snapshots(Box::new(Ok(list))));
         assert_eq!(app.snap_sel, 1, "#3 was cancelled: start on #2");
         assert!(app.handle_key(key(KeyCode::Char('c'))).is_empty());
-        assert!(app.snap_note.as_deref().unwrap().contains("No earlier scan of /b"));
+        assert!(
+            app.snap_note
+                .as_deref()
+                .unwrap()
+                .contains("No earlier scan of /b")
+        );
         app.handle_key(key(KeyCode::Down));
         assert!(app.snap_note.is_none(), "moving clears the note");
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
-        assert!(app.snap_note.as_deref().unwrap().contains("#3 was cancelled"));
+        assert!(
+            app.snap_note
+                .as_deref()
+                .unwrap()
+                .contains("#3 was cancelled")
+        );
         assert!(app.handle_key(key(KeyCode::Char('t'))).is_empty());
         assert_eq!(app.screen, Screen::Snapshots);
     }
@@ -3827,11 +5468,27 @@ pub(crate) mod tests {
     #[test]
     fn largest_files_tabs_on_arrows_and_picks_another_scan_from_a_list() {
         let mut app = App::new(settings());
-        app.snapshots = Job::Done(Box::new(rows(&[(1, "/a", Status::Completed), (2, "/a", Status::Partial)])));
-        let run = |snapshot| vec![Command::RunTop { snapshot, metric: SizeMetric::Allocated }];
-        assert_eq!(app.handle_key(key(KeyCode::Char('t'))), run(2), "opens on the newest scan");
+        app.snapshots = Job::Done(Box::new(rows(&[
+            (1, "/a", Status::Completed),
+            (2, "/a", Status::Partial),
+        ])));
+        let run = |snapshot| {
+            vec![Command::RunTop {
+                snapshot,
+                metric: SizeMetric::Allocated,
+            }]
+        };
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('t'))),
+            run(2),
+            "opens on the newest scan"
+        );
         assert!(app.handle_key(key(KeyCode::Right)).is_empty());
-        assert_eq!(app.top.view, TopView::Dirs, "←→ switch files/folders, like the Compare tabs");
+        assert_eq!(
+            app.top.view,
+            TopView::Dirs,
+            "←→ switch files/folders, like the Compare tabs"
+        );
         app.handle_key(key(KeyCode::Up));
         assert_eq!(app.top.focus, TopFocus::Header);
         app.handle_key(key(KeyCode::Enter));
@@ -3841,9 +5498,16 @@ pub(crate) mod tests {
         assert_eq!(app.top.focus, TopFocus::List);
         app.handle_key(key(KeyCode::Char('p')));
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!((app.screen, app.top.focus), (Screen::Top, TopFocus::List), "Esc leaves the list, not the screen");
+        assert_eq!(
+            (app.screen, app.top.focus),
+            (Screen::Top, TopFocus::List),
+            "Esc leaves the list, not the screen"
+        );
         app.handle_key(key(KeyCode::Esc));
-        assert!(app.handle_key(key(KeyCode::Char('t'))).is_empty(), "the chosen scan is kept");
+        assert!(
+            app.handle_key(key(KeyCode::Char('t'))).is_empty(),
+            "the chosen scan is kept"
+        );
     }
 
     #[test]
@@ -3855,7 +5519,11 @@ pub(crate) mod tests {
                 BrowseData::Diff(_) => unreachable!(),
             };
             v.id = id;
-            diskdrift_app::snapshots::SnapshotRow { meta: v, size_on_disk: 0, disk_name: None }
+            diskdrift_app::snapshots::SnapshotRow {
+                meta: v,
+                size_on_disk: 0,
+                disk_name: None,
+            }
         };
         app.snapshots = Job::Done(Box::new(SnapshotList {
             store_path: "/s".into(),
@@ -3866,20 +5534,41 @@ pub(crate) mod tests {
             disk: None,
         }));
         app.screen = Screen::Snapshots;
-        assert!(app.handle_key(key(KeyCode::Char('c'))).is_empty(), "no scan before the first");
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Command::RunBrowse { id: 1, source: BrowseSource::Snapshot(1), path: None }]);
+        assert!(
+            app.handle_key(key(KeyCode::Char('c'))).is_empty(),
+            "no scan before the first"
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Command::RunBrowse {
+                id: 1,
+                source: BrowseSource::Snapshot(1),
+                path: None
+            }]
+        );
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Snapshots);
         app.handle_key(key(KeyCode::Down));
         let cmds = app.handle_key(key(KeyCode::Char('c')));
-        assert_eq!(cmds, vec![Command::RunBrowse { id: 2, source: BrowseSource::Diff { old: 1, new: 2 }, path: None }]);
+        assert_eq!(
+            cmds,
+            vec![Command::RunBrowse {
+                id: 2,
+                source: BrowseSource::Diff { old: 1, new: 2 },
+                path: None
+            }]
+        );
     }
 
     #[test]
     fn settings_toggle_edit_and_save_the_config_file() {
         let t = diskdrift_core::testutil::TestDir::new("tui-settings");
         let cfg = t.path().join("config.json");
-        let ov = diskdrift_app::config::Overrides { config: Some(cfg.clone()), db: Some(t.path().join("store")), ..Default::default() };
+        let ov = diskdrift_app::config::Overrides {
+            config: Some(cfg.clone()),
+            db: Some(t.path().join("store")),
+            ..Default::default()
+        };
         std::fs::write(&cfg, r#"{"schemaVersion":1}"#).unwrap();
         let mut app = App::new(resolve_with(&ov, t.path(), Path::new("/")).unwrap());
         app.handle_key(key(KeyCode::Char('e')));
@@ -3891,7 +5580,11 @@ pub(crate) mod tests {
             app.handle_key(key(KeyCode::Down));
         }
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.settings.size_units.value, SizeUnits::Binary, "applied to this session");
+        assert_eq!(
+            app.settings.size_units.value,
+            SizeUnits::Binary,
+            "applied to this session"
+        );
         assert!(std::fs::read_to_string(&cfg).unwrap().contains("binary"));
 
         // Text is typed (letters are text, not hotkeys) and saved on Enter.
@@ -3909,7 +5602,12 @@ pub(crate) mod tests {
         typed(&mut app, "x");
         app.handle_key(key(KeyCode::Enter));
         assert!(matches!(&app.settings_ui.message, Some(Err(m)) if m.contains("whole number")));
-        assert!(std::fs::read_to_string(&cfg).unwrap().contains("\"threads\": 0,"), "file unchanged");
+        assert!(
+            std::fs::read_to_string(&cfg)
+                .unwrap()
+                .contains("\"threads\": 0,"),
+            "file unchanged"
+        );
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Dashboard);
     }
@@ -3930,7 +5628,11 @@ pub(crate) mod tests {
             store_path: "/s".into(),
             store_exists: true,
             store_bytes: 0,
-            snapshots: vec![diskdrift_app::snapshots::SnapshotRow { meta: old.clone(), size_on_disk: 0, disk_name: None }],
+            snapshots: vec![diskdrift_app::snapshots::SnapshotRow {
+                meta: old.clone(),
+                size_on_disk: 0,
+                disk_name: None,
+            }],
             disk_count: 1,
             disk: None,
         };
@@ -3940,11 +5642,21 @@ pub(crate) mod tests {
             "{cmds:?}"
         );
         assert!(app.auto_scan_running() && !app.busy());
-        assert!(app.handle_msg(Msg::Snapshots(Box::new(Ok(list())))).is_empty(), "only once per session");
+        assert!(
+            app.handle_msg(Msg::Snapshots(Box::new(Ok(list()))))
+                .is_empty(),
+            "only once per session"
+        );
 
-        assert!(app.handle_key(key(KeyCode::Char('x'))).is_empty(), "asks first");
+        assert!(
+            app.handle_key(key(KeyCode::Char('x'))).is_empty(),
+            "asks first"
+        );
         assert!(app.confirm_cancel);
-        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), vec![Command::CancelScan]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            vec![Command::CancelScan]
+        );
         assert!(app.auto_status.as_deref().unwrap().contains("stopping"));
         let mut cancelled = ScanOutcome {
             snapshot: old.clone(),
@@ -3954,24 +5666,46 @@ pub(crate) mod tests {
             rebase: diskdrift_app::storage::Rebase::Nothing,
             rebase_error: None,
             disk: None,
+            migration: diskdrift_app::storage::MigrationOutcome::None,
         };
         cancelled.snapshot.status = diskdrift_app::storage::Status::Cancelled;
         app.handle_msg(Msg::ScanDone(Box::new(Ok(cancelled))));
         assert!(app.auto_status.as_deref().unwrap().contains("stopped"));
-        assert!(matches!(app.scan, ScanStage::Setup { .. }), "the scan form is ready for a scan of your own");
+        assert!(
+            matches!(app.scan, ScanStage::Setup { .. }),
+            "the scan form is ready for a scan of your own"
+        );
 
         // Quitting during a background scan does not ask.
         let mut app = App::new(settings());
         app.handle_msg(Msg::Snapshots(Box::new(Ok(list()))));
-        assert!(app.handle_key(key(KeyCode::Char('q'))).contains(&Command::Quit));
+        assert!(
+            app.handle_key(key(KeyCode::Char('q')))
+                .contains(&Command::Quit)
+        );
     }
 
     #[test]
     fn no_background_scan_without_an_earlier_scan_or_when_off() {
         let mut app = App::new(settings());
-        let empty = SnapshotList { store_path: "/s".into(), store_exists: false, store_bytes: 0, snapshots: Vec::new(), disk_count: 0, disk: None };
-        assert!(app.handle_msg(Msg::Snapshots(Box::new(Ok(empty.clone())))).is_empty());
-        assert!(app.auto_status.as_deref().unwrap().contains("the first one is up to you"));
+        let empty = SnapshotList {
+            store_path: "/s".into(),
+            store_exists: false,
+            store_bytes: 0,
+            snapshots: Vec::new(),
+            disk_count: 0,
+            disk: None,
+        };
+        assert!(
+            app.handle_msg(Msg::Snapshots(Box::new(Ok(empty.clone()))))
+                .is_empty()
+        );
+        assert!(
+            app.auto_status
+                .as_deref()
+                .unwrap()
+                .contains("the first one is up to you")
+        );
         let mut s = settings();
         s.auto_scan.value = false;
         let mut app = App::new(s);
@@ -3982,7 +5716,10 @@ pub(crate) mod tests {
     #[test]
     fn ctrl_c_quits() {
         let mut app = App::new(settings());
-        app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('c')) });
+        app.handle_key(KeyEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..key(KeyCode::Char('c'))
+        });
         assert!(app.should_quit);
     }
 
@@ -3995,7 +5732,11 @@ pub(crate) mod tests {
         std::fs::create_dir_all(tree.join("a")).unwrap();
         std::fs::write(tree.join("a/x"), b"12345").unwrap();
         std::fs::write(t.path().join("config.json"), r#"{"schemaVersion":1}"#).unwrap();
-        let o = Overrides { config: Some(t.path().join("config.json")), db: Some(t.path().join("store")), ..Default::default() };
+        let o = Overrides {
+            config: Some(t.path().join("config.json")),
+            db: Some(t.path().join("store")),
+            ..Default::default()
+        };
         let s = resolve_with(&o, t.path(), Path::new("/")).unwrap();
         let cancel = std::sync::atomic::AtomicBool::new(false);
         for scan in 0..2 {
@@ -4012,15 +5753,21 @@ pub(crate) mod tests {
     #[cfg(not(windows))]
     fn loaded(s: &Effective) -> App {
         let mut app = App::new(s.clone());
-        app.handle_msg(Msg::Snapshots(Box::new(snapshots::list(s).map_err(|e| e.to_string()))));
+        app.handle_msg(Msg::Snapshots(Box::new(
+            snapshots::list(s).map_err(|e| e.to_string()),
+        )));
         app
     }
 
     #[cfg(not(windows))]
     fn reload(app: &mut App) {
         let s = app.settings.clone();
-        app.handle_msg(Msg::Disks(Box::new(disks::list(&s).map_err(|e| e.to_string()))));
-        app.handle_msg(Msg::Snapshots(Box::new(snapshots::list(&s).map_err(|e| e.to_string()))));
+        app.handle_msg(Msg::Disks(Box::new(
+            disks::list(&s).map_err(|e| e.to_string()),
+        )));
+        app.handle_msg(Msg::Snapshots(Box::new(
+            snapshots::list(&s).map_err(|e| e.to_string()),
+        )));
     }
 
     #[cfg(not(windows))]
@@ -4033,13 +5780,30 @@ pub(crate) mod tests {
         // o: the scans of the folder older than the selected one.
         app.handle_key(key(KeyCode::Char('o')));
         let first = app.history()[0].meta.id;
-        assert_eq!(app.snap_marks.iter().copied().collect::<Vec<_>>(), vec![first]);
-        assert!(app.snap_note.as_deref().is_some_and(|n| n.contains("older than")), "{:?}", app.snap_note);
+        assert_eq!(
+            app.snap_marks.iter().copied().collect::<Vec<_>>(),
+            vec![first]
+        );
+        assert!(
+            app.snap_note
+                .as_deref()
+                .is_some_and(|n| n.contains("older than")),
+            "{:?}",
+            app.snap_note
+        );
         // n: none without data here; p: no rules set yet.
         app.handle_key(key(KeyCode::Char('n')));
-        assert!(app.snap_note.as_deref().is_some_and(|n| n.starts_with("No ")));
+        assert!(
+            app.snap_note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("No "))
+        );
         app.handle_key(key(KeyCode::Char('p')));
-        assert!(app.snap_note.as_deref().is_some_and(|n| n.contains("Settings")));
+        assert!(
+            app.snap_note
+                .as_deref()
+                .is_some_and(|n| n.contains("Settings"))
+        );
         // Esc clears the marks first, and stays.
         app.handle_key(key(KeyCode::Esc));
         assert!(app.snap_marks.is_empty() && app.screen == Screen::Snapshots);
@@ -4049,30 +5813,61 @@ pub(crate) mod tests {
         assert_eq!(app.snap_sel, 1);
         assert!(app.handle_key(key(KeyCode::Delete)).is_empty());
         let p = app.snap_remove.clone().expect("asks");
-        assert_eq!(p.snapshots.iter().map(|r| r.meta.id).collect::<Vec<_>>(), vec![first]);
+        assert_eq!(
+            p.snapshots.iter().map(|r| r.meta.id).collect::<Vec<_>>(),
+            vec![first]
+        );
         app.handle_key(key(KeyCode::Char('q')));
         assert!(!app.should_quit && app.snap_remove.is_none());
         assert_eq!(app.snap_note.as_deref(), Some("Nothing was removed."));
         // y removes them in the background; the result reloads History and My disks.
         app.handle_key(key(KeyCode::Delete));
-        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), vec![Command::RemoveSnapshots { ids: vec![first] }]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            vec![Command::RemoveSnapshots { ids: vec![first] }]
+        );
         assert!(app.store_job.is_some());
         // While it runs: no other store action, and no scan.
         app.handle_key(key(KeyCode::Char('z')));
         assert!(app.snap_note.as_deref().is_some_and(|n| n.contains("Wait")));
-        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), vec![Command::CancelStoreJob]);
-        let r = diskdrift_app::prune::remove(&s, &[first], &std::sync::atomic::AtomicBool::new(false)).map_err(|e| e.to_string());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('x'))),
+            vec![Command::CancelStoreJob]
+        );
+        let r =
+            diskdrift_app::prune::remove(&s, &[first], &std::sync::atomic::AtomicBool::new(false))
+                .map_err(|e| e.to_string());
         let cmds = app.handle_msg(Msg::Removed(Box::new(r)));
         assert!(cmds.contains(&Command::LoadSnapshots) && cmds.contains(&Command::LoadDisks));
         assert!(app.store_job.is_none() && app.snap_marks.is_empty());
-        assert!(app.snap_note.as_deref().is_some_and(|n| n.starts_with("Removed 1 scan")), "{:?}", app.snap_note);
+        assert!(
+            app.snap_note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("Removed 1 scan")),
+            "{:?}",
+            app.snap_note
+        );
         reload(&mut app);
         assert_eq!(app.history().len(), 1);
         // z compacts (nothing to do here).
-        assert_eq!(app.handle_key(key(KeyCode::Char('z'))), vec![Command::Compact]);
-        let c = diskdrift_app::prune::compact(&s, &std::sync::atomic::AtomicBool::new(false), &mut |_| {}).map_err(|e| e.to_string());
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('z'))),
+            vec![Command::Compact]
+        );
+        let c = diskdrift_app::prune::compact(
+            &s,
+            &std::sync::atomic::AtomicBool::new(false),
+            &mut |_| {},
+        )
+        .map_err(|e| e.to_string());
         app.handle_msg(Msg::Compacted(Box::new(c)));
-        assert!(app.snap_note.as_deref().is_some_and(|n| n.contains("already compact")), "{:?}", app.snap_note);
+        assert!(
+            app.snap_note
+                .as_deref()
+                .is_some_and(|n| n.contains("already compact")),
+            "{:?}",
+            app.snap_note
+        );
     }
 
     #[cfg(not(windows))]
@@ -4080,22 +5875,38 @@ pub(crate) mod tests {
     fn my_disks_filters_history_and_edits_the_disk() {
         let (_t, s, _tree) = with_store("tui-my-disks");
         let mut app = loaded(&s);
-        assert_eq!(app.handle_key(key(KeyCode::Char('k'))), vec![Command::LoadDisks]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('k'))),
+            vec![Command::LoadDisks]
+        );
         assert_eq!(app.screen, Screen::Disks);
         reload(&mut app);
         let id = app.selected_disk().unwrap().disk.id.clone();
         assert_eq!(app.selected_disk().unwrap().snapshots, 2);
 
         // Enter: History of that disk, Compare follows.
-        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Command::LoadSnapshots]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            vec![Command::LoadSnapshots]
+        );
         assert_eq!(app.screen, Screen::Snapshots);
-        assert_eq!(app.disk_filter.as_ref().and_then(|f| f.ids.first()).map(|i| i.as_str()), Some(id.as_str()));
+        assert_eq!(
+            app.disk_filter
+                .as_ref()
+                .and_then(|f| f.ids.first())
+                .map(|i| i.as_str()),
+            Some(id.as_str())
+        );
         reload(&mut app);
         assert_eq!(app.history().len(), 2);
         assert_eq!(app.snap_sel, 1, "on the newest scan");
         app.handle_key(key(KeyCode::Char('*')));
         assert!(app.disk_filter.is_none());
-        assert!(app.snap_note.as_deref().is_some_and(|n| n.contains("every disk")));
+        assert!(
+            app.snap_note
+                .as_deref()
+                .is_some_and(|n| n.contains("every disk"))
+        );
 
         // A label, typed; an invalid one is refused and can be corrected.
         app.handle_key(key(KeyCode::Char('k')));
@@ -4105,14 +5916,24 @@ pub(crate) mod tests {
         typed(&mut app, "zly:label");
         app.handle_key(key(KeyCode::Enter));
         assert!(app.disks.edit.is_some(), "the text stays for a correction");
-        assert!(matches!(&app.disks.note, Some(Err(e)) if e.contains("':'")), "{:?}", app.disks.note);
-        app.handle_key(KeyEvent { modifiers: KeyModifiers::CONTROL, ..key(KeyCode::Char('u')) });
+        assert!(
+            matches!(&app.disks.note, Some(Err(e)) if e.contains("':'")),
+            "{:?}",
+            app.disks.note
+        );
+        app.handle_key(KeyEvent {
+            modifiers: KeyModifiers::CONTROL,
+            ..key(KeyCode::Char('u'))
+        });
         typed(&mut app, "robocze");
         let cmds = app.handle_key(key(KeyCode::Enter));
         assert!(cmds.contains(&Command::LoadDisks) && cmds.contains(&Command::LoadSnapshots));
         assert!(matches!(&app.disks.note, Some(Ok(m)) if m.contains("label robocze")));
         reload(&mut app);
-        assert_eq!(app.selected_disk().unwrap().disk.label.as_deref(), Some("robocze"));
+        assert_eq!(
+            app.selected_disk().unwrap().disk.label.as_deref(),
+            Some("robocze")
+        );
         // Sets: + adds, - offers the last one to remove.
         app.handle_key(key(KeyCode::Char('+')));
         typed(&mut app, "archiwum");
@@ -4120,7 +5941,10 @@ pub(crate) mod tests {
         reload(&mut app);
         assert_eq!(app.selected_disk().unwrap().disk.sets, ["archiwum"]);
         app.handle_key(key(KeyCode::Char('-')));
-        assert_eq!(app.disks.edit, Some((DiskField::RemoveFromSet, "archiwum".into())));
+        assert_eq!(
+            app.disks.edit,
+            Some((DiskField::RemoveFromSet, "archiwum".into()))
+        );
         app.handle_key(key(KeyCode::Enter));
         reload(&mut app);
         assert!(app.selected_disk().unwrap().disk.sets.is_empty());
@@ -4138,15 +5962,31 @@ pub(crate) mod tests {
         app.handle_key(key(KeyCode::Char('k')));
         reload(&mut app);
         app.handle_key(key(KeyCode::Char('f')));
-        assert!(app.disks.forget.as_ref().is_some_and(|p| p.snapshots.len() == 2));
+        assert!(
+            app.disks
+                .forget
+                .as_ref()
+                .is_some_and(|p| p.snapshots.len() == 2)
+        );
         app.handle_key(key(KeyCode::Char('n')));
         assert!(app.disks.forget.is_none());
-        assert_eq!(snapshots::list(&s).unwrap().snapshots.len(), 2, "nothing removed");
+        assert_eq!(
+            snapshots::list(&s).unwrap().snapshots.len(),
+            2,
+            "nothing removed"
+        );
         app.handle_key(key(KeyCode::Char('f')));
         let cmds = app.handle_key(key(KeyCode::Char('y')));
         assert!(cmds.contains(&Command::LoadSnapshots));
-        assert!(matches!(&app.disks.note, Some(Ok(m)) if m.starts_with("Forgot disk")), "{:?}", app.disks.note);
-        assert!(app.disk_filter.is_none(), "the filter of a forgotten disk goes");
+        assert!(
+            matches!(&app.disks.note, Some(Ok(m)) if m.starts_with("Forgot disk")),
+            "{:?}",
+            app.disks.note
+        );
+        assert!(
+            app.disk_filter.is_none(),
+            "the filter of a forgotten disk goes"
+        );
         assert!(snapshots::list(&s).unwrap().snapshots.is_empty());
     }
 
@@ -4156,11 +5996,20 @@ pub(crate) mod tests {
         app.open(Screen::Scan);
         let cmds = app.start_scan("/Volumes/STICK".into(), "x".into());
         assert!(matches!(&cmds[..], [Command::StartScan { disk: None, .. }]));
-        app.handle_msg(Msg::ScanDoubt("STICK looks like a copy of backupy-2014.".into()));
-        assert!(matches!(&app.scan, ScanStage::AskDisk { root, name, .. } if root == "/Volumes/STICK" && name == "x"));
-        assert!(app.handle_key(key(KeyCode::Char('q'))).is_empty(), "other keys wait for the answer");
+        app.handle_msg(Msg::ScanDoubt(
+            "STICK looks like a copy of backupy-2014.".into(),
+        ));
+        assert!(
+            matches!(&app.scan, ScanStage::AskDisk { root, name, .. } if root == "/Volumes/STICK" && name == "x")
+        );
+        assert!(
+            app.handle_key(key(KeyCode::Char('q'))).is_empty(),
+            "other keys wait for the answer"
+        );
         let cmds = app.handle_key(key(KeyCode::Char('n')));
-        assert!(matches!(&cmds[..], [Command::StartScan { disk: Some(DiskChoice::New), root, .. }] if root == "/Volumes/STICK"));
+        assert!(
+            matches!(&cmds[..], [Command::StartScan { disk: Some(DiskChoice::New), root, .. }] if root == "/Volumes/STICK")
+        );
         app.handle_msg(Msg::ScanDoubt("again".into()));
         app.handle_key(key(KeyCode::Esc));
         assert!(matches!(&app.scan, ScanStage::Setup { root, .. } if root == "/Volumes/STICK"));
@@ -4178,12 +6027,16 @@ pub(crate) mod tests {
             rebase: diskdrift_app::storage::Rebase::Nothing,
             rebase_error: None,
             disk: None,
+            migration: diskdrift_app::storage::MigrationOutcome::None,
         }
     }
 
     fn vol(id: &str, mp: &str) -> Volume {
         Volume {
-            identity: diskdrift_app::storage::Identity::new(diskdrift_app::storage::Strength::Uuid, id),
+            identity: diskdrift_app::storage::Identity::new(
+                diskdrift_app::storage::Strength::Uuid,
+                id,
+            ),
             mount_point: mp.into(),
             name: Some(id.into()),
             fs_type: "hfs".into(),
@@ -4194,7 +6047,10 @@ pub(crate) mod tests {
     fn known_disk(label: &str) -> diskdrift_app::storage::Disk {
         diskdrift_app::storage::Disk {
             id: "d1".into(),
-            identity: diskdrift_app::storage::Identity::new(diskdrift_app::storage::Strength::Uuid, "B"),
+            identity: diskdrift_app::storage::Identity::new(
+                diskdrift_app::storage::Strength::Uuid,
+                "B",
+            ),
             label: Some(label.into()),
             description: None,
             sets: Vec::new(),
@@ -4211,60 +6067,155 @@ pub(crate) mod tests {
     #[test]
     fn the_mounts_at_start_are_the_baseline_and_changes_are_looked_at() {
         let mut app = App::new(settings());
-        let cmds = app.handle_msg(Msg::Volumes(vec![vol("SYS", "/")]));
-        assert!(!cmds.iter().any(|c| matches!(c, Command::DiskConnected(_))), "nothing is 'connected' at start");
+        let cmds = app.handle_msg(Msg::Volumes(VolumeInventory {
+            volumes: vec![vol("SYS", "/")],
+            errors: vec!["/Volumes/failing: permission denied".into()],
+        }));
+        assert!(
+            !cmds.iter().any(|c| matches!(c, Command::DiskConnected(_))),
+            "nothing is 'connected' at start"
+        );
+        assert_eq!(
+            app.mount_errors,
+            vec!["/Volumes/failing: permission denied".to_string()]
+        );
         assert!(app.disk_event.is_none());
-        let cmds = app.handle_msg(Msg::Volumes(vec![vol("SYS", "/"), vol("B", "/Volumes/B")]));
-        assert!(cmds.contains(&Command::DiskConnected(vol("B", "/Volumes/B"))), "{cmds:?}");
+        let cmds = app.handle_msg(Msg::Volumes(VolumeInventory {
+            volumes: vec![vol("SYS", "/"), vol("B", "/Volumes/B")],
+            errors: Vec::new(),
+        }));
+        assert!(
+            cmds.contains(&Command::DiskConnected(vol("B", "/Volumes/B"))),
+            "{cmds:?}"
+        );
         app.handle_msg(Msg::Disks(Box::new(Err("x".into()))));
-        app.handle_msg(Msg::Volumes(vec![vol("SYS", "/")]));
-        assert!(app.disk_event.as_ref().is_some_and(|e| e.text.contains("B disconnected")), "{:?}", app.disk_event);
+        app.handle_msg(Msg::Volumes(VolumeInventory {
+            volumes: vec![vol("SYS", "/")],
+            errors: Vec::new(),
+        }));
+        assert!(
+            app.disk_event
+                .as_ref()
+                .is_some_and(|e| e.text.contains("B disconnected")),
+            "{:?}",
+            app.disk_event
+        );
     }
 
     #[test]
     fn a_known_disk_is_rescanned_and_then_said_to_be_safe_to_eject() {
         let mut app = App::new(settings());
-        app.handle_msg(Msg::Volumes(vec![]));
-        let action = Ok(ConnectAction::Rescan { disk: known_disk("backupy-2014"), root: "/Volumes/B/Docs".into(), last_scan: "2026-01-01T10:00:00+01:00".into() });
-        let cmds = app.handle_msg(Msg::Connected { volume: vol("B", "/Volumes/B"), action: Box::new(action) });
-        assert!(matches!(&cmds[..], [Command::StartScan { root, background: true, disk: None, name: Some(n) }] if root == "/Volumes/B/Docs" && n.starts_with("auto-")), "{cmds:?}");
+        app.handle_msg(Msg::Volumes(VolumeInventory {
+            volumes: Vec::new(),
+            errors: Vec::new(),
+        }));
+        let action = Ok(ConnectAction::Rescan {
+            disk: known_disk("backupy-2014"),
+            root: "/Volumes/B/Docs".into(),
+            last_scan: "2026-01-01T10:00:00+01:00".into(),
+        });
+        let cmds = app.handle_msg(Msg::Connected {
+            volume: vol("B", "/Volumes/B"),
+            action: Box::new(action),
+        });
+        assert!(
+            matches!(&cmds[..], [Command::StartScan { root, background: true, disk: None, name: Some(n) }] if root == "/Volumes/B/Docs" && n.starts_with("auto-")),
+            "{cmds:?}"
+        );
         assert!(app.auto_scan_running());
-        assert!(app.disk_event.as_ref().is_some_and(|e| e.text.contains("backupy-2014 connected") && e.text.contains("x stops")));
+        assert!(app.disk_event.as_ref().is_some_and(
+            |e| e.text.contains("backupy-2014 connected") && e.text.contains("x stops")
+        ));
         let mut done = scan_outcome_for_tests();
         done.snapshot.root = "/Volumes/B/Docs".into();
         app.handle_msg(Msg::ScanDone(Box::new(Ok(done))));
         let status = app.auto_status.clone().unwrap();
-        assert!(status.contains("backupy-2014 rescanned") && status.contains("you can eject it"), "{status}");
-        assert!(matches!(app.scan, ScanStage::Setup { .. }), "the scan form is free again");
+        assert!(
+            status.contains("backupy-2014 rescanned") && status.contains("you can eject it"),
+            "{status}"
+        );
+        assert!(
+            matches!(app.scan, ScanStage::Setup { .. }),
+            "the scan form is free again"
+        );
     }
 
     #[test]
     fn a_rescan_waits_until_the_scan_screen_is_free() {
         let mut app = App::new(settings());
         app.open(Screen::Scan);
-        let action = |l: &str| Ok(ConnectAction::Rescan { disk: known_disk(l), root: format!("/Volumes/{l}").into(), last_scan: "2026-01-01T10:00:00+01:00".into() });
-        assert!(app.handle_msg(Msg::Connected { volume: vol("B", "/Volumes/B"), action: Box::new(action("one")) }).is_empty());
-        assert!(app.handle_msg(Msg::Connected { volume: vol("C", "/Volumes/C"), action: Box::new(action("two")) }).is_empty());
-        assert!(app.disk_event.as_ref().is_some_and(|e| e.text.contains("as soon as the scan screen is free")));
+        let action = |l: &str| {
+            Ok(ConnectAction::Rescan {
+                disk: known_disk(l),
+                root: format!("/Volumes/{l}").into(),
+                last_scan: "2026-01-01T10:00:00+01:00".into(),
+            })
+        };
+        assert!(
+            app.handle_msg(Msg::Connected {
+                volume: vol("B", "/Volumes/B"),
+                action: Box::new(action("one"))
+            })
+            .is_empty()
+        );
+        assert!(
+            app.handle_msg(Msg::Connected {
+                volume: vol("C", "/Volumes/C"),
+                action: Box::new(action("two"))
+            })
+            .is_empty()
+        );
+        assert!(
+            app.disk_event
+                .as_ref()
+                .is_some_and(|e| e.text.contains("as soon as the scan screen is free"))
+        );
         assert!(app.idle().is_empty(), "the user is on the scan form");
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Dashboard);
-        assert!(matches!(&app.idle()[..], [Command::StartScan { root, .. }] if root == "/Volumes/one"));
+        assert!(
+            matches!(&app.idle()[..], [Command::StartScan { root, .. }] if root == "/Volumes/one")
+        );
         assert!(app.idle().is_empty(), "one at a time");
         app.handle_msg(Msg::ScanDone(Box::new(Ok(scan_outcome_for_tests()))));
-        assert!(matches!(&app.idle()[..], [Command::StartScan { root, .. }] if root == "/Volumes/two"));
+        assert!(
+            matches!(&app.idle()[..], [Command::StartScan { root, .. }] if root == "/Volumes/two")
+        );
     }
 
     #[test]
     fn a_new_disk_is_announced_and_never_scanned_on_its_own() {
         let mut app = App::new(settings());
-        for action in [Ok(ConnectAction::New { disk: None }), Ok(ConnectAction::Doubt { message: "STICK looks like a copy of X.".into() })] {
-            assert!(app.handle_msg(Msg::Connected { volume: vol("S", "/Volumes/STICK"), action: Box::new(action) }).is_empty());
+        for action in [
+            Ok(ConnectAction::New { disk: None }),
+            Ok(ConnectAction::Doubt {
+                message: "STICK looks like a copy of X.".into(),
+            }),
+        ] {
+            assert!(
+                app.handle_msg(Msg::Connected {
+                    volume: vol("S", "/Volumes/STICK"),
+                    action: Box::new(action)
+                })
+                .is_empty()
+            );
             assert!(!app.scan_running());
         }
-        assert!(app.disk_event.as_ref().is_some_and(|e| e.text.contains("Scan it with S")));
-        app.handle_msg(Msg::Connected { volume: vol("S", "/Volumes/STICK"), action: Box::new(Ok(ConnectAction::New { disk: None })) });
-        assert!(app.disk_event.as_ref().is_some_and(|e| e.text.contains("new disk S connected") && e.text.contains("K to give it a label")));
+        assert!(
+            app.disk_event
+                .as_ref()
+                .is_some_and(|e| e.text.contains("Scan it with S"))
+        );
+        app.handle_msg(Msg::Connected {
+            volume: vol("S", "/Volumes/STICK"),
+            action: Box::new(Ok(ConnectAction::New { disk: None })),
+        });
+        assert!(
+            app.disk_event
+                .as_ref()
+                .is_some_and(|e| e.text.contains("new disk S connected")
+                    && e.text.contains("K to give it a label"))
+        );
         assert!(app.idle().is_empty());
     }
 
@@ -4272,7 +6223,11 @@ pub(crate) mod tests {
     fn w_in_my_disks_filters_to_the_disks_set_and_find_follows() {
         let mut app = App::new(settings());
         let row = |id: &str, label: &str, sets: &[&str]| diskdrift_app::disks::DiskRow {
-            disk: diskdrift_app::storage::Disk { id: id.into(), sets: sets.iter().map(|s| s.to_string()).collect(), ..known_disk(label) },
+            disk: diskdrift_app::storage::Disk {
+                id: id.into(),
+                sets: sets.iter().map(|s| s.to_string()).collect(),
+                ..known_disk(label)
+            },
             known: true,
             connected: false,
             mount_point: None,
@@ -4282,28 +6237,61 @@ pub(crate) mod tests {
             last_root: None,
             store_bytes: 0,
         };
-        let disks = vec![row("d1", "old-a", &["stare", "2014"]), row("d2", "old-b", &["stare"]), row("d3", "lone", &[])];
-        app.disks.list = Job::Done(Box::new(DiskList { store_path: "/s".into(), store_exists: true, disks }));
+        let disks = vec![
+            row("d1", "old-a", &["stare", "2014"]),
+            row("d2", "old-b", &["stare"]),
+            row("d3", "lone", &[]),
+        ];
+        app.disks.list = Job::Done(Box::new(DiskList {
+            store_path: "/s".into(),
+            store_exists: true,
+            disks,
+            mount_errors: Vec::new(),
+        }));
         app.screen = Screen::Disks;
         app.handle_key(key(KeyCode::Char('w')));
         let f = app.disk_filter.clone().unwrap();
-        assert_eq!((f.set.as_deref(), f.ids.clone()), (Some("stare"), vec!["d1".to_string(), "d2".to_string()]));
+        assert_eq!(
+            (f.set.as_deref(), f.ids.clone()),
+            (Some("stare"), vec!["d1".to_string(), "d2".to_string()])
+        );
         assert_eq!(app.screen, Screen::Snapshots);
-        assert!(app.history().is_empty() || app.history().iter().all(|r| f.shows(r.meta.disk.as_deref())));
+        assert!(
+            app.history().is_empty()
+                || app
+                    .history()
+                    .iter()
+                    .all(|r| f.shows(r.meta.disk.as_deref()))
+        );
         // Again: its next set.
         app.screen = Screen::Disks;
         app.handle_key(key(KeyCode::Char('w')));
-        assert_eq!(app.disk_filter.as_ref().unwrap().set.as_deref(), Some("2014"));
+        assert_eq!(
+            app.disk_filter.as_ref().unwrap().set.as_deref(),
+            Some("2014")
+        );
         // Find searches only the set.
         app.open(Screen::Find);
         typed(&mut app, "plan");
         let cmds = app.handle_key(key(KeyCode::Enter));
-        assert_eq!(cmds[1], Command::RunFind { id: 1, pattern: "plan".into(), disk: None, set: Some("2014".into()) });
+        assert_eq!(
+            cmds[1],
+            Command::RunFind {
+                id: 1,
+                pattern: "plan".into(),
+                disk: None,
+                set: Some("2014".into())
+            }
+        );
         // A disk in no set says so.
         app.screen = Screen::Disks;
         app.disks.sel = 2;
         app.handle_key(key(KeyCode::Char('w')));
-        assert!(matches!(&app.disks.note, Some(Err(m)) if m.contains("in no set")), "{:?}", app.disks.note);
+        assert!(
+            matches!(&app.disks.note, Some(Err(m)) if m.contains("in no set")),
+            "{:?}",
+            app.disks.note
+        );
     }
 
     #[test]
@@ -4324,16 +6312,39 @@ pub(crate) mod tests {
             last_root: None,
             store_bytes: 0,
         };
-        app.disks.list = Job::Done(Box::new(DiskList { store_path: "/s".into(), store_exists: true, disks: vec![row(false)] }));
+        app.disks.list = Job::Done(Box::new(DiskList {
+            store_path: "/s".into(),
+            store_exists: true,
+            disks: vec![row(false)],
+            mount_errors: Vec::new(),
+        }));
         app.screen = Screen::Snapshots;
         app.open_browse(BrowseSource::Snapshot(7), None, None);
-        app.handle_msg(Msg::Browse { id: 1, result: Box::new(Ok(browse_listing("/Volumes/OLD", "/Volumes/OLD", &[("Docs", true)]))) });
+        app.handle_msg(Msg::Browse {
+            id: 1,
+            result: Box::new(Ok(browse_listing(
+                "/Volumes/OLD",
+                "/Volumes/OLD",
+                &[("Docs", true)],
+            ))),
+        });
         assert!(app.handle_key(key(KeyCode::Char('a'))).is_empty());
         assert_eq!(app.screen, Screen::Browse);
         let note = app.browse.as_ref().unwrap().note.clone().unwrap();
-        assert!(note.contains("backupy-2014 is not connected") && note.contains("/Volumes/OLD/Docs"), "{note}");
+        assert!(
+            note.contains("backupy-2014 is not connected") && note.contains("/Volumes/OLD/Docs"),
+            "{note}"
+        );
         // Connected (or not known to be disconnected): the analysis starts as before.
-        app.disks.list = Job::Done(Box::new(DiskList { store_path: "/s".into(), store_exists: true, disks: vec![row(true)] }));
-        assert!(matches!(&app.handle_key(key(KeyCode::Char('a')))[..], [Command::CancelAnalyze, Command::RunAnalyze { .. }]));
+        app.disks.list = Job::Done(Box::new(DiskList {
+            store_path: "/s".into(),
+            store_exists: true,
+            disks: vec![row(true)],
+            mount_errors: Vec::new(),
+        }));
+        assert!(matches!(
+            &app.handle_key(key(KeyCode::Char('a')))[..],
+            [Command::CancelAnalyze, Command::RunAnalyze { .. }]
+        ));
     }
 }

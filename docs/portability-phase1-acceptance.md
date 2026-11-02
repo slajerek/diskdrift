@@ -15,6 +15,10 @@ phase 1. It intentionally contains no private implementation notes or links.
   not host separator strings, and preserve coverage uncertainty.
 - **F1-A5:** Native filesystem operations provide the documented lock,
   flush, publication and recovery guarantees on supported hosts.
+  Task 5 evidence includes explicit current-user plus SYSTEM Windows private
+  directory ACEs, non-creating writer and registry-lock probes, stale registry
+  lock takeover, and marker-replacement failure preserving the prior readable
+  view.
 - **F1-A6:** The new record codec has deterministic goldens, corruption
   detection, bounded memory use and no production writer before activation.
 - **F1-A7:** Store-v4 migration is staged and idempotent; injected failures

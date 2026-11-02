@@ -9,11 +9,12 @@
 //! be edited while a scan runs. Reading never creates anything: a missing
 //! `disks.json` is an empty registry.
 
-use crate::meta::SnapshotMeta;
+use crate::fsops;
+use crate::meta::{SnapshotMeta, SpaceSample};
+use crate::store::{Result, StoreError, write_atomic};
+use diskdrift_core::measurement::{Envelope, Quality};
 use diskdrift_core::native::NativePath;
-use crate::store::{Result, StoreError, sync_dir, write_atomic};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 pub const DISKS_FORMAT: &str = "diskdrift-disks";
@@ -21,6 +22,7 @@ pub const DISKS_VERSION: u32 = 1;
 /// Reserved registry-v2 compatibility schema; active publication remains v1.
 pub const DISKS_VERSION_V2: u32 = 2;
 const DISKS_FILE: &str = "disks.json";
+#[cfg(test)]
 const DISKS_LOCK: &str = "disks.lock";
 
 /// How sure the identity is (ADR 0002, section 2.2).
@@ -68,8 +70,12 @@ impl std::hash::Hash for Identity {
     }
 }
 
-fn default_identity_platform() -> String { "unknown".into() }
-fn default_identity_scheme() -> String { "legacy".into() }
+fn default_identity_platform() -> String {
+    "unknown".into()
+}
+fn default_identity_scheme() -> String {
+    "legacy_string".into()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdentityV2 {
@@ -81,32 +87,62 @@ pub struct IdentityV2 {
 
 impl From<&Identity> for IdentityV2 {
     fn from(value: &Identity) -> Self {
-        Self { platform: value.platform.clone(), scheme: value.scheme.clone(), strength: value.strength, source: value.source.clone() }
+        Self {
+            platform: value.platform.clone(),
+            scheme: value.scheme.clone(),
+            strength: value.strength,
+            source: value.source.clone(),
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Alias { pub path: NativePath }
+pub struct Alias {
+    pub path: NativePath,
+}
 
 impl Alias {
-    pub fn new(path: impl Into<String>) -> Self { Self { path: NativePath::unix(path.into().into_bytes()) } }
-    pub fn from_native(path: NativePath) -> Self { Self { path } }
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: NativePath::unix(path.into().into_bytes()),
+        }
+    }
+    pub fn from_native(path: NativePath) -> Self {
+        Self { path }
+    }
 }
 
 impl Identity {
     pub fn new(strength: Strength, source: impl Into<String>) -> Identity {
-        Identity { strength, source: source.into(), platform: "unknown".into(), scheme: "legacy".into() }
+        Identity {
+            strength,
+            source: source.into(),
+            platform: "unknown".into(),
+            scheme: "legacy".into(),
+        }
     }
 
     /// The `weak` identity of a volume without a UUID.
     pub fn weak(fs_type: &str, volume_name: Option<&str>, capacity_bytes: Option<u64>) -> Identity {
         let cap = capacity_bytes.map(|c| c.to_string()).unwrap_or_default();
-        Identity::new(Strength::Weak, format!("{fs_type}|{}|{cap}", volume_name.unwrap_or("")))
+        Identity::new(
+            Strength::Weak,
+            format!("{fs_type}|{}|{cap}", volume_name.unwrap_or("")),
+        )
     }
 
     /// `d` and the first `digits` hex digits of SHA-256 of `<strength>:<source>`.
     pub fn short_id(&self, digits: usize) -> String {
-        let hash = sha256(format!("{}:{}:{}:{}", self.platform, self.scheme, self.strength.as_str(), self.source).as_bytes());
+        let hash = sha256(
+            format!(
+                "{}:{}:{}:{}",
+                self.platform,
+                self.scheme,
+                self.strength.as_str(),
+                self.source
+            )
+            .as_bytes(),
+        );
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         format!("d{}", &hex[..digits.min(hex.len())])
     }
@@ -115,8 +151,10 @@ impl Identity {
         self.strength == other.strength
             && self.source == other.source
             && (self.platform == other.platform && self.scheme == other.scheme
-                || self.platform == "unknown" && self.scheme == "legacy"
-                || other.platform == "unknown" && other.scheme == "legacy")
+                || self.platform == "unknown"
+                    && matches!(self.scheme.as_str(), "legacy" | "legacy_string")
+                || other.platform == "unknown"
+                    && matches!(other.scheme.as_str(), "legacy" | "legacy_string"))
     }
 }
 
@@ -125,7 +163,38 @@ impl Identity {
 pub struct VolumeFacts {
     pub name: Option<String>,
     pub fs_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity_bytes: Option<u64>,
+    #[serde(flatten, default)]
+    pub measurement: Envelope,
+}
+
+fn sample_measurement(sample: Option<&SpaceSample>) -> Envelope {
+    let Some(sample) = sample else {
+        return Envelope::default();
+    };
+    let quality = match sample.quality {
+        crate::meta::MeasurementQuality::Observed => Quality::Observed,
+        crate::meta::MeasurementQuality::Estimated => Quality::Estimated,
+        crate::meta::MeasurementQuality::LowerBound => Quality::LowerBound,
+        crate::meta::MeasurementQuality::Unknown => Quality::Unknown,
+        crate::meta::MeasurementQuality::Unsupported => Quality::Unsupported,
+        crate::meta::MeasurementQuality::NotApplicable => Quality::NotApplicable,
+    };
+    let mut envelope = Envelope::with_quality(
+        sample.domain.clone().unwrap_or_else(|| "filesystem".into()),
+        sample.scope.clone().unwrap_or_else(|| "volume".into()),
+        quality,
+        sample
+            .provenance
+            .clone()
+            .unwrap_or_else(|| "persisted space sample".into()),
+    );
+    envelope.observed_at = sample.observed_at.clone().or(envelope.observed_at);
+    envelope.domain = sample.domain.clone().or(envelope.domain);
+    envelope.scope = sample.scope.clone().or(envelope.scope);
+    envelope.provenance = sample.provenance.clone().or(envelope.provenance);
+    envelope
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -135,6 +204,7 @@ pub struct DeviceFacts {
     pub vendor: Option<String>,
     pub bus: Option<String>,
     pub serial: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub media_bytes: Option<u64>,
     pub internal: Option<bool>,
 }
@@ -166,7 +236,10 @@ pub struct Disk {
 impl Disk {
     /// The label, else the volume name, else the short ID.
     pub fn display_name(&self) -> &str {
-        self.label.as_deref().or(self.volume.name.as_deref()).unwrap_or(&self.id)
+        self.label
+            .as_deref()
+            .or(self.volume.name.as_deref())
+            .unwrap_or(&self.id)
     }
 }
 
@@ -185,7 +258,23 @@ pub struct Sighting {
 impl Sighting {
     pub fn portable(identity: Identity, mount_point: impl Into<String>) -> Self {
         let mount_point = mount_point.into();
-        Self { identity, volume: VolumeFacts { fs_type: "portable".into(), ..Default::default() }, device: None, mount_path: NativePath::unix(mount_point.as_bytes().to_vec()), mount_point, at: "now".into(), aliases: Vec::new() }
+        let mount_path = if identity.platform == "windows" {
+            NativePath::windows(mount_point.encode_utf16().collect())
+        } else {
+            NativePath::unix(mount_point.as_bytes().to_vec())
+        };
+        Self {
+            identity,
+            volume: VolumeFacts {
+                fs_type: "portable".into(),
+                ..Default::default()
+            },
+            device: None,
+            mount_path,
+            mount_point,
+            at: "now".into(),
+            aliases: Vec::new(),
+        }
     }
 }
 
@@ -197,20 +286,61 @@ impl Sighting {
     /// a `weak` identity: filesystem, volume name and mount point.
     pub fn of_snapshot(m: &SnapshotMeta) -> Sighting {
         let v = &m.volume;
-        let capacity = m.space_after.or(m.space_before).map(|s| s.total_bytes);
-        let fat = matches!(v.fs_type.as_str(), "msdos" | "exfat");
-        let identity = match &v.uuid {
-            Some(u) if !fat => Identity::new(Strength::Uuid, u.clone()),
-            _ => Identity::new(Strength::Weak, format!("{}|{}|@{}", v.fs_type, v.name.as_deref().unwrap_or(""), v.mount_point)),
+        let capacity = m
+            .space_after
+            .as_ref()
+            .or(m.space_before.as_ref())
+            .and_then(|s| s.total_bytes);
+        let native_descriptor = v.descriptor.is_some();
+        let identity = if let Some(descriptor) = &v.descriptor {
+            let strength = match descriptor.identity_strength.as_str() {
+                "serial" => Strength::Serial,
+                "weak" => Strength::Weak,
+                _ => Strength::Uuid,
+            };
+            Identity {
+                strength,
+                source: descriptor.identity.display(),
+                platform: descriptor.platform.clone(),
+                scheme: "native_volume_identity".into(),
+            }
+        } else {
+            // A legacy UUID and mount point are display strings, not native
+            // identity fields. Keep them explicitly weak until a platform
+            // adapter supplies a validated descriptor.
+            Identity {
+                strength: Strength::Weak,
+                source: v.uuid.clone().unwrap_or_else(|| v.mount_point.clone()),
+                platform: "unknown".into(),
+                scheme: "legacy_string".into(),
+            }
         };
+        let mut identity = identity;
+        if !native_descriptor {
+            identity.platform = "unknown".into();
+            identity.scheme = "legacy_string".into();
+        }
         Sighting {
             identity,
-            volume: VolumeFacts { name: v.name.clone(), fs_type: v.fs_type.clone(), capacity_bytes: capacity },
+            volume: VolumeFacts {
+                name: v.name.clone(),
+                fs_type: v.fs_type.clone(),
+                measurement: sample_measurement(m.space_after.as_ref().or(m.space_before.as_ref())),
+                capacity_bytes: capacity,
+            },
             device: None,
             mount_point: v.mount_point.clone(),
             at: m.started_at.clone(),
-            aliases: Vec::new(),
-            mount_path: NativePath::unix(v.mount_point.as_bytes().to_vec()),
+            aliases: v
+                .descriptor
+                .as_ref()
+                .map(|d| d.aliases.iter().cloned().map(Alias::from_native).collect())
+                .unwrap_or_default(),
+            mount_path: v
+                .descriptor
+                .as_ref()
+                .map(|d| d.mount_key.clone())
+                .unwrap_or_else(|| NativePath::unix(v.mount_point.as_bytes().to_vec())),
         }
     }
 }
@@ -241,10 +371,26 @@ pub struct Registry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RegistryV2Disk {
     pub id: String,
     pub identity: IdentityV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub sets: Vec<String>,
+    pub volume: VolumeFacts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceFacts>,
+    pub first_seen: String,
+    pub last_seen: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mount_point: Option<String>,
     pub aliases: Vec<NativePath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mount_path: Option<NativePath>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +398,38 @@ pub struct RegistryV2 {
     pub format: String,
     pub version: u32,
     pub disks: Vec<RegistryV2Disk>,
+}
+
+impl RegistryV2 {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.format != DISKS_FORMAT || self.version != DISKS_VERSION_V2 {
+            return Err("invalid disk registry v2 document".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for disk in &self.disks {
+            if disk.id.is_empty() || !ids.insert(&disk.id) {
+                return Err("registry disk IDs must be non-empty and unique".into());
+            }
+            if disk.identity.platform.is_empty() || disk.identity.scheme.is_empty() {
+                return Err("registry identity platform and scheme are required".into());
+            }
+            let expected = match disk.identity.platform.as_str() {
+                "windows" => Some(diskdrift_core::native::PathEncoding::WindowsUtf16le),
+                "macos" | "linux" | "freebsd" | "unix" => {
+                    Some(diskdrift_core::native::PathEncoding::UnixBytes)
+                }
+                "unknown" => None,
+                _ => return Err("registry identity platform is invalid".into()),
+            };
+            if let Some(expected) = expected {
+                let mut paths = disk.aliases.iter().chain(disk.last_mount_path.iter());
+                if paths.any(|path| path.encoding() != expected) {
+                    return Err("registry native path encoding disagrees with platform".into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -263,56 +441,44 @@ struct Document {
 }
 
 /// Holds `<store>/disks.lock` (released when dropped).
-pub struct DisksLock {
-    _file: File,
-    #[cfg(windows)]
-    path: PathBuf,
-}
-
-#[cfg(windows)]
-impl Drop for DisksLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+pub(crate) struct DisksLock {
+    _lock: fsops::Lock,
 }
 
 pub fn disks_path(store: &Path) -> PathBuf {
     store.join(DISKS_FILE)
 }
 
+#[cfg(test)]
+pub(crate) fn registry_lock_path(store: &Path) -> PathBuf {
+    store.join(DISKS_LOCK)
+}
+
 fn io_at(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
-    move |source| StoreError::Io { path: path.to_path_buf(), source }
+    move |source| crate::store::io_err(path, source)
 }
 
 /// Waits for and takes the registry lock. Hold it only for one read-modify-write.
-pub fn lock(store: &Path) -> Result<DisksLock> {
-    let p = store.join(DISKS_LOCK);
-    #[cfg(windows)]
-    let f = loop {
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&p) {
-            Ok(f) => break f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::thread::sleep(std::time::Duration::from_millis(10)),
-            Err(e) => return Err(io_at(&p)(e)),
+#[cfg(test)]
+pub(crate) fn lock(store: &Path) -> Result<DisksLock> {
+    lock_at(&registry_lock_path(store))
+}
+
+pub(crate) fn lock_at(p: &Path) -> Result<DisksLock> {
+    let lock = loop {
+        match fsops::try_lock_exclusive(p).map_err(io_at(p))? {
+            Some(lock) => break lock,
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     };
-    #[cfg(not(windows))]
-    let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&p).map_err(io_at(&p))?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(io_at(&p)(std::io::Error::last_os_error()));
-        }
-    }
-    Ok(DisksLock {
-        _file: f,
-        #[cfg(windows)]
-        path: p,
-    })
+    Ok(DisksLock { _lock: lock })
 }
 
 fn invalid(label: &str, why: &str) -> StoreError {
-    StoreError::InvalidLabel { label: label.into(), why: why.into() }
+    StoreError::InvalidLabel {
+        label: label.into(),
+        why: why.into(),
+    }
 }
 
 fn is_short_id(s: &str) -> bool {
@@ -322,51 +488,119 @@ fn is_short_id(s: &str) -> bool {
 impl Registry {
     /// Reads `<store>/disks.json`; a missing file is an empty registry.
     pub fn load(store: &Path) -> Result<Registry> {
-        let p = disks_path(store);
-        let bytes = match std::fs::read(&p) {
+        Self::load_at(&disks_path(store))
+    }
+
+    /// Reads a registry from an explicitly selected layout path.
+    pub(crate) fn load_at(p: &Path) -> Result<Registry> {
+        Self::load_at_version(p, None)
+    }
+
+    /// Reads a registry from a v4 layout path, which must contain registry-v2.
+    pub(crate) fn load_v2_at(p: &Path) -> Result<Registry> {
+        Self::load_at_version(p, Some(DISKS_VERSION_V2))
+    }
+
+    fn load_at_version(p: &Path, required_version: Option<u32>) -> Result<Registry> {
+        let bytes = match std::fs::read(p) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Registry::default()),
-            Err(e) => return Err(io_at(&p)(e)),
+            Err(e) => return Err(io_at(p)(e)),
         };
-        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
         if value["format"] != DISKS_FORMAT {
-            return Err(StoreError::Corrupt(format!("{} is not a DiskDrift disk registry", p.display())));
+            return Err(StoreError::Corrupt(format!(
+                "{} is not a DiskDrift disk registry",
+                p.display()
+            )));
         }
-        let version = value["version"].as_u64().unwrap_or(0) as u32;
-        if version > DISKS_VERSION_V2 {
+        let version = value["version"].as_u64().ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "{} registry version must be an integer",
+                p.display()
+            ))
+        })?;
+        if let Some(required) = required_version
+            && version != u64::from(required)
+        {
+            return Err(StoreError::Corrupt(format!(
+                "{} has registry version {version}, expected {required}",
+                p.display()
+            )));
+        }
+        if version > u64::from(DISKS_VERSION_V2) {
             return Err(StoreError::UnsupportedDisksVersion { found: version });
         }
-        if version == DISKS_VERSION_V2 {
-            let doc: RegistryV2 = serde_json::from_value(value).map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
+        if version == u64::from(DISKS_VERSION_V2) {
+            let doc: RegistryV2 = serde_json::from_value(value)
+                .map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
+            doc.validate()
+                .map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
             return Registry::from_v2(doc);
         }
-        let doc: Document = serde_json::from_value(value).map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
-        Ok(Registry { disks: doc.disks })
+        if version != u64::from(DISKS_VERSION) {
+            return Err(StoreError::Corrupt(format!(
+                "{} has unsupported registry version {version}",
+                p.display()
+            )));
+        }
+        let doc: Document = serde_json::from_value(value)
+            .map_err(|e| StoreError::Corrupt(format!("{}: {e}", p.display())))?;
+        let mut disks = doc.disks;
+        for disk in &mut disks {
+            if disk.identity.platform == "unknown" && disk.identity.scheme == "legacy" {
+                disk.identity.scheme = "legacy_string".into();
+            }
+        }
+        Ok(Registry { disks })
     }
 
     /// Writes the registry atomically (temp file, fsync, rename, fsync directory).
-    pub fn save(&self, store: &Path, _lock: &DisksLock) -> Result<()> {
-        let p = disks_path(store);
-        let disks = self.disks.iter().map(|disk| {
-            let mut value = serde_json::to_value(disk).expect("registry serializes");
-            if let Some(identity) = value.get_mut("identity").and_then(serde_json::Value::as_object_mut) {
-                identity.remove("platform");
-                identity.remove("scheme");
-            }
-            if let Some(object) = value.as_object_mut() {
-                object.remove("aliases");
-                object.remove("lastMountPath");
-            }
-            value
-        }).collect::<Vec<_>>();
-        let doc = serde_json::json!({ "format": DISKS_FORMAT, "version": DISKS_VERSION, "disks": disks });
+    pub(crate) fn save(&self, store: &Path, _lock: &DisksLock) -> Result<()> {
+        self.save_v1_at(&disks_path(store), store)
+    }
+
+    fn save_v1_at(&self, p: &Path, store: &Path) -> Result<()> {
+        let disks = self
+            .disks
+            .iter()
+            .map(|disk| {
+                let mut value = serde_json::to_value(disk).expect("registry serializes");
+                if let Some(identity) = value
+                    .get_mut("identity")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    identity.remove("platform");
+                    identity.remove("scheme");
+                }
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("aliases");
+                    object.remove("lastMountPath");
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let doc =
+            serde_json::json!({ "format": DISKS_FORMAT, "version": DISKS_VERSION, "disks": disks });
         let bytes = serde_json::to_vec_pretty(&doc).expect("registry serializes");
-        write_atomic(&p, &bytes).map_err(io_at(&p))?;
-        sync_dir(store).map_err(io_at(store))
+        write_atomic(p, &bytes).map_err(io_at(p))?;
+        fsops::sync_dir(store).map_err(io_at(store))
+    }
+
+    /// Publishes the full registry-v2 document without changing the active
+    /// registry-v1 projection used by legacy stores.
+    pub(crate) fn save_v2_at(&self, p: &Path, store: &Path, _lock: &DisksLock) -> Result<()> {
+        let value = self.as_v2();
+        value.validate().map_err(StoreError::Corrupt)?;
+        let bytes = serde_json::to_vec_pretty(&value).expect("registry serializes");
+        write_atomic(p, &bytes).map_err(io_at(p))?;
+        fsops::sync_dir(store).map_err(io_at(store))
     }
 
     /// Lock, load, apply `f`, save when it succeeds, unlock.
-    pub fn update<T>(store: &Path, f: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
+    #[cfg(test)]
+    fn update<T>(store: &Path, f: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
         let lock = lock(store)?;
         let mut reg = Registry::load(store)?;
         let out = f(&mut reg)?;
@@ -379,17 +613,24 @@ impl Registry {
     }
 
     fn get_mut(&mut self, id: &str) -> Result<&mut Disk> {
-        self.disks.iter_mut().find(|d| d.id == id).ok_or_else(|| StoreError::UnknownDisk(id.into()))
+        self.disks
+            .iter_mut()
+            .find(|d| d.id == id)
+            .ok_or_else(|| StoreError::UnknownDisk(id.into()))
     }
 
     pub fn find(&self, identity: &Identity) -> Option<&Disk> {
-        self.disks.iter().find(|d| d.identity.matches_lineage(identity))
+        self.disks
+            .iter()
+            .find(|d| d.identity.matches_lineage(identity))
     }
 
     /// Resolves an exact native mount or alias without using display strings.
     pub fn resolve_mount(&self, path: &NativePath) -> Option<&Disk> {
         self.disks.iter().find(|d| {
-            d.last_mount_path.as_ref().is_some_and(|mount| mount == path)
+            d.last_mount_path
+                .as_ref()
+                .is_some_and(|mount| mount == path)
                 || d.aliases.iter().any(|alias| alias == path)
         })
     }
@@ -398,7 +639,13 @@ impl Registry {
     /// prefix of the short ID, in that order.
     pub fn resolve(&self, reference: &str) -> Option<&Disk> {
         let lower = reference.to_lowercase();
-        if let Some(d) = self.get(&lower).or_else(|| self.disks.iter().find(|d| d.label.as_deref().is_some_and(|l| l.to_lowercase() == lower))) {
+        if let Some(d) = self.get(&lower).or_else(|| {
+            self.disks.iter().find(|d| {
+                d.label
+                    .as_deref()
+                    .is_some_and(|l| l.to_lowercase() == lower)
+            })
+        }) {
             return Some(d);
         }
         if lower.len() < 2 || !lower.starts_with('d') {
@@ -435,21 +682,30 @@ impl Registry {
         };
         let id = known.id.clone();
         if s.identity.strength == Strength::Weak {
-            return Observed::Ask { existing: id, doubt: Doubt::Weak };
+            return Observed::Ask {
+                existing: id,
+                doubt: Doubt::Weak,
+            };
         }
         let serial_now = s.device.as_ref().and_then(|d| d.serial.as_deref());
         let serial_was = known.device.as_ref().and_then(|d| d.serial.as_deref());
         if let (Some(now), Some(was)) = (serial_now, serial_was)
             && now != was
         {
-            return Observed::Ask { existing: id, doubt: Doubt::Clone };
+            return Observed::Ask {
+                existing: id,
+                doubt: Doubt::Clone,
+            };
         }
         self.touch(&id, s).expect("found above");
         Observed::Known(id)
     }
 
     pub fn observe_clone(&mut self, existing: &str, _s: &Sighting) -> Observed {
-        Observed::Ask { existing: existing.into(), doubt: Doubt::Clone }
+        Observed::Ask {
+            existing: existing.into(),
+            doubt: Doubt::Clone,
+        }
     }
 
     /// Adds `s` as a new disk and returns its short ID. A separate identity
@@ -520,28 +776,56 @@ impl Registry {
     }
 
     pub fn as_v2(&self) -> RegistryV2 {
-        RegistryV2 { format: DISKS_FORMAT.into(), version: DISKS_VERSION_V2, disks: self.disks.iter().map(|d| RegistryV2Disk { id: d.id.clone(), identity: (&d.identity).into(), aliases: d.aliases.clone() }).collect() }
+        RegistryV2 {
+            format: DISKS_FORMAT.into(),
+            version: DISKS_VERSION_V2,
+            disks: self
+                .disks
+                .iter()
+                .map(|d| RegistryV2Disk {
+                    id: d.id.clone(),
+                    identity: (&d.identity).into(),
+                    label: d.label.clone(),
+                    description: d.description.clone(),
+                    sets: d.sets.clone(),
+                    volume: d.volume.clone(),
+                    device: d.device.clone(),
+                    first_seen: d.first_seen.clone(),
+                    last_seen: d.last_seen.clone(),
+                    last_mount_point: d.last_mount_point.clone(),
+                    aliases: d.aliases.clone(),
+                    last_mount_path: d.last_mount_path.clone(),
+                })
+                .collect(),
+        }
     }
 
     pub fn from_v2(value: RegistryV2) -> Result<Self> {
-        if value.format != DISKS_FORMAT || value.version != DISKS_VERSION_V2 {
-            return Err(StoreError::Corrupt("invalid disk registry v2 document".into()));
-        }
+        value.validate().map_err(StoreError::Corrupt)?;
         Ok(Self {
-            disks: value.disks.into_iter().map(|disk| Disk {
-                id: disk.id,
-                identity: Identity { strength: disk.identity.strength, source: disk.identity.source, platform: disk.identity.platform, scheme: disk.identity.scheme },
-                label: None,
-                description: None,
-                sets: Vec::new(),
-                volume: VolumeFacts::default(),
-                device: None,
-                first_seen: String::new(),
-                last_seen: String::new(),
-                last_mount_point: None,
-                aliases: disk.aliases,
-                last_mount_path: None,
-            }).collect(),
+            disks: value
+                .disks
+                .into_iter()
+                .map(|disk| Disk {
+                    id: disk.id,
+                    identity: Identity {
+                        strength: disk.identity.strength,
+                        source: disk.identity.source,
+                        platform: disk.identity.platform,
+                        scheme: disk.identity.scheme,
+                    },
+                    label: disk.label,
+                    description: disk.description,
+                    sets: disk.sets,
+                    volume: disk.volume,
+                    device: disk.device,
+                    first_seen: disk.first_seen,
+                    last_seen: disk.last_seen,
+                    last_mount_point: disk.last_mount_point,
+                    aliases: disk.aliases,
+                    last_mount_path: disk.last_mount_path,
+                })
+                .collect(),
         })
     }
 
@@ -558,14 +842,25 @@ impl Registry {
                 return Err(invalid(l, "a label cannot contain control characters"));
             }
             if is_short_id(&l.to_lowercase()) {
-                return Err(invalid(l, "a label cannot look like a disk ID (d followed by hex digits)"));
+                return Err(invalid(
+                    l,
+                    "a label cannot look like a disk ID (d followed by hex digits)",
+                ));
             }
             if l.eq_ignore_ascii_case("latest") {
                 return Err(invalid(l, "'latest' is reserved for snapshot references"));
             }
             let lower = l.to_lowercase();
-            if let Some(other) = self.disks.iter().find(|d| d.id != id && d.label.as_deref().is_some_and(|o| o.to_lowercase() == lower)) {
-                return Err(StoreError::DuplicateLabel { label: l.into(), disk: other.id.clone() });
+            if let Some(other) = self.disks.iter().find(|d| {
+                d.id != id
+                    && d.label
+                        .as_deref()
+                        .is_some_and(|o| o.to_lowercase() == lower)
+            }) {
+                return Err(StoreError::DuplicateLabel {
+                    label: l.into(),
+                    disk: other.id.clone(),
+                });
             }
         }
         self.get_mut(id)?.label = label.map(String::from);
@@ -573,7 +868,10 @@ impl Registry {
     }
 
     pub fn set_description(&mut self, id: &str, description: Option<&str>) -> Result<()> {
-        self.get_mut(id)?.description = description.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        self.get_mut(id)?.description = description
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
         Ok(())
     }
 
@@ -591,14 +889,20 @@ impl Registry {
     }
 
     pub fn remove_from_set(&mut self, id: &str, set: &str) -> Result<()> {
-        self.get_mut(id)?.sets.retain(|s| !s.eq_ignore_ascii_case(set.trim()));
+        self.get_mut(id)?
+            .sets
+            .retain(|s| !s.eq_ignore_ascii_case(set.trim()));
         Ok(())
     }
 
     /// Removes the entry of disk `id`. Its snapshots are the caller's to remove
     /// first (ADR 0002: forgetting a disk removes its snapshots, then its entry).
     pub fn forget(&mut self, id: &str) -> Result<Disk> {
-        let i = self.disks.iter().position(|d| d.id == id).ok_or_else(|| StoreError::UnknownDisk(id.into()))?;
+        let i = self
+            .disks
+            .iter()
+            .position(|d| d.id == id)
+            .ok_or_else(|| StoreError::UnknownDisk(id.into()))?;
         Ok(self.disks.remove(i))
     }
 }
@@ -606,14 +910,21 @@ impl Registry {
 /// SHA-256 (FIPS 180-4). Only short IDs use it, so there is no streaming API.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
     ];
-    let mut h: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
     let mut msg = data.to_vec();
     msg.push(0x80);
     while msg.len() % 64 != 56 {
@@ -628,13 +939,20 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
         let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ (!e & g);
-            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let t2 = s0.wrapping_add(maj);
@@ -670,8 +988,17 @@ mod tests {
     fn sighting(identity: Identity, serial: Option<&str>, at: &str) -> Sighting {
         Sighting {
             identity,
-            volume: VolumeFacts { name: Some("Backup".into()), fs_type: "hfs".into(), capacity_bytes: Some(500) },
-            device: Some(DeviceFacts { serial: serial.map(String::from), bus: Some("USB".into()), ..Default::default() }),
+            volume: VolumeFacts {
+                name: Some("Backup".into()),
+                fs_type: "hfs".into(),
+                capacity_bytes: Some(500),
+                measurement: Envelope::default(),
+            },
+            device: Some(DeviceFacts {
+                serial: serial.map(String::from),
+                bus: Some("USB".into()),
+                ..Default::default()
+            }),
             mount_point: "/Volumes/Backup".into(),
             mount_path: NativePath::unix(b"/Volumes/Backup".to_vec()),
             at: at.into(),
@@ -685,15 +1012,29 @@ mod tests {
 
     #[test]
     fn sha256_matches_the_standard_vectors() {
-        assert_eq!(hex(&sha256(b"")), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(hex(&sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         assert_eq!(
-            hex(&sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         // 56 and 64 bytes: the padding needs a second block.
-        assert_eq!(hex(&sha256(&[b'a'; 64])), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
-        assert_eq!(hex(&sha256(&vec![b'a'; 1_000_000])), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+        assert_eq!(
+            hex(&sha256(&[b'a'; 64])),
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb"
+        );
+        assert_eq!(
+            hex(&sha256(&vec![b'a'; 1_000_000])),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
     }
 
     #[test]
@@ -701,8 +1042,29 @@ mod tests {
         let id = uuid("9F0E").short_id(8);
         assert_eq!(id.len(), 9);
         assert!(is_short_id(&id));
-        assert_eq!(id, format!("d{}", &hex(&sha256(b"unknown:legacy:uuid:9F0E"))[..8]));
+        assert_eq!(
+            id,
+            format!("d{}", &hex(&sha256(b"unknown:legacy:uuid:9F0E"))[..8])
+        );
         assert_ne!(id, Identity::new(Strength::Serial, "9F0E").short_id(8));
+    }
+
+    #[test]
+    fn normalized_legacy_identity_matches_a_native_identity() {
+        let legacy = Identity {
+            strength: Strength::Uuid,
+            source: "U1".into(),
+            platform: "unknown".into(),
+            scheme: "legacy_string".into(),
+        };
+        let native = Identity {
+            strength: Strength::Uuid,
+            source: "U1".into(),
+            platform: "macos".into(),
+            scheme: "disk_arbitration_uuid".into(),
+        };
+        assert!(legacy.matches_lineage(&native));
+        assert!(native.matches_lineage(&legacy));
     }
 
     #[test]
@@ -728,10 +1090,45 @@ mod tests {
     }
 
     #[test]
+    fn registry_lock_probe_is_non_creating_and_observes_only_registry_lock() {
+        let dir = TestDir::new("disks-lock-probe");
+        let path = dir.path().join(DISKS_LOCK);
+
+        assert!(!fsops::probe_lock(&path).unwrap());
+        assert!(!path.exists(), "a registry probe must not create the lock");
+
+        let held = lock(dir.path()).unwrap();
+        assert!(path.exists());
+        assert!(fsops::probe_lock(&path).unwrap());
+        drop(held);
+
+        assert!(!fsops::probe_lock(&path).unwrap());
+    }
+
+    #[test]
+    fn stale_registry_lock_file_can_be_taken_over() {
+        let dir = TestDir::new("disks-stale-lock");
+        let path = dir.path().join(DISKS_LOCK);
+        std::fs::write(&path, b"dead-pid").unwrap();
+
+        let held = lock(dir.path()).unwrap();
+        assert!(fsops::probe_lock(&path).unwrap());
+        drop(held);
+
+        let replacement = lock(dir.path()).unwrap();
+        assert!(fsops::probe_lock(&path).unwrap());
+        drop(replacement);
+    }
+
+    #[test]
     fn the_registry_round_trips_through_its_file() {
         let dir = TestDir::new("disks-roundtrip");
         let id = Registry::update(dir.path(), |r| {
-            let id = r.add(&sighting(uuid("U1"), Some("WX1"), "2026-10-22T10:00:00+02:00"));
+            let id = r.add(&sighting(
+                uuid("U1"),
+                Some("WX1"),
+                "2026-10-22T10:00:00+02:00",
+            ));
             r.set_label(&id, Some("backupy-2014"))?;
             r.set_description(&id, Some(" WD 500 GB, shelf 2 "))?;
             r.add_to_set(&id, "stare-dyski-2014")?;
@@ -746,18 +1143,30 @@ mod tests {
         assert_eq!(d.sets, ["stare-dyski-2014"]);
         assert_eq!(d.device.as_ref().unwrap().serial.as_deref(), Some("WX1"));
         let text = std::fs::read_to_string(disks_path(dir.path())).unwrap();
-        assert!(text.contains("\"format\": \"diskdrift-disks\"") && text.contains("\"firstSeen\"") && text.contains("\"strength\": \"uuid\""));
+        assert!(
+            text.contains("\"format\": \"diskdrift-disks\"")
+                && text.contains("\"firstSeen\"")
+                && text.contains("\"strength\": \"uuid\"")
+        );
         // Nothing temporary left behind.
-        let mut names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
         names.sort();
-        let expected = if cfg!(windows) { vec!["disks.json"] } else { vec!["disks.json", "disks.lock"] };
+        let expected = if cfg!(windows) {
+            vec!["disks.json"]
+        } else {
+            vec!["disks.json", "disks.lock"]
+        };
         assert_eq!(names, expected);
     }
 
     #[test]
     fn a_failed_update_writes_nothing() {
         let dir = TestDir::new("disks-failed");
-        let id = Registry::update(dir.path(), |r| Ok(r.add(&sighting(uuid("U1"), None, "t1")))).unwrap();
+        let id =
+            Registry::update(dir.path(), |r| Ok(r.add(&sighting(uuid("U1"), None, "t1")))).unwrap();
         let before = std::fs::read(disks_path(dir.path())).unwrap();
         let err = Registry::update(dir.path(), |r| {
             r.set_description(&id, Some("changed"))?;
@@ -770,18 +1179,30 @@ mod tests {
     #[test]
     fn newer_or_foreign_registries_are_refused() {
         let dir = TestDir::new("disks-version");
-        std::fs::write(disks_path(dir.path()), r#"{"format":"diskdrift-disks","version":2,"disks":[]}"#).unwrap();
+        std::fs::write(
+            disks_path(dir.path()),
+            r#"{"format":"diskdrift-disks","version":2,"disks":[]}"#,
+        )
+        .unwrap();
         assert_eq!(Registry::load(dir.path()).unwrap(), Registry::default());
         std::fs::write(disks_path(dir.path()), r#"{"format":"other","version":1}"#).unwrap();
-        assert!(matches!(Registry::load(dir.path()), Err(StoreError::Corrupt(_))));
+        assert!(matches!(
+            Registry::load(dir.path()),
+            Err(StoreError::Corrupt(_))
+        ));
         std::fs::write(disks_path(dir.path()), "{").unwrap();
-        assert!(matches!(Registry::load(dir.path()), Err(StoreError::Corrupt(_))));
+        assert!(matches!(
+            Registry::load(dir.path()),
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     #[test]
     fn a_known_disk_is_touched_and_a_new_one_added() {
         let mut reg = Registry::default();
-        let Observed::New(id) = reg.observe(&sighting(uuid("U1"), Some("WX1"), "t1")) else { panic!() };
+        let Observed::New(id) = reg.observe(&sighting(uuid("U1"), Some("WX1"), "t1")) else {
+            panic!()
+        };
         let mut later = sighting(uuid("U1"), Some("WX1"), "t2");
         later.mount_point = "/Volumes/Backup 1".into();
         later.volume.name = Some("Backup 1".into());
@@ -790,28 +1211,54 @@ mod tests {
         assert_eq!((d.first_seen.as_str(), d.last_seen.as_str()), ("t1", "t2"));
         assert_eq!(d.last_mount_point.as_deref(), Some("/Volumes/Backup 1"));
         assert_eq!(d.display_name(), "Backup 1");
-        assert!(matches!(reg.observe(&sighting(uuid("U2"), None, "t3")), Observed::New(_)));
+        assert!(matches!(
+            reg.observe(&sighting(uuid("U2"), None, "t3")),
+            Observed::New(_)
+        ));
         assert_eq!(reg.disks.len(), 2);
     }
 
     #[test]
     fn a_known_uuid_on_another_device_and_a_weak_match_are_asked_about() {
         let mut reg = Registry::default();
-        let Observed::New(id) = reg.observe(&sighting(uuid("U1"), Some("WX1"), "t1")) else { panic!() };
+        let Observed::New(id) = reg.observe(&sighting(uuid("U1"), Some("WX1"), "t1")) else {
+            panic!()
+        };
         let copy = sighting(uuid("U1"), Some("ZZ9"), "t2");
-        assert_eq!(reg.observe(&copy), Observed::Ask { existing: id.clone(), doubt: Doubt::Clone });
-        assert_eq!(reg.get(&id).unwrap().last_seen, "t1", "nothing changed before the user decides");
+        assert_eq!(
+            reg.observe(&copy),
+            Observed::Ask {
+                existing: id.clone(),
+                doubt: Doubt::Clone
+            }
+        );
+        assert_eq!(
+            reg.get(&id).unwrap().last_seen,
+            "t1",
+            "nothing changed before the user decides"
+        );
         // Without a serial on either side there is nothing to tell them apart.
         let mut no_serial = copy.clone();
         no_serial.device = None;
         assert_eq!(reg.observe(&no_serial), Observed::Known(id.clone()));
         // The user splits the copy off: a separate identity.
-        let split = Sighting { identity: uuid("U1+ZZ9"), ..copy };
+        let split = Sighting {
+            identity: uuid("U1+ZZ9"),
+            ..copy
+        };
         assert_ne!(reg.add(&split), id);
 
         let weak = Identity::weak("ntfs", Some("Old"), Some(100));
-        let Observed::New(w) = reg.observe(&sighting(weak.clone(), None, "t1")) else { panic!() };
-        assert_eq!(reg.observe(&sighting(weak, None, "t2")), Observed::Ask { existing: w, doubt: Doubt::Weak });
+        let Observed::New(w) = reg.observe(&sighting(weak.clone(), None, "t1")) else {
+            panic!()
+        };
+        assert_eq!(
+            reg.observe(&sighting(weak, None, "t2")),
+            Observed::Ask {
+                existing: w,
+                doubt: Doubt::Weak
+            }
+        );
     }
 
     #[test]
@@ -820,19 +1267,34 @@ mod tests {
         let a = reg.add(&sighting(uuid("A"), None, "t"));
         let b = reg.add(&sighting(uuid("B"), None, "t"));
         reg.set_label(&a, Some("Backupy-2014")).unwrap();
-        assert!(matches!(reg.set_label(&b, Some("backupy-2014")), Err(StoreError::DuplicateLabel { disk, .. }) if disk == a));
+        assert!(
+            matches!(reg.set_label(&b, Some("backupy-2014")), Err(StoreError::DuplicateLabel { disk, .. }) if disk == a)
+        );
         reg.set_label(&a, Some("BACKUPY-2014")).unwrap();
         assert_eq!(reg.resolve("backupy-2014").unwrap().id, a);
         assert_eq!(reg.resolve(&b).unwrap().id, b);
         assert!(reg.resolve("nothing").is_none());
-        assert_eq!(reg.resolve(&b[..5].to_uppercase()).unwrap().id, b, "a prefix of the ID");
+        assert_eq!(
+            reg.resolve(&b[..5].to_uppercase()).unwrap().id,
+            b,
+            "a prefix of the ID"
+        );
         assert!(reg.resolve("d").is_none(), "too short, and matches both");
         for bad in ["a:b", "a/b", "d1a2b3c4d", "D1A2B3C4D", "latest", "x\ty"] {
-            assert!(matches!(reg.set_label(&b, Some(bad)), Err(StoreError::InvalidLabel { .. })), "{bad}");
+            assert!(
+                matches!(
+                    reg.set_label(&b, Some(bad)),
+                    Err(StoreError::InvalidLabel { .. })
+                ),
+                "{bad}"
+            );
         }
         reg.set_label(&a, Some("  ")).unwrap();
         assert_eq!(reg.get(&a).unwrap().label, None);
-        assert!(matches!(reg.set_label("d00000000", Some("x")), Err(StoreError::UnknownDisk(_))));
+        assert!(matches!(
+            reg.set_label("d00000000", Some("x")),
+            Err(StoreError::UnknownDisk(_))
+        ));
     }
 
     #[test]
@@ -856,7 +1318,12 @@ mod tests {
         let threads: Vec<_> = (0..8)
             .map(|i| {
                 let p = path.clone();
-                std::thread::spawn(move || Registry::update(&p, |r| Ok(r.add(&sighting(uuid(&format!("U{i}")), None, "t")))).unwrap())
+                std::thread::spawn(move || {
+                    Registry::update(&p, |r| {
+                        Ok(r.add(&sighting(uuid(&format!("U{i}")), None, "t")))
+                    })
+                    .unwrap()
+                })
             })
             .collect();
         for t in threads {

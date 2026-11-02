@@ -26,7 +26,9 @@ pub fn native_root(value: &OsStr) -> Result<NativeRoot, NativeError> {
 }
 
 fn cstr_field(field: &[libc::c_char]) -> String {
-    unsafe { CStr::from_ptr(field.as_ptr()) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(field.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 unsafe extern "C" {
@@ -102,16 +104,15 @@ pub fn statfs_path(path: &Path) -> io::Result<MountInfo> {
 
 /// Firmlinks from `/usr/share/firmlinks`: (path seen from `/`, path relative to the
 /// Data volume root).
-pub fn firmlinks() -> Vec<(PathBuf, PathBuf)> {
-    let Ok(text) = std::fs::read_to_string(FIRMLINKS_FILE) else {
-        return Vec::new();
-    };
-    text.lines()
+pub fn firmlinks() -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let text = std::fs::read_to_string(FIRMLINKS_FILE)?;
+    Ok(text
+        .lines()
         .filter_map(|line| {
             let (from, to) = line.split_once('\t')?;
             Some((PathBuf::from(from.trim()), PathBuf::from(to.trim())))
         })
-        .collect()
+        .collect())
 }
 
 /// Scan layout for the macOS System+Data volume group (spec section 5).
@@ -125,23 +126,24 @@ pub fn firmlinks() -> Vec<(PathBuf, PathBuf)> {
 /// The group is detected from the mount table, not from device numbers: since
 /// macOS 11 `stat` reports the same `st_dev` for both volumes, so a device check
 /// alone would neither separate them nor prevent counting `/Users` twice.
-pub fn scan_layout(root: &Path) -> ScanLayout {
+pub fn scan_layout(root: &Path) -> io::Result<ScanLayout> {
     let mut layout = ScanLayout::default();
     let data = Path::new(DATA_VOLUME_MOUNT);
-    let data_mounted = mounts()
-        .map(|ms| ms.iter().any(|m| m.mount_point == data && m.fs_type == "apfs"))
-        .unwrap_or(false);
+    let mounted = mounts()?;
+    let data_mounted = mounted
+        .iter()
+        .any(|m| m.mount_point == data && m.fs_type == "apfs");
     if !data_mounted {
-        return layout; // pre-Catalina layout: a single volume
+        return Ok(layout); // pre-Catalina layout: a single volume
     }
-    let dev_of = |p: &Path| {
-        std::fs::symlink_metadata(p).ok().map(|m| std::os::unix::fs::MetadataExt::dev(&m))
+    let dev_of = |p: &Path| -> io::Result<u64> {
+        Ok(std::os::unix::fs::MetadataExt::dev(
+            &std::fs::symlink_metadata(p)?,
+        ))
     };
-    let (Some(system_dev), Some(data_dev), Some(root_dev)) =
-        (dev_of(Path::new("/")), dev_of(data), dev_of(root))
-    else {
-        return layout;
-    };
+    let system_dev = dev_of(Path::new("/"))?;
+    let data_dev = dev_of(data)?;
+    let root_dev = dev_of(root)?;
     if root_dev == system_dev || root_dev == data_dev {
         layout.same_filesystem_devs = vec![system_dev];
         if data_dev != system_dev {
@@ -150,9 +152,12 @@ pub fn scan_layout(root: &Path) -> ScanLayout {
         layout.volume_group = true;
     }
     if root == Path::new("/") {
-        layout.alias_paths = firmlinks().into_iter().map(|(_, rel)| data.join(rel)).collect();
+        layout.alias_paths = firmlinks()?
+            .into_iter()
+            .map(|(_, rel)| data.join(rel))
+            .collect();
     }
-    layout
+    Ok(layout)
 }
 
 #[cfg(test)]
@@ -169,12 +174,18 @@ mod tests {
 
     #[test]
     fn volume_group_layout_for_root() {
-        let l = scan_layout(Path::new("/"));
+        let l = scan_layout(Path::new("/")).unwrap();
         if Path::new(DATA_VOLUME_MOUNT).exists() {
             assert!(l.volume_group);
-            assert!(l.alias_paths.contains(&PathBuf::from("/System/Volumes/Data/Users")));
+            assert!(
+                l.alias_paths
+                    .contains(&PathBuf::from("/System/Volumes/Data/Users"))
+            );
         }
-        let home = scan_layout(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert!(home.alias_paths.is_empty(), "aliases only apply when scanning /");
+        let home = scan_layout(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        assert!(
+            home.alias_paths.is_empty(),
+            "aliases only apply when scanning /"
+        );
     }
 }

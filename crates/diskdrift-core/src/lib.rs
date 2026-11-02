@@ -1,8 +1,9 @@
 //! DiskDrift core: data model, scanner, diff and accounting. Platform-independent.
 
-pub mod delta;
 pub mod browse;
+pub mod delta;
 pub mod diff;
+pub mod measurement;
 pub mod native;
 pub mod paths;
 pub mod pathser;
