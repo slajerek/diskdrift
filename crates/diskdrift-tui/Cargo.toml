@@ -13,6 +13,7 @@ crossterm.workspace = true
 crossbeam-channel.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 diskdrift-core = { workspace = true, features = ["testutil"] }

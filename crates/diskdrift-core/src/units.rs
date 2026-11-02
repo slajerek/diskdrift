@@ -57,7 +57,10 @@ pub fn format_delta(delta: i128, units: SizeUnits) -> String {
     } else {
         "±"
     };
-    format!("{sign}{}", format_size(delta.unsigned_abs().min(u64::MAX as u128) as u64, units))
+    format!(
+        "{sign}{}",
+        format_size(delta.unsigned_abs().min(u64::MAX as u128) as u64, units)
+    )
 }
 
 /// Parses a size such as `120GB`, `1.5 GiB`, `500k` or `4096`.

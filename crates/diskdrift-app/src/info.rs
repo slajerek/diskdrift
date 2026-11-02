@@ -23,6 +23,7 @@ pub struct InfoReport {
     pub system: SystemInfo,
     pub containers: Vec<ApfsContainer>,
     pub apfs_error: Option<String>,
+    pub mounts_error: Option<String>,
     pub local_snapshots: usize,
     pub access: AccessCheck,
     pub settings: Effective,
@@ -34,11 +35,26 @@ fn sysctl_string(name: &str) -> Option<String> {
     let cname = CString::new(name).ok()?;
     let mut len: libc::size_t = 0;
     unsafe {
-        if libc::sysctlbyname(cname.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 || len == 0 {
+        if libc::sysctlbyname(
+            cname.as_ptr(),
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+            || len == 0
+        {
             return None;
         }
         let mut buf = vec![0u8; len];
-        if libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) != 0 {
+        if libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
             return None;
         }
         buf.truncate(len);
@@ -59,12 +75,20 @@ pub fn system_info() -> SystemInfo {
         os: std::env::consts::OS.into(),
         os_version: sysctl_string("kern.osproductversion"),
         model: sysctl_string("hw.model"),
-        cpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        cpus: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
     }
 }
 
 pub fn info(settings: &Effective) -> InfoReport {
-    let mounts = diskdrift_platform::mounts().unwrap_or_default();
+    let (mounts, mounts_error) = match diskdrift_platform::mounts() {
+        Ok(inventory) => (
+            inventory.mounts,
+            (!inventory.errors.is_empty()).then(|| inventory.errors.join("; ")),
+        ),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     let topology = apfs::topology(&mounts);
     let (containers, apfs_error) = match topology {
         Ok(c) => (c, None),
@@ -77,6 +101,7 @@ pub fn info(settings: &Effective) -> InfoReport {
         local_snapshots: snapshots.len(),
         containers,
         apfs_error,
+        mounts_error,
         access: access::full_disk_access(),
         store_exists: settings.storage_path.value.exists(),
         settings: settings.clone(),

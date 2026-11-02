@@ -59,28 +59,60 @@ impl Drop for TestDir {
 
 /// Canonical records for `(relative path, kind, allocated size)` specs given in any
 /// order, below the root `/r`. Sizes are used as logical and allocated size.
-pub fn records<S: AsRef<str>>(spec: &[(S, crate::record::Kind, u64)]) -> Vec<crate::record::Record> {
-    let mut v: Vec<(Vec<Vec<u8>>, crate::record::Kind, u64)> = spec
+pub fn records<S: AsRef<str>>(
+    spec: &[(S, crate::record::Kind, u64)],
+) -> Vec<crate::record::Record> {
+    let mut v: Vec<(Vec<crate::native::NativeName>, crate::record::Kind, u64)> = spec
         .iter()
         .map(|(p, k, a)| {
-            let mut comps: Vec<Vec<u8>> = vec![b"/r".to_vec()];
-            comps.extend(p.as_ref().split('/').filter(|c| !c.is_empty()).map(|c| c.as_bytes().to_vec()));
+            let mut comps = vec![crate::native::NativeName::unix(b"/r".to_vec())];
+            comps.extend(
+                p.as_ref()
+                    .split('/')
+                    .filter(|c| !c.is_empty())
+                    .map(|c| crate::native::NativeName::unix(c.as_bytes().to_vec())),
+            );
             (comps, *k, *a)
         })
         .collect();
-    v.sort_by(|a, b| crate::paths::compare_paths(&a.0, &b.0));
+    v.sort_by(|a, b| crate::paths::compare_paths(&a.0, &b.0).unwrap());
     v.into_iter()
         .map(|(comps, kind, alloc)| crate::record::Record {
             depth: (comps.len() - 1) as u16,
             // Stable per path, like a real inode across scans.
-            ino: comps.iter().flatten().fold(1469598103934665603u64, |h, &b| (h ^ b as u64).wrapping_mul(1099511628211)),
-            file_id: crate::record::FileId { low: comps.iter().flatten().fold(1469598103934665603u64, |h, &b| (h ^ b as u64).wrapping_mul(1099511628211)), high: 0 },
-            name: crate::native::NativeName::unix(comps.last().unwrap().clone()),
+            ino: comps
+                .iter()
+                .flat_map(|c| match c {
+                    crate::native::NativeName::Unix(v) => v.iter().copied(),
+                    crate::native::NativeName::Windows(_) => [].iter().copied(),
+                })
+                .fold(1469598103934665603u64, |h, b| {
+                    (h ^ b as u64).wrapping_mul(1099511628211)
+                }),
+            file_id: crate::record::FileId {
+                low: comps
+                    .iter()
+                    .flat_map(|c| match c {
+                        crate::native::NativeName::Unix(v) => v.iter().copied(),
+                        crate::native::NativeName::Windows(_) => [].iter().copied(),
+                    })
+                    .fold(1469598103934665603u64, |h, b| {
+                        (h ^ b as u64).wrapping_mul(1099511628211)
+                    }),
+                high: 0,
+            },
+            name: comps.last().unwrap().clone(),
             kind,
             size: alloc,
             alloc,
             mtime: 1000,
             nlink: 1,
+            available: crate::record::EntryFields::KIND
+                .union(crate::record::EntryFields::LOGICAL_SIZE)
+                .union(crate::record::EntryFields::ALLOCATED_SIZE)
+                .union(crate::record::EntryFields::MTIME)
+                .union(crate::record::EntryFields::FILE_ID)
+                .union(crate::record::EntryFields::LINK_COUNT),
             ..Default::default()
         })
         .collect()

@@ -7,9 +7,10 @@ use crate::snapshots::{AppError, Result};
 use diskdrift_core::record::{Record, flags};
 use diskdrift_core::walk::{self, Progress, WalkOptions};
 use diskdrift_diagnostics::classify::{Assessment, Classifier, verdict};
+use diskdrift_diagnostics::measurement::Envelope;
 use diskdrift_diagnostics::suspects::{self, MeasureStatus, Risk};
 use diskdrift_platform::ListerKind;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
@@ -17,8 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct AnalyzeItem {
     pub name: String,
     pub path: String,
@@ -34,16 +34,14 @@ pub struct AnalyzeItem {
     pub assessment: Assessment,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct VerdictTotal {
     pub verdict: String,
     pub allocated_bytes: u64,
     pub items: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
 pub struct DirAnalysis {
     pub path: String,
     /// What the analysed folder itself (or its nearest known ancestor) is;
@@ -69,6 +67,130 @@ pub struct DirAnalysis {
     pub notes: Vec<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyzeItemWire<'a> {
+    name: &'a str,
+    path: &'a str,
+    is_dir: bool,
+    status: MeasureStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    newest_mtime: Option<i64>,
+    assessment: &'a Assessment,
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl Serialize for AnalyzeItem {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let known = !matches!(
+            self.status,
+            MeasureStatus::Absent | MeasureStatus::Inaccessible | MeasureStatus::Skipped
+        );
+        AnalyzeItemWire {
+            name: &self.name,
+            path: &self.path,
+            is_dir: self.is_dir,
+            status: self.status,
+            allocated_bytes: known.then_some(self.allocated_bytes),
+            logical_bytes: known.then_some(self.logical_bytes),
+            entries: known.then_some(self.entries),
+            newest_mtime: self.newest_mtime,
+            assessment: &self.assessment,
+            measurement: suspects::envelope_for_status(self.status),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VerdictTotalWire<'a> {
+    verdict: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocated_bytes: Option<u64>,
+    items: usize,
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl Serialize for VerdictTotal {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let unknown = self.verdict == "unknown";
+        VerdictTotalWire {
+            verdict: &self.verdict,
+            allocated_bytes: (!unknown).then_some(self.allocated_bytes),
+            items: self.items,
+            measurement: if unknown {
+                Envelope::default()
+            } else {
+                Envelope::observed("filesystem", "path group", "bounded read-only walk")
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirAnalysisWire<'a> {
+    path: &'a str,
+    context: &'a Option<Context>,
+    status: MeasureStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entries: Option<u64>,
+    items: &'a [AnalyzeItem],
+    more_items: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    more_allocated_bytes: Option<u64>,
+    by_verdict: &'a [VerdictTotal],
+    installed_apps: usize,
+    analyzed_at: i64,
+    elapsed_ms: u64,
+    sizes_from: &'a Option<String>,
+    notes: &'a [String],
+    #[serde(flatten)]
+    measurement: Envelope,
+}
+
+impl Serialize for DirAnalysis {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let known = !matches!(
+            self.status,
+            MeasureStatus::Absent | MeasureStatus::Inaccessible | MeasureStatus::Skipped
+        );
+        DirAnalysisWire {
+            path: &self.path,
+            context: &self.context,
+            status: self.status,
+            allocated_bytes: known.then_some(self.allocated_bytes),
+            logical_bytes: known.then_some(self.logical_bytes),
+            entries: known.then_some(self.entries),
+            items: &self.items,
+            more_items: self.more_items,
+            more_allocated_bytes: known.then_some(self.more_allocated_bytes),
+            by_verdict: &self.by_verdict,
+            installed_apps: self.installed_apps,
+            analyzed_at: self.analyzed_at,
+            elapsed_ms: self.elapsed_ms,
+            sizes_from: &self.sizes_from,
+            notes: &self.notes,
+            measurement: suspects::envelope_for_status(self.status),
+        }
+        .serialize(serializer)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Context {
@@ -81,17 +203,25 @@ pub struct Context {
 /// The nearest of `path` and its ancestors (up to the home folder or `/`) that is
 /// a known location or has a known name.
 fn context_for(path: &Path, home: &Path, classifier: &Classifier) -> Option<Context> {
-    let catalog = suspects::macos_catalog();
+    let catalog = suspects::catalog();
     for p in path.ancestors() {
         if p == home || p.parent().is_none() {
             break;
         }
         if let Some(s) = catalog.iter().find(|s| suspects::expand(s.path, home) == p) {
-            return Some(Context { what: s.label.into(), risk: s.risk, from: p.display().to_string() });
+            return Some(Context {
+                what: s.label.into(),
+                risk: s.risk,
+                from: p.display().to_string(),
+            });
         }
         let a = classifier.assess(p, true);
         if let Some(risk) = a.risk {
-            return Some(Context { what: a.what, risk, from: p.display().to_string() });
+            return Some(Context {
+                what: a.what,
+                risk,
+                from: p.display().to_string(),
+            });
         }
     }
     None
@@ -100,8 +230,16 @@ fn context_for(path: &Path, home: &Path, classifier: &Classifier) -> Option<Cont
 /// Progress events, in order.
 #[derive(Debug, Clone)]
 pub enum AnalyzeStep {
-    Listed { children: usize, installed_apps: usize },
-    Measured { name: String, allocated_bytes: u64, entries: u64, elapsed: Duration },
+    Listed {
+        children: usize,
+        installed_apps: usize,
+    },
+    Measured {
+        name: String,
+        allocated_bytes: u64,
+        entries: u64,
+        elapsed: Duration,
+    },
 }
 
 struct Acc {
@@ -115,7 +253,14 @@ struct Acc {
 
 impl Acc {
     fn new() -> Acc {
-        Acc { status: MeasureStatus::Absent, allocated: 0, logical: 0, entries: 0, newest: None, inaccessible: 0 }
+        Acc {
+            status: MeasureStatus::Absent,
+            allocated: 0,
+            logical: 0,
+            entries: 0,
+            newest: None,
+            inaccessible: 0,
+        }
     }
 
     fn add(&mut self, rec: &Record) {
@@ -134,7 +279,11 @@ impl Acc {
 /// Expands `~` and makes `path` absolute against the current directory.
 pub fn resolve_path(settings: &Effective, path: &str) -> PathBuf {
     let p = suspects::expand(path, &settings.home);
-    if p.is_absolute() { p } else { std::env::current_dir().map(|c| c.join(&p)).unwrap_or(p) }
+    if p.is_absolute() {
+        p
+    } else {
+        std::env::current_dir().map(|c| c.join(&p)).unwrap_or(p)
+    }
 }
 
 pub fn analyze(
@@ -147,52 +296,72 @@ pub fn analyze(
     step: &dyn Fn(AnalyzeStep),
 ) -> Result<DirAnalysis> {
     let started = Instant::now();
-    let md = std::fs::symlink_metadata(path).map_err(|e| AppError::Usage(format!("{}: {e}", path.display())))?;
+    let md = std::fs::symlink_metadata(path)
+        .map_err(|e| AppError::Usage(format!("{}: {e}", path.display())))?;
     if !md.is_dir() {
-        return Err(AppError::Usage(format!("{} is not a directory", path.display())));
+        return Err(AppError::Usage(format!(
+            "{} is not a directory",
+            path.display()
+        )));
     }
     // List the children first, so ones the time budget does not reach still appear.
     let mut children: Vec<(OsString, bool)> = std::fs::read_dir(path)
         .map_err(|e| AppError::Runtime(format!("{}: {e}", path.display())))?
         .flatten()
-        .map(|e| (e.file_name(), e.file_type().map(|t| t.is_dir()).unwrap_or(false)))
+        .map(|e| {
+            (
+                e.file_name(),
+                e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            )
+        })
         .collect();
     children.sort();
     let classifier = Classifier::load(&settings.home);
     let installed_apps = classifier.installed_apps();
     let context = context_for(path, &settings.home, &classifier);
-    step(AnalyzeStep::Listed { children: children.len(), installed_apps });
+    step(AnalyzeStep::Listed {
+        children: children.len(),
+        installed_apps,
+    });
 
-    let mut accs: HashMap<OsString, Acc> = children.iter().map(|(n, _)| (n.clone(), Acc::new())).collect();
+    let mut accs: HashMap<OsString, Acc> = children
+        .iter()
+        .map(|(n, _)| (n.clone(), Acc::new()))
+        .collect();
     let mut total = Acc::new();
     let lister = diskdrift_platform::lister(ListerKind::Auto);
-    let opts = WalkOptions { threads: settings.threads.value, ..WalkOptions::default() };
+    let opts = WalkOptions {
+        threads: settings.threads.value,
+        ..WalkOptions::default()
+    };
     let deadline = started + budget;
     let stop = AtomicBool::new(false);
     let mut timed_out = false;
     let mut n = 0u64;
     let mut current: Option<(OsString, Instant)> = None;
-    let finish = |cur: &mut Option<(OsString, Instant)>, accs: &mut HashMap<OsString, Acc>, done: bool| {
-        if let Some((name, t0)) = cur.take()
-            && let Some(a) = accs.get_mut(&name)
-        {
-            if a.status == MeasureStatus::Complete && a.inaccessible > 0 {
-                a.status = MeasureStatus::Partial;
+    let finish =
+        |cur: &mut Option<(OsString, Instant)>, accs: &mut HashMap<OsString, Acc>, done: bool| {
+            if let Some((name, t0)) = cur.take()
+                && let Some(a) = accs.get_mut(&name)
+            {
+                if a.status == MeasureStatus::Complete && a.inaccessible > 0 {
+                    a.status = MeasureStatus::Partial;
+                }
+                if !done && matches!(a.status, MeasureStatus::Complete | MeasureStatus::Partial) {
+                    a.status = MeasureStatus::TimedOut;
+                }
+                step(AnalyzeStep::Measured {
+                    name: name.to_string_lossy().into_owned(),
+                    allocated_bytes: a.allocated,
+                    entries: a.entries,
+                    elapsed: t0.elapsed(),
+                });
             }
-            if !done && matches!(a.status, MeasureStatus::Complete | MeasureStatus::Partial) {
-                a.status = MeasureStatus::TimedOut;
-            }
-            step(AnalyzeStep::Measured {
-                name: name.to_string_lossy().into_owned(),
-                allocated_bytes: a.allocated,
-                entries: a.entries,
-                elapsed: t0.elapsed(),
-            });
-        }
-    };
+        };
     let mut sink = |rec: &Record, p: &Path| -> io::Result<()> {
         n += 1;
-        if n.is_multiple_of(2048) && (Instant::now() >= deadline || cancel.load(Ordering::Relaxed)) {
+        if n.is_multiple_of(2048) && (Instant::now() >= deadline || cancel.load(Ordering::Relaxed))
+        {
             timed_out = Instant::now() >= deadline;
             stop.store(true, Ordering::Relaxed);
         }
@@ -204,7 +373,11 @@ pub fn analyze(
             finish(&mut current, &mut accs, true);
             let name = p.file_name().map(OsString::from).unwrap_or_default();
             if let Some(a) = accs.get_mut(&name) {
-                a.status = if rec.has(flags::INACCESSIBLE) { MeasureStatus::Inaccessible } else { MeasureStatus::Complete };
+                a.status = if rec.has(flags::INACCESSIBLE) {
+                    MeasureStatus::Inaccessible
+                } else {
+                    MeasureStatus::Complete
+                };
             }
             current = Some((name, Instant::now()));
         }
@@ -231,7 +404,8 @@ pub fn analyze(
             (name.to_string_lossy().into_owned(), is_dir, status, a)
         })
         .collect();
-    let (items, more_items, more_allocated_bytes, by) = assemble(path, measured, &classifier, context.as_ref(), limit);
+    let (items, more_items, more_allocated_bytes, by) =
+        assemble(path, measured, &classifier, context.as_ref(), limit);
 
     let status = if stopped && timed_out {
         MeasureStatus::TimedOut
@@ -255,7 +429,7 @@ pub fn analyze(
     }
     if total.inaccessible > 0 {
         notes.push(format!(
-            "{} folder(s) could not be read (Full Disk Access may be needed); their contents are not counted.",
+            "{} folder(s) could not be read (additional filesystem permissions may be needed); their contents are not counted.",
             total.inaccessible
         ));
     }
@@ -282,7 +456,13 @@ type Assembled = (Vec<AnalyzeItem>, usize, u64, Vec<VerdictTotal>);
 
 /// Assesses measured children, sorts them largest first, totals them per
 /// verdict and applies the limit.
-fn assemble(path: &Path, measured: Vec<(String, bool, MeasureStatus, Acc)>, classifier: &Classifier, context: Option<&Context>, limit: usize) -> Assembled {
+fn assemble(
+    path: &Path,
+    measured: Vec<(String, bool, MeasureStatus, Acc)>,
+    classifier: &Classifier,
+    context: Option<&Context>,
+    limit: usize,
+) -> Assembled {
     let mut items: Vec<AnalyzeItem> = measured
         .into_iter()
         .map(|(name, is_dir, status, a)| {
@@ -307,7 +487,11 @@ fn assemble(path: &Path, measured: Vec<(String, bool, MeasureStatus, Acc)>, clas
             }
         })
         .collect();
-    items.sort_by(|a, b| b.allocated_bytes.cmp(&a.allocated_bytes).then_with(|| a.name.cmp(&b.name)));
+    items.sort_by(|a, b| {
+        b.allocated_bytes
+            .cmp(&a.allocated_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     let mut by: Vec<VerdictTotal> = Vec::new();
     for it in &items {
         let v = verdict(it.assessment.risk);
@@ -316,7 +500,11 @@ fn assemble(path: &Path, measured: Vec<(String, bool, MeasureStatus, Acc)>, clas
                 t.allocated_bytes += it.allocated_bytes;
                 t.items += 1;
             }
-            None => by.push(VerdictTotal { verdict: v.into(), allocated_bytes: it.allocated_bytes, items: 1 }),
+            None => by.push(VerdictTotal {
+                verdict: v.into(),
+                allocated_bytes: it.allocated_bytes,
+                items: 1,
+            }),
         }
     }
     by.sort_by_key(|v| std::cmp::Reverse(v.allocated_bytes));
@@ -329,20 +517,44 @@ fn assemble(path: &Path, measured: Vec<(String, bool, MeasureStatus, Acc)>, clas
 /// The same analysis from the latest scan, without walking the folder: `None`
 /// when that scan is older than `max_age` seconds or does not contain `path`.
 #[cfg(unix)]
-pub fn analyze_from_scan(settings: &Effective, path: &Path, limit: usize, max_age: i64, now: i64) -> Result<Option<DirAnalysis>> {
+pub fn analyze_from_scan(
+    settings: &Effective,
+    path: &Path,
+    limit: usize,
+    max_age: i64,
+    now: i64,
+) -> Result<Option<DirAnalysis>> {
     use diskdrift_core::paths::components_under;
-    use std::os::unix::ffi::OsStrExt;
     let started = Instant::now();
-    let Some(store) = crate::snapshots::open_store(settings)? else { return Ok(None) };
-    let Some(m) = store.list()?.into_iter().rev().find(|m| m.status.is_usable()) else { return Ok(None) };
-    let scanned_at = chrono::DateTime::parse_from_rfc3339(&m.started_at).map(|t| t.timestamp()).unwrap_or(0);
+    let Some(store) = crate::snapshots::open_store(settings)? else {
+        return Ok(None);
+    };
+    let Some(m) = store
+        .list()?
+        .into_iter()
+        .rev()
+        .find(|m| m.status.is_usable())
+    else {
+        return Ok(None);
+    };
+    let scanned_at = chrono::DateTime::parse_from_rfc3339(&m.started_at)
+        .map(|t| t.timestamp())
+        .unwrap_or(0);
     if now - scanned_at > max_age {
         return Ok(None);
     }
-    let Some(dir) = components_under(m.root.as_bytes(), path.as_os_str().as_bytes()) else { return Ok(None) };
+    let root = crate::snapshots::exact_root(&store, &m)?;
+    let path_native = diskdrift_platform::native_path(path.as_os_str());
+    let Some(dir) =
+        components_under(&root, &path_native).map_err(|e| AppError::Runtime(e.to_string()))?
+    else {
+        return Ok(None);
+    };
     let listing = diskdrift_core::browse::children(store.records(m.id)?, &dir, usize::MAX)
         .map_err(|e| AppError::Store(diskdrift_storage::StoreError::Corrupt(e.to_string())))?;
-    let Some(d) = listing.dir.filter(|d| d.is_dir()) else { return Ok(None) };
+    let Some(d) = listing.dir.filter(|d| d.is_dir()) else {
+        return Ok(None);
+    };
     let classifier = Classifier::load(&settings.home);
     let context = context_for(path, &settings.home, &classifier);
     let measured = listing
@@ -365,7 +577,8 @@ pub fn analyze_from_scan(settings: &Effective, path: &Path, limit: usize, max_ag
             (c.name(), c.is_dir(), status, acc)
         })
         .collect();
-    let (items, more_items, more_allocated_bytes, by) = assemble(path, measured, &classifier, context.as_ref(), limit);
+    let (items, more_items, more_allocated_bytes, by) =
+        assemble(path, measured, &classifier, context.as_ref(), limit);
     let source = crate::snapshots::scan_label(&m, now);
     let mut notes = vec![
         format!("Sizes from {source}, not measured now; changes since then are not shown."),
@@ -377,7 +590,11 @@ pub fn analyze_from_scan(settings: &Effective, path: &Path, limit: usize, max_ag
     Ok(Some(DirAnalysis {
         path: path.display().to_string(),
         context,
-        status: if d.incomplete { MeasureStatus::Partial } else { MeasureStatus::Complete },
+        status: if d.incomplete {
+            MeasureStatus::Partial
+        } else {
+            MeasureStatus::Complete
+        },
         allocated_bytes: d.allocated_bytes,
         logical_bytes: d.logical_bytes,
         entries: d.entries,
@@ -395,7 +612,13 @@ pub fn analyze_from_scan(settings: &Effective, path: &Path, limit: usize, max_ag
 }
 
 #[cfg(not(unix))]
-pub fn analyze_from_scan(_settings: &Effective, _path: &Path, _limit: usize, _max_age: i64, _now: i64) -> Result<Option<DirAnalysis>> {
+pub fn analyze_from_scan(
+    _settings: &Effective,
+    _path: &Path,
+    _limit: usize,
+    _max_age: i64,
+    _now: i64,
+) -> Result<Option<DirAnalysis>> {
     Ok(None)
 }
 
@@ -405,7 +628,11 @@ pub fn age(seconds: i64) -> String {
     let (min, hour, day) = (60.0, 3600.0, 86_400.0);
     let n = |v: f64, unit: &str| {
         let v = v.round() as i64;
-        if v == 1 { format!("1 {unit}") } else { format!("{v} {unit}s") }
+        if v == 1 {
+            format!("1 {unit}")
+        } else {
+            format!("{v} {unit}s")
+        }
     };
     if s < min {
         "just now".into()
@@ -445,11 +672,22 @@ mod tests {
         t.file("root/node_modules/m.js", 10_000);
         t.file("root/loose.dmg", 70_000);
         std::fs::create_dir_all(t.path().join("root/empty")).unwrap();
-        let s = resolve_with(&Overrides::default(), Path::new("/nonexistent-home"), Path::new("/")).unwrap();
+        let s = resolve_with(
+            &Overrides::default(),
+            Path::new("/nonexistent-home"),
+            Path::new("/"),
+        )
+        .unwrap();
         let steps = std::cell::RefCell::new(Vec::new());
-        let r = analyze(&s, &t.path().join("root"), 3, Duration::from_secs(30), &AtomicBool::new(false), None, &|st| {
-            steps.borrow_mut().push(st)
-        })
+        let r = analyze(
+            &s,
+            &t.path().join("root"),
+            3,
+            Duration::from_secs(30),
+            &AtomicBool::new(false),
+            None,
+            &|st| steps.borrow_mut().push(st),
+        )
         .unwrap();
         assert_eq!(r.status, MeasureStatus::Complete);
         assert_eq!(r.items.len(), 3);
@@ -465,8 +703,25 @@ mod tests {
         assert_eq!(all, 5);
         let steps = steps.into_inner();
         assert!(matches!(steps[0], AnalyzeStep::Listed { children: 5, .. }));
-        assert_eq!(steps.iter().filter(|s| matches!(s, AnalyzeStep::Measured { .. })).count(), 5);
-        assert!(analyze(&s, &t.path().join("root/loose.dmg"), 3, Duration::from_secs(1), &AtomicBool::new(false), None, &|_| {}).is_err());
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| matches!(s, AnalyzeStep::Measured { .. }))
+                .count(),
+            5
+        );
+        assert!(
+            analyze(
+                &s,
+                &t.path().join("root/loose.dmg"),
+                3,
+                Duration::from_secs(1),
+                &AtomicBool::new(false),
+                None,
+                &|_| {}
+            )
+            .is_err()
+        );
     }
 
     #[test]

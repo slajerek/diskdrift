@@ -7,10 +7,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono.workspace = true
 diskdrift-core.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 serde.workspace = true
+windows-sys.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 diskdrift-core = { workspace = true, features = ["testutil"] }

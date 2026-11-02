@@ -18,7 +18,7 @@ with open(cfg, "w") as f:
     f.write('{"schemaVersion":1}')
 
 
-def run(keys, settle=0.6, cancel_with_signal=False, wait_for=None, after_wait=()):
+def run(keys, settle=0.6, cancel_with_signal=False, waits=()):
     pid, fd = pty.fork()
     if pid == 0:
         fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
@@ -41,7 +41,7 @@ def run(keys, settle=0.6, cancel_with_signal=False, wait_for=None, after_wait=()
     for k in keys:
         os.write(fd, k)
         pump(settle)
-    if wait_for is not None:
+    for wait_for, after_wait in waits:
         deadline = time.time() + 20
         while not wait_for() and time.time() < deadline:
             pump(0.1)
@@ -99,42 +99,66 @@ if os.path.isdir(store):
 keys = [b"s"] + [b"\x7f"] * 40 + [tree.encode(), b"\t", b"tui-scan", b"\r", b"\r"]
 
 
-def scan_completed():
-    for path in glob.glob(os.path.join(store, "snapshots", "*.json")):
+def metadata_paths():
+    paths = []
+    for directory in ("snapshots-v4", "snapshots"):
+        paths.extend(glob.glob(os.path.join(store, directory, "*.json")))
+    return paths
+
+
+def scan_status(name):
+    for path in metadata_paths():
         try:
             meta = json.load(open(path))
         except (OSError, ValueError):
             continue
-        if meta.get("name") == "tui-scan" and meta.get("status") == "COMPLETED":
-            return True
-    return False
+        if meta.get("name") == name:
+            return meta.get("status")
+    return None
 
 
-out, status = run(keys + [b"", b"h", b"t", b"\t", b"d"], settle=0.05, wait_for=scan_completed, after_wait=[b"q"])
+def scan_completed():
+    return scan_status("tui-scan") == "COMPLETED"
+
+
+out, status = run(
+    keys + [b"", b"h", b"t", b"\t", b"d"],
+    settle=0.05,
+    waits=((scan_completed, (b"q",)),),
+)
 check("scan from the TUI", out, status)
-metas = [json.load(open(p)) for p in glob.glob(os.path.join(store, "snapshots", "*.json"))]
+metas = [json.load(open(p)) for p in metadata_paths()]
 assert any(m["name"] == "tui-scan" and m["status"] == "COMPLETED" for m in metas), metas
 print("ok  snapshot written by the TUI is COMPLETED")
-# Cancel a running scan: a large read-only tree, Esc + y after a moment.
-keys = [b"s"] + [b"\x7f"] * 120 + [b"/Applications", b"\t", b"tui-cancel", b"\r", b"\r"]
+# Cancel a running scan after its metadata confirms it has started.
+cancel_tree = os.path.join(TMP, "cancel-tree")
+os.makedirs(cancel_tree, exist_ok=True)
+for i in range(65_536):
+    open(os.path.join(cancel_tree, f"entry-{i}"), "a").close()
+keys = [b"s"] + [b"\x7f"] * 120 + [cancel_tree.encode(), b"\t", b"tui-cancel", b"\r", b"\r"]
 
 
-def scan_settled():
-    for path in glob.glob(os.path.join(store, "snapshots", "*.json")):
-        try:
-            meta = json.load(open(path))
-        except (OSError, ValueError):
-            continue
-        if meta.get("name") == "tui-cancel" and meta.get("status") in ("CANCELLED", "COMPLETED", "PARTIAL"):
-            return True
-    return False
+def scan_started():
+    return scan_status("tui-cancel") == "IN_PROGRESS"
 
 
-out, status = run(keys + [b"", b"\x1b", b"y", b""], settle=0.05, wait_for=scan_settled, after_wait=[b"q"])
+def scan_finished():
+    status = scan_status("tui-cancel")
+    return status is not None and status != "IN_PROGRESS"
+
+
+out, status = run(
+    keys,
+    settle=0.05,
+    waits=((scan_started, (b"", b"\x1b", b"y", b"")), (scan_finished, (b"q",))),
+)
 check("cancel a running scan", out, status)
-metas = [json.load(open(p)) for p in glob.glob(os.path.join(store, "snapshots", "*.json"))]
+metas = [json.load(open(p)) for p in metadata_paths()]
 m = [m for m in metas if m["name"] == "tui-cancel"]
-assert m and m[0]["status"] in ("CANCELLED", "COMPLETED", "PARTIAL"), metas
-assert not glob.glob(os.path.join(store, "snapshots", "*.tmp")), "no temporary data left"
-print(f"ok  cancelled scan recorded as {m[0]['status']}")
+assert m and m[0]["status"] == "CANCELLED", metas
+assert not any(
+    glob.glob(os.path.join(store, directory, "*.tmp"))
+    for directory in ("snapshots-v4", "snapshots")
+), "no temporary data left"
+print("ok  cancelled scan recorded as CANCELLED")
 print("TUI smoke test passed")

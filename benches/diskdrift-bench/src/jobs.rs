@@ -5,6 +5,7 @@ use crate::stores::{self, Backend, Store};
 use crate::synth::{Gen, Params};
 use diskdrift_core::delta::{DeltaBuilder, DeltaOp, OpDecoder, OpEncoder};
 use diskdrift_core::diff::{self, DiffOptions};
+use diskdrift_core::native::NativeName;
 use diskdrift_core::record::Record;
 use diskdrift_core::top::{self, TopOptions};
 use diskdrift_core::walk::{self, WalkOptions};
@@ -12,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(not(unix))]
 use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -58,6 +61,22 @@ impl Strategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProductionFormat {
+    Dds1,
+    Dds2,
+}
+
+impl ProductionFormat {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dds1 => "dds1",
+            Self::Dds2 => "dds2",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "job", rename_all = "kebab-case")]
 pub enum Job {
@@ -91,7 +110,7 @@ pub enum Job {
         backend: Backend,
         dir: PathBuf,
         id: u32,
-        prefix: Vec<Vec<u8>>,
+        prefix: Vec<NativeName>,
     },
     Delta {
         backend: Backend,
@@ -145,6 +164,12 @@ pub enum Job {
         params: Params,
         version: u32,
     },
+    /// Writes and reads a full snapshot through the shipping `Store`.
+    ProductionStore {
+        dir: PathBuf,
+        params: Params,
+        format: ProductionFormat,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -154,6 +179,8 @@ pub struct JobResult {
     pub footprint: u64,
     pub ok: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub peak_rss: u64,
     #[serde(default)]
     pub extra: serde_json::Value,
 }
@@ -222,11 +249,26 @@ pub fn run_child_with(job: &Job, kill_after_ms: Option<u64>) -> io::Result<Measu
 }
 
 #[cfg(not(unix))]
-pub fn run_child(_job: &Job) -> io::Result<Measured> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "benchmark child jobs require Unix wait4 support",
-    ))
+pub fn run_child(job: &Job) -> io::Result<Measured> {
+    let exe = std::env::current_exe()?;
+    let started = Instant::now();
+    let output = Command::new(exe)
+        .arg("child")
+        .arg(serde_json::to_string(job).unwrap())
+        .stdin(Stdio::null())
+        .output()?;
+    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let result = serde_json::from_str::<JobResult>(text.trim()).unwrap_or_else(|_| JobResult {
+        ok: false,
+        error: Some(format!("child failed ({}): {text}", output.status)),
+        ..Default::default()
+    });
+    Ok(Measured {
+        max_rss: result.peak_rss,
+        result,
+        wall_ms,
+    })
 }
 
 #[cfg(unix)]
@@ -472,7 +514,7 @@ pub fn execute(job: Job) -> JobResult {
             threads,
         } => timed(|| {
             let l = lister_by_name(&lister);
-            let layout = diskdrift_platform::scan_layout(&root);
+            let layout = diskdrift_platform::scan_layout(&root)?;
             let opts = WalkOptions {
                 threads,
                 same_filesystem_devs: layout.same_filesystem_devs,
@@ -498,7 +540,7 @@ pub fn execute(job: Job) -> JobResult {
             footprint_dir = Some(dir.clone());
             timed(|| {
                 let l = lister_by_name(&lister);
-                let layout = diskdrift_platform::scan_layout(&root);
+                let layout = diskdrift_platform::scan_layout(&root)?;
                 let opts = WalkOptions {
                     threads,
                     same_filesystem_devs: layout.same_filesystem_devs,
@@ -566,11 +608,255 @@ pub fn execute(job: Job) -> JobResult {
             let ids: Vec<u32> = infos.iter().map(|i| i.id).collect();
             Ok((got.0, serde_json::json!({ "snapshots": ids })))
         }),
+        Job::ProductionStore {
+            dir,
+            params,
+            format,
+        } => {
+            footprint_dir = Some(dir.clone());
+            timed(|| {
+                use diskdrift_core::native::{NativePath, NativeRoot, RootKind};
+                use diskdrift_core::record::{FileIdScheme, TimestampResolution};
+                use diskdrift_core::walk::WalkReport;
+                use diskdrift_storage::{
+                    ScanOptions, SnapshotMeta, Status, Store, VolumeIdentity, meta,
+                };
+
+                let windows = cfg!(windows);
+                let root_units: Vec<u16> = r"C:\synthetic".encode_utf16().collect();
+                let root_native = if windows {
+                    NativeRoot::new(
+                        NativePath::windows(root_units.clone()),
+                        RootKind::Drive,
+                        false,
+                    )
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                } else {
+                    NativeRoot::posix(b"/synthetic".to_vec())
+                };
+                let root_in_volume_native = if windows {
+                    NativePath::windows(vec![b'\\' as u16])
+                } else {
+                    NativePath::unix(b"/synthetic".to_vec())
+                };
+                let mut descriptor = meta::VolumeDescriptor::new(
+                    0,
+                    if windows { "windows" } else { "linux" },
+                    if windows {
+                        FileIdScheme::WindowsFileId128
+                    } else {
+                        FileIdScheme::PosixInode64
+                    },
+                    meta::FileIdScope::Volume,
+                    meta::AllocationSemantics::FilesystemReported,
+                    TimestampResolution::Seconds,
+                    meta::Provenance::Observed("synthetic benchmark".into()),
+                );
+                descriptor.identity = if windows {
+                    NativePath::windows(r"\\?\Volume{benchmark}".encode_utf16().collect())
+                } else {
+                    NativePath::unix(b"benchmark".to_vec())
+                };
+                descriptor.mount_key = if windows {
+                    NativePath::windows(r"C:\".encode_utf16().collect())
+                } else {
+                    NativePath::unix(b"/synthetic".to_vec())
+                };
+                descriptor.identity_strength = "uuid".into();
+                let meta = SnapshotMeta {
+                    format_version: meta::META_FORMAT_VERSION,
+                    id: 0,
+                    name: "benchmark".into(),
+                    root: if windows {
+                        r"C:\synthetic"
+                    } else {
+                        "/synthetic"
+                    }
+                    .into(),
+                    root_native: Some(root_native.clone()),
+                    disk: None,
+                    root_in_volume: None,
+                    root_in_volume_native: Some(root_in_volume_native),
+                    status: Status::InProgress,
+                    started_at: String::new(),
+                    finished_at: None,
+                    volume: VolumeIdentity {
+                        uuid: Some("benchmark".into()),
+                        fs_type: if windows { "ntfs" } else { "synthetic" }.into(),
+                        mount_point: if windows { r"C:\" } else { "/synthetic" }.into(),
+                        descriptor: Some(descriptor.clone()),
+                        ..Default::default()
+                    },
+                    volumes: meta::complete_volume_table(&descriptor),
+                    options: ScanOptions {
+                        stay_on_filesystem: true,
+                        ..Default::default()
+                    },
+                    space_before: None,
+                    space_after: None,
+                    storage: Default::default(),
+                    counts: None,
+                    error: None,
+                    diskdrift_version: "bench".into(),
+                };
+                if format == ProductionFormat::Dds1 {
+                    if windows {
+                        return Err(io::Error::other(
+                            "DDS1 production benchmark cannot encode Windows-native names",
+                        ));
+                    }
+                    use diskdrift_storage::codec::RecordEncoder;
+                    use diskdrift_storage::container::DataWriter;
+                    use diskdrift_storage::{FileKind, StorageInfo};
+
+                    let snapshots = dir.join("snapshots");
+                    std::fs::create_dir_all(&snapshots)?;
+                    let data_path = snapshots.join("00000001.dds");
+                    let mut writer =
+                        DataWriter::create(snapshots.join("00000001.dds.tmp"), FileKind::Records)?;
+                    let import_started = Instant::now();
+                    let mut encoder = RecordEncoder::new();
+                    let mut items = 0;
+                    for record in Gen::new(params, 0) {
+                        if let Some(block) = encoder.push(&record)? {
+                            writer.block(block)?;
+                        }
+                        items += 1;
+                    }
+                    if let Some(block) = encoder.finish()? {
+                        writer.block(block)?;
+                    }
+                    let blocks = writer.blocks();
+                    writer.commit(&data_path)?;
+                    let mut legacy_meta = meta;
+                    legacy_meta.id = 1;
+                    legacy_meta.status = Status::Completed;
+                    legacy_meta.finished_at = Some(String::new());
+                    legacy_meta.storage = StorageInfo {
+                        data_file: Some("00000001.dds".into()),
+                        bytes_on_disk: stores::footprint(&data_path),
+                        blocks,
+                        items,
+                        ..Default::default()
+                    };
+                    std::fs::write(
+                        dir.join("store.json"),
+                        r#"{"format":"diskdrift-snapshots","version":3}"#,
+                    )?;
+                    std::fs::write(
+                        snapshots.join("00000001.json"),
+                        serde_json::to_vec(&legacy_meta)?,
+                    )?;
+                    let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
+                    let footprint = stores::footprint(&dir);
+                    let read_started = Instant::now();
+                    let legacy_store =
+                        Store::open(&dir).map_err(|error| io::Error::other(error.to_string()))?;
+                    let read_items = legacy_store
+                        .records(1)
+                        .map_err(|error| io::Error::other(error.to_string()))?
+                        .try_fold(0u64, |count, record| record.map(|_| count + 1))?;
+                    let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+                    return Ok((
+                        items,
+                        serde_json::json!({
+                            "format": format.label(),
+                            "importMs": import_ms,
+                            "readMs": read_ms,
+                            "readItems": read_items,
+                            "footprint": footprint,
+                            "pathEncoding": "unix-bytes",
+                        }),
+                    ));
+                }
+                let store =
+                    Store::create(&dir).map_err(|error| io::Error::other(error.to_string()))?;
+                let import_started = Instant::now();
+                let (lock, _) = store
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut writer = store
+                    .begin(lock, meta, None)
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut items = 0;
+                for mut record in Gen::new(params, 0) {
+                    if windows {
+                        record.name = if record.depth == 0 {
+                            NativeName::windows(root_units.clone())
+                        } else {
+                            match &record.name {
+                                NativeName::Unix(bytes) => NativeName::windows(
+                                    bytes.iter().map(|byte| u16::from(*byte)).collect(),
+                                ),
+                                NativeName::Windows(_) => {
+                                    unreachable!("synthetic generator is Unix-byte based")
+                                }
+                            }
+                        };
+                    }
+                    writer
+                        .push(&record)
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    items += 1;
+                }
+                let committed = writer
+                    .commit(WalkReport::default(), None, String::new())
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let import_ms = import_started.elapsed().as_secs_f64() * 1000.0;
+                let footprint = store.size_on_disk();
+                let read_started = Instant::now();
+                let read_items = store
+                    .records(committed.id)
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .try_fold(0u64, |count, record| record.map(|_| count + 1))?;
+                let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+                Ok((
+                    items,
+                    serde_json::json!({
+                        "format": format.label(),
+                        "importMs": import_ms,
+                        "readMs": read_ms,
+                        "readItems": read_items,
+                        "footprint": footprint,
+                        "pathEncoding": if windows { "windows-utf16" } else { "unix-bytes" },
+                    }),
+                ))
+            })
+        }
     };
     if let Some(d) = footprint_dir {
         r.footprint = stores::footprint(&d);
     }
+    r.peak_rss = peak_rss_bytes();
     r
+}
+
+#[cfg(windows)]
+fn peak_rss_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    if unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    } == 0
+    {
+        0
+    } else {
+        counters.PeakWorkingSetSize as u64
+    }
+}
+
+#[cfg(not(windows))]
+fn peak_rss_bytes() -> u64 {
+    0
 }
 
 pub fn lister_by_name(name: &str) -> Box<dyn diskdrift_core::walk::DirLister> {

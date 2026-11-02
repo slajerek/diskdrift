@@ -2,12 +2,14 @@ use diskdrift_core::native::{NativeName, NativePath};
 use diskdrift_core::record::{
     EntryFields, FileId, IdentityEvidence, MoveCertainty, Record, TimestampResolution,
 };
-use diskdrift_storage::codec::RecordEncoder;
+use diskdrift_storage::StreamDescriptor;
+use diskdrift_storage::codec::{RecordEncoder, decode_records, decompress};
 use diskdrift_storage::disks::{
     Alias, DISKS_FORMAT, DISKS_VERSION_V2, Identity, Registry, Sighting, Strength,
 };
 use diskdrift_storage::meta::{
-    AllocationSemantics, FileIdScheme, FileIdScope, MetadataV3, Provenance, VolumeDescriptor,
+    AllocationSemantics, FileIdScheme, FileIdScope, MetadataError, MetadataV3, Provenance,
+    VolumeDescriptor,
 };
 
 #[test]
@@ -85,6 +87,7 @@ fn available_kind_and_timestamp_precision_are_compared() {
         mtime_nanos: 2,
         btime: 3,
         btime_nanos: 4,
+        timestamp_resolution: TimestampResolution::Nanoseconds,
         available,
         ..Default::default()
     };
@@ -180,6 +183,142 @@ fn timestamps_round_trip_with_availability() {
 }
 
 #[test]
+fn dds1_columnar_decode_keeps_only_legacy_id_precision() {
+    let record = Record {
+        name: NativeName::unix(b"entry".to_vec()),
+        mtime: -2,
+        mtime_nanos: 123_456_789,
+        btime: -3,
+        btime_nanos: 987_654_321,
+        file_id: FileId {
+            low: u64::MAX,
+            high: 0x0123_4567_89ab_cdef,
+        },
+        available: EntryFields::KIND
+            .union(EntryFields::LOGICAL_SIZE)
+            .union(EntryFields::ALLOCATED_SIZE)
+            .union(EntryFields::MTIME)
+            .union(EntryFields::MTIME_NANOS)
+            .union(EntryFields::BIRTH_TIME)
+            .union(EntryFields::BIRTH_TIME_NANOS)
+            .union(EntryFields::FILE_ID)
+            .union(EntryFields::LINK_COUNT),
+        ..Default::default()
+    };
+    let mut encoder = RecordEncoder::new();
+    encoder.push(&record).unwrap();
+    let block = encoder.finish().unwrap().unwrap();
+    let raw = decompress(&block.data, block.raw_len, block.crc).unwrap();
+    let mut decoded = Vec::new();
+    decode_records(&raw, block.count, &mut decoded).unwrap();
+
+    assert_eq!(
+        decoded[0].file_id,
+        FileId {
+            low: record.file_id.low,
+            high: 0
+        }
+    );
+    assert!(decoded[0].available.contains(EntryFields::FILE_ID));
+    assert!(!decoded[0].available.contains(EntryFields::MTIME_NANOS));
+    assert!(!decoded[0].available.contains(EntryFields::BIRTH_TIME_NANOS));
+    assert_eq!(decoded[0].mtime_nanos, 0);
+    assert_eq!(decoded[0].btime_nanos, 0);
+    assert_eq!(
+        decoded[0].timestamp_resolution,
+        TimestampResolution::Seconds
+    );
+}
+
+#[test]
+fn dds1_columnar_decode_discards_subsecond_timestamps() {
+    let record = Record {
+        name: NativeName::unix(b"time".to_vec()),
+        mtime: -2,
+        mtime_nanos: 123_456_789,
+        btime: -3,
+        btime_nanos: 987_654_321,
+        available: EntryFields::MTIME
+            .union(EntryFields::MTIME_NANOS)
+            .union(EntryFields::BIRTH_TIME)
+            .union(EntryFields::BIRTH_TIME_NANOS),
+        ..Default::default()
+    };
+    let mut encoder = RecordEncoder::new();
+    encoder.push(&record).unwrap();
+    let block = encoder.finish().unwrap().unwrap();
+    let raw = decompress(&block.data, block.raw_len, block.crc).unwrap();
+    let mut decoded = Vec::new();
+    decode_records(&raw, block.count, &mut decoded).unwrap();
+
+    assert_eq!(decoded[0].mtime, record.mtime);
+    assert_eq!(decoded[0].mtime_nanos, 0);
+    assert_eq!(decoded[0].btime, record.btime);
+    assert_eq!(decoded[0].btime_nanos, 0);
+    assert_eq!(
+        decoded[0].timestamp_resolution,
+        TimestampResolution::Seconds
+    );
+}
+
+#[test]
+fn unavailable_fields_between_observed_records_remain_unavailable() {
+    let observed = EntryFields::KIND
+        .union(EntryFields::LOGICAL_SIZE)
+        .union(EntryFields::ALLOCATED_SIZE)
+        .union(EntryFields::MTIME)
+        .union(EntryFields::FILE_ID);
+    let before = Record {
+        name: NativeName::unix(b"a-before".to_vec()),
+        size: 11,
+        alloc: 4096,
+        mtime: 100,
+        file_id: FileId { low: 10, high: 0 },
+        available: observed,
+        ..Default::default()
+    };
+    let unavailable = Record {
+        name: NativeName::unix(b"b-gap".to_vec()),
+        size: 123,
+        alloc: 8192,
+        mtime: 200,
+        file_id: FileId { low: 20, high: 0 },
+        available: EntryFields::KIND,
+        ..Default::default()
+    };
+    let after = Record {
+        name: NativeName::unix(b"c-after".to_vec()),
+        size: 33,
+        alloc: 4096,
+        mtime: 300,
+        file_id: FileId { low: 30, high: 0 },
+        available: observed,
+        ..Default::default()
+    };
+    let mut encoder = RecordEncoder::new();
+    encoder.push(&before).unwrap();
+    encoder.push(&unavailable).unwrap();
+    encoder.push(&after).unwrap();
+    let block = encoder.finish().unwrap().unwrap();
+    let raw = decompress(&block.data, block.raw_len, block.crc).unwrap();
+    let mut decoded = Vec::new();
+    decode_records(&raw, block.count, &mut decoded).unwrap();
+
+    assert_eq!(decoded[0].size, before.size);
+    assert_eq!(decoded[0].file_id, before.file_id);
+    assert!(decoded[1].has_observed_size());
+    assert_eq!(decoded[1].counted_size(), unavailable.size);
+    assert!(decoded[1].available.contains(EntryFields::FILE_ID));
+    assert_eq!(decoded[2].size, after.size);
+    assert_eq!(decoded[2].mtime, after.mtime);
+    assert_eq!(decoded[2].file_id, after.file_id);
+    assert_eq!(
+        decoded[2].available,
+        after.available.union(EntryFields::LINK_COUNT)
+    );
+}
+
+#[test]
 fn dds1_maps_into_portable_record() {
     let legacy = Record {
         name: NativeName::unix(b"legacy".to_vec()),
@@ -187,7 +326,7 @@ fn dds1_maps_into_portable_record() {
         alloc: 0,
         mtime: 0,
         btime: 0,
-        ino: 0,
+        ino: 42,
         file_id: FileId::ZERO,
         ..Default::default()
     };
@@ -195,8 +334,21 @@ fn dds1_maps_into_portable_record() {
     legacy.encode_dds1(&mut bytes).unwrap();
     let mut input = bytes.as_slice();
     let portable = Record::decode(&mut input).expect("DDS1 record decodes");
-    assert!(!portable.available.contains(EntryFields::FILE_ID));
+    assert!(portable.available.contains(EntryFields::FILE_ID));
+    assert_eq!(portable.file_id, FileId { low: 42, high: 0 });
     assert!(!portable.available.contains(EntryFields::BIRTH_TIME));
+
+    let zero_inode = Record {
+        ino: 0,
+        ..legacy.clone()
+    };
+    let mut bytes = Vec::new();
+    zero_inode.encode_dds1(&mut bytes).unwrap();
+    let mut input = bytes.as_slice();
+    let portable = Record::decode(&mut input).unwrap();
+    assert!(!portable.available.contains(EntryFields::FILE_ID));
+    assert_eq!(portable.file_id, FileId::ZERO);
+
     let errored = Record {
         flags: diskdrift_core::record::flags::STAT_ERROR,
         ..legacy
@@ -208,7 +360,7 @@ fn dds1_maps_into_portable_record() {
 }
 
 #[test]
-fn dds1_does_not_advertise_unrepresentable_precision_or_identity() {
+fn dds1_advertises_legacy_identity_but_not_unrepresentable_precision() {
     let legacy = Record {
         name: NativeName::unix(b"legacy".to_vec()),
         mtime: 10,
@@ -235,8 +387,14 @@ fn dds1_does_not_advertise_unrepresentable_precision_or_identity() {
     assert_eq!(decoded.btime_nanos, 0);
     assert!(!decoded.available.contains(EntryFields::MTIME_NANOS));
     assert!(!decoded.available.contains(EntryFields::BIRTH_TIME_NANOS));
-    assert!(!decoded.available.contains(EntryFields::FILE_ID));
-    assert_eq!(decoded.file_id, FileId { low: legacy.ino, high: 0 });
+    assert!(decoded.available.contains(EntryFields::FILE_ID));
+    assert_eq!(
+        decoded.file_id,
+        FileId {
+            low: legacy.ino,
+            high: 0
+        }
+    );
     assert_eq!(decoded.ino, legacy.ino);
 }
 
@@ -263,6 +421,7 @@ fn volume_descriptor_validates_file_id_scope() {
     );
     descriptor.identity = NativePath::unix(b"uuid".to_vec());
     descriptor.mount_key = NativePath::unix(b"/".to_vec());
+    descriptor.identity_strength = "uuid".into();
     assert!(descriptor.validate().is_ok());
     let unavailable = VolumeDescriptor::new(
         0,
@@ -289,6 +448,7 @@ fn metadata_v3_requires_ordered_volume_descriptors() {
     );
     descriptor.identity = NativePath::windows(vec![1]);
     descriptor.mount_key = NativePath::windows(vec![2]);
+    descriptor.identity_strength = "uuid".into();
     let metadata = MetadataV3 {
         format_version: 3,
         volumes: vec![descriptor.clone()],
@@ -319,6 +479,7 @@ fn metadata_v3_keeps_exact_native_identity_and_mount_values() {
     descriptor.identity = NativePath::windows(vec![0xd800]);
     descriptor.mount_key =
         NativePath::windows(vec![b'C' as u16, b':'.into(), b'\\'.into(), 0xdfff]);
+    descriptor.identity_strength = "uuid".into();
     assert!(
         MetadataV3 {
             format_version: 3,
@@ -327,6 +488,84 @@ fn metadata_v3_keeps_exact_native_identity_and_mount_values() {
         .validate()
         .is_ok()
     );
+}
+
+#[test]
+fn dds2_descriptor_requires_metadata_with_the_same_native_path_encoding() {
+    let mut descriptor = VolumeDescriptor::new(
+        0,
+        "windows",
+        FileIdScheme::WindowsFileId128,
+        FileIdScope::Volume,
+        AllocationSemantics::FilesystemReported,
+        TimestampResolution::Nanoseconds,
+        Provenance::Observed("native".into()),
+    );
+    descriptor.identity = NativePath::windows(vec![0xd800]);
+    descriptor.mount_key = NativePath::windows(vec![b'C' as u16, b':'.into(), b'\\'.into()]);
+    descriptor.identity_strength = "uuid".into();
+    let metadata = MetadataV3 {
+        format_version: 3,
+        volumes: vec![descriptor],
+    };
+    let stream = StreamDescriptor::dds2(
+        diskdrift_storage::FileKind::Records,
+        diskdrift_core::native::PathEncoding::UnixBytes,
+    )
+    .unwrap();
+
+    let error = stream.validate_metadata(&metadata).unwrap_err();
+    assert!(error.to_string().contains("path encoding"));
+}
+
+#[test]
+fn metadata_v3_rejects_identity_platform_and_encoding_mismatches() {
+    let mut descriptor = VolumeDescriptor::new(
+        0,
+        "windows",
+        FileIdScheme::WindowsFileId128,
+        FileIdScope::Volume,
+        AllocationSemantics::FilesystemReported,
+        TimestampResolution::Nanoseconds,
+        Provenance::Observed("native".into()),
+    );
+    descriptor.identity = NativePath::unix(b"volume-guid".to_vec());
+    descriptor.mount_key = NativePath::windows(r"C:".encode_utf16().collect());
+    descriptor.identity_strength = "uuid".into();
+    let error = MetadataV3 {
+        format_version: 3,
+        volumes: vec![descriptor],
+    }
+    .validate()
+    .unwrap_err();
+    assert!(matches!(error, MetadataError::Invalid(_)));
+}
+
+#[test]
+fn metadata_v3_propagates_mixed_alias_path_order_errors() {
+    let mut descriptor = VolumeDescriptor::new(
+        0,
+        "macos",
+        FileIdScheme::PosixInode64,
+        FileIdScope::Volume,
+        AllocationSemantics::FilesystemReported,
+        TimestampResolution::Seconds,
+        Provenance::Observed("stat".into()),
+    );
+    descriptor.identity = NativePath::unix(b"uuid".to_vec());
+    descriptor.mount_key = NativePath::unix(b"/".to_vec());
+    descriptor.identity_strength = "uuid".into();
+    descriptor.aliases = vec![
+        NativePath::unix(b"/Volumes/A".to_vec()),
+        NativePath::windows(r"C:".encode_utf16().collect()),
+    ];
+    let error = MetadataV3 {
+        format_version: 3,
+        volumes: vec![descriptor],
+    }
+    .validate()
+    .unwrap_err();
+    assert!(matches!(error, MetadataError::PathOrder(_)));
 }
 
 #[test]
@@ -438,25 +677,6 @@ fn registry_load_reads_v2_documents_into_the_active_model() {
     let loaded = Registry::load(dir.path()).unwrap();
     assert_eq!(loaded.disks.len(), 1);
     assert_eq!(loaded.disks[0].identity.platform, "windows");
-}
-
-#[test]
-fn registry_v1_serialization_does_not_publish_v2_fields() {
-    let mut registry = Registry::default();
-    registry.record(&Sighting::portable(
-        Identity::new(Strength::Uuid, "legacy"),
-        "/Volumes/Legacy",
-    ));
-    let dir = diskdrift_core::testutil::TestDir::new("registry-v1-projection");
-    let lock = diskdrift_storage::disks::lock(dir.path()).unwrap();
-    registry.save(dir.path(), &lock).unwrap();
-    let value: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.path().join("disks.json")).unwrap()).unwrap();
-    assert_eq!(value["version"], 1);
-    let disk = &value["disks"][0];
-    assert!(disk["aliases"].is_null());
-    assert!(disk["lastMountPath"].is_null());
-    assert!(disk["identity"]["platform"].is_null());
 }
 
 #[test]

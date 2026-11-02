@@ -4,8 +4,9 @@ use super::blocks::{self, OpBlockEncoder, RecordBlockEncoder};
 use super::{Ops, PrefixFilter, SnapInfo, Store};
 use diskdrift_core::delta::{DeltaOp, OpDecoder, OpEncoder};
 use diskdrift_core::diff::RecordStream;
+use diskdrift_core::native::NativeName;
 use diskdrift_core::paths::PathStack;
-use diskdrift_core::record::{Kind, Record};
+use diskdrift_core::record::{FileIdScheme, FileIdScope, Kind, Record, TimestampResolution};
 use rusqlite::{Connection, params};
 use std::io;
 use std::path::Path;
@@ -67,11 +68,20 @@ impl SqliteStore {
     }
 
     fn checkpoint(&self) -> io::Result<()> {
-        self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).map_err(err)
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .map_err(err)
     }
 
     #[allow(clippy::type_complexity)]
-    fn write_blocks(&mut self, id: u32, base: Option<u32>, blocks_iter: &mut dyn FnMut(&mut dyn FnMut(blocks::Block) -> io::Result<()>) -> io::Result<u64>) -> io::Result<u64> {
+    fn write_blocks(
+        &mut self,
+        id: u32,
+        base: Option<u32>,
+        blocks_iter: &mut dyn FnMut(
+            &mut dyn FnMut(blocks::Block) -> io::Result<()>,
+        ) -> io::Result<u64>,
+    ) -> io::Result<u64> {
         let tx = self.conn.transaction().map_err(err)?;
         let n = {
             let mut st = tx
@@ -81,13 +91,20 @@ impl SqliteStore {
             let kind = if base.is_some() { 1 } else { 0 };
             blocks_iter(&mut |b: blocks::Block| {
                 let mut fp = Vec::new();
-                blocks::encode_path(&b.first_path, &mut fp);
-                st.execute(params![id, idx, kind, b.raw_len, b.count, b.crc, fp, b.data]).map_err(err)?;
+                blocks::encode_path(&b.first_path, &mut fp)?;
+                st.execute(params![
+                    id, idx, kind, b.raw_len, b.count, b.crc, fp, b.data
+                ])
+                .map_err(err)?;
                 idx += 1;
                 Ok(())
             })?
         };
-        tx.execute("INSERT INTO snaps(id, base) VALUES (?, ?)", params![id, base]).map_err(err)?;
+        tx.execute(
+            "INSERT INTO snaps(id, base) VALUES (?, ?)",
+            params![id, base],
+        )
+        .map_err(err)?;
         tx.commit().map_err(err)?;
         self.checkpoint()?;
         Ok(n)
@@ -114,8 +131,19 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
         ino: row.get::<_, i64>(8)? as u64,
         nlink: row.get::<_, i64>(9)? as u32,
         vol: row.get::<_, i64>(10)? as u16,
-        file_id: diskdrift_core::record::FileId { low: row.get::<_, i64>(8)? as u64, high: 0 },
-        available: diskdrift_core::record::EntryFields::KIND.union(diskdrift_core::record::EntryFields::LOGICAL_SIZE).union(diskdrift_core::record::EntryFields::ALLOCATED_SIZE).union(diskdrift_core::record::EntryFields::MTIME).union(diskdrift_core::record::EntryFields::FILE_ID).union(diskdrift_core::record::EntryFields::LINK_COUNT),
+        file_id: diskdrift_core::record::FileId {
+            low: row.get::<_, i64>(8)? as u64,
+            high: 0,
+        },
+        timestamp_resolution: TimestampResolution::Seconds,
+        file_id_scheme: FileIdScheme::PosixInode64,
+        file_id_scope: FileIdScope::Volume,
+        available: diskdrift_core::record::EntryFields::KIND
+            .union(diskdrift_core::record::EntryFields::LOGICAL_SIZE)
+            .union(diskdrift_core::record::EntryFields::ALLOCATED_SIZE)
+            .union(diskdrift_core::record::EntryFields::MTIME)
+            .union(diskdrift_core::record::EntryFields::FILE_ID)
+            .union(diskdrift_core::record::EntryFields::LINK_COUNT),
     })
 }
 
@@ -148,7 +176,9 @@ impl Iterator for RowChunks<'_> {
                          FROM entries WHERE snap = ? AND seq >= ? AND seq < ? ORDER BY seq LIMIT ?",
                     )
                     .map_err(err)?;
-                let mut rows = st.query(params![self.snap, self.next_seq, self.end_seq, CHUNK]).map_err(err)?;
+                let mut rows = st
+                    .query(params![self.snap, self.next_seq, self.end_seq, CHUNK])
+                    .map_err(err)?;
                 let mut v = Vec::with_capacity(CHUNK as usize);
                 let mut last = None;
                 while let Some(row) = rows.next().map_err(err)? {
@@ -199,7 +229,9 @@ impl<T> Iterator for BlockChunks<'_, T> {
             let res = (|| {
                 let mut st = self
                     .conn
-                    .prepare_cached("SELECT raw_len, count, crc, data FROM blocks WHERE snap = ? AND idx = ?")
+                    .prepare_cached(
+                        "SELECT raw_len, count, crc, data FROM blocks WHERE snap = ? AND idx = ?",
+                    )
                     .map_err(err)?;
                 let mut rows = st.query(params![self.snap, self.next_idx]).map_err(err)?;
                 match rows.next().map_err(err)? {
@@ -236,7 +268,11 @@ fn decode_records(raw: &[u8], count: u32, out: &mut Vec<Record>) -> io::Result<(
 }
 
 impl Store for SqliteStore {
-    fn write_full(&mut self, id: u32, records: &mut dyn Iterator<Item = Record>) -> io::Result<u64> {
+    fn write_full(
+        &mut self,
+        id: u32,
+        records: &mut dyn Iterator<Item = Record>,
+    ) -> io::Result<u64> {
         if self.mode == Mode::Blocks {
             return self.write_blocks(id, None, &mut |emit| {
                 let mut enc = RecordBlockEncoder::new(3);
@@ -272,7 +308,15 @@ impl Store for SqliteStore {
                     seq,
                     parent,
                     r.depth,
-                    r.name.as_unix_bytes().unwrap_or_default(),
+                    {
+                        let NativeName::Unix(name) = &r.name else {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "DDS1 only supports Unix-native names",
+                            ));
+                        };
+                        name
+                    },
                     r.kind as u8,
                     r.flags,
                     r.size as i64,
@@ -288,13 +332,19 @@ impl Store for SqliteStore {
                 n += 1;
             }
         }
-        tx.execute("INSERT INTO snaps(id, base) VALUES (?, NULL)", params![id]).map_err(err)?;
+        tx.execute("INSERT INTO snaps(id, base) VALUES (?, NULL)", params![id])
+            .map_err(err)?;
         tx.commit().map_err(err)?;
         self.checkpoint()?;
         Ok(n)
     }
 
-    fn write_delta(&mut self, id: u32, base: u32, ops: &mut dyn Iterator<Item = DeltaOp>) -> io::Result<u64> {
+    fn write_delta(
+        &mut self,
+        id: u32,
+        base: u32,
+        ops: &mut dyn Iterator<Item = DeltaOp>,
+    ) -> io::Result<u64> {
         if self.mode == Mode::Blocks {
             return self.write_blocks(id, Some(base), &mut |emit| {
                 let mut enc = OpBlockEncoder::new(3);
@@ -314,7 +364,9 @@ impl Store for SqliteStore {
         let tx = self.conn.transaction().map_err(err)?;
         let mut n = 0u64;
         {
-            let mut st = tx.prepare("INSERT INTO ops(snap, seq, op) VALUES (?,?,?)").map_err(err)?;
+            let mut st = tx
+                .prepare("INSERT INTO ops(snap, seq, op) VALUES (?,?,?)")
+                .map_err(err)?;
             let mut enc = OpEncoder::new();
             let mut buf = Vec::new();
             for (seq, op) in ops.enumerate() {
@@ -324,7 +376,11 @@ impl Store for SqliteStore {
                 n += 1;
             }
         }
-        tx.execute("INSERT INTO snaps(id, base) VALUES (?, ?)", params![id, base]).map_err(err)?;
+        tx.execute(
+            "INSERT INTO snaps(id, base) VALUES (?, ?)",
+            params![id, base],
+        )
+        .map_err(err)?;
         tx.commit().map_err(err)?;
         self.checkpoint()?;
         Ok(n)
@@ -362,31 +418,58 @@ impl Store for SqliteStore {
                 done: false,
             }));
         }
-        let mut st = self.conn.prepare("SELECT op FROM ops WHERE snap = ? ORDER BY seq").map_err(err)?;
-        let blobs: Vec<Vec<u8>> =
-            st.query_map(params![id], |r| r.get(0)).map_err(err)?.collect::<Result<_, _>>().map_err(err)?;
+        let mut st = self
+            .conn
+            .prepare("SELECT op FROM ops WHERE snap = ? ORDER BY seq")
+            .map_err(err)?;
+        let blobs: Vec<Vec<u8>> = st
+            .query_map(params![id], |r| r.get(0))
+            .map_err(err)?
+            .collect::<Result<_, _>>()
+            .map_err(err)?;
         let mut dec = OpDecoder::new();
-        Ok(Box::new(blobs.into_iter().map(move |b| dec.decode(&mut b.as_slice()))))
+        Ok(Box::new(
+            blobs
+                .into_iter()
+                .map(move |b| dec.decode(&mut b.as_slice())),
+        ))
     }
 
     fn list(&self) -> io::Result<Vec<SnapInfo>> {
-        let mut st = self.conn.prepare("SELECT id, base FROM snaps ORDER BY id").map_err(err)?;
+        let mut st = self
+            .conn
+            .prepare("SELECT id, base FROM snaps ORDER BY id")
+            .map_err(err)?;
         let v = st
-            .query_map([], |r| Ok(SnapInfo { id: r.get::<_, i64>(0)? as u32, base: r.get::<_, Option<i64>>(1)?.map(|b| b as u32) }))
+            .query_map([], |r| {
+                Ok(SnapInfo {
+                    id: r.get::<_, i64>(0)? as u32,
+                    base: r.get::<_, Option<i64>>(1)?.map(|b| b as u32),
+                })
+            })
             .map_err(err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(err)?;
         Ok(v)
     }
 
-    fn read_prefix(&self, id: u32, prefix: &[Vec<u8>]) -> io::Result<RecordStream<'_>> {
+    fn read_prefix(&self, id: u32, prefix: &[NativeName]) -> io::Result<RecordStream<'_>> {
         if self.mode != Mode::Indexed {
-            return Ok(Box::new(PrefixFilter::new(self.read_full(id)?, prefix.to_vec())));
+            return Ok(Box::new(PrefixFilter::new(
+                self.read_full(id)?,
+                prefix.to_vec(),
+            )));
         }
         // Walk down from the root by (parent, name), then stream the subtree range.
         let mut seq: i64 = 0;
         let mut depth: i64 = 0;
         for comp in &prefix[1..] {
+            let NativeName::Unix(comp) = comp else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SQLite benchmark backend requires Unix-native names",
+                ));
+            };
             let found: Option<i64> = self
                 .conn
                 .query_row(
@@ -395,7 +478,13 @@ impl Store for SqliteStore {
                     |r| r.get(0),
                 )
                 .map(Some)
-                .or_else(|e| if matches!(e, rusqlite::Error::QueryReturnedNoRows) { Ok(None) } else { Err(e) })
+                .or_else(|e| {
+                    if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                })
                 .map_err(err)?;
             match found {
                 Some(s) => {
@@ -435,7 +524,9 @@ impl Store for SqliteStore {
                 .prepare("SELECT alloc FROM entries WHERE snap = ? AND kind != 1 ORDER BY alloc DESC LIMIT ?")
                 .map_err(err)?;
             let v = st
-                .query_map(params![id, n as i64], |r| r.get::<_, i64>(0).map(|x| x as u64))
+                .query_map(params![id, n as i64], |r| {
+                    r.get::<_, i64>(0).map(|x| x as u64)
+                })
                 .map_err(err)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(err)?;

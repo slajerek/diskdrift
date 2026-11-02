@@ -10,7 +10,8 @@
 
 use super::cf::{self, CFAllocatorRef, CFDictionaryRef, CFStringRef, CFTypeRef, CFURLRef, Owned};
 use super::disk::{
-    DADiskCopyDescription, DADiskCopyWholeDisk, DADiskRef, DASessionCreate, DASessionRef, bsd_name, device_of, kDADiskDescriptionVolumeUUIDKey,
+    DADiskCopyDescription, DADiskCopyWholeDisk, DADiskRef, DASessionCreate, DASessionRef, bsd_name,
+    device_of, kDADiskDescriptionVolumeUUIDKey,
 };
 use crate::{DaError, DiskInfo, GuardEvent, HeldVolume};
 use std::collections::HashSet;
@@ -24,17 +25,38 @@ type CFRunLoopRef = CFTypeRef;
 
 #[link(name = "DiskArbitration", kind = "framework")]
 unsafe extern "C" {
-    fn DASessionScheduleWithRunLoop(session: DASessionRef, run_loop: CFRunLoopRef, mode: CFStringRef);
-    fn DASessionUnscheduleFromRunLoop(session: DASessionRef, run_loop: CFRunLoopRef, mode: CFStringRef);
-    fn DADiskCreateFromBSDName(allocator: CFAllocatorRef, session: DASessionRef, name: *const c_char) -> DADiskRef;
+    fn DASessionScheduleWithRunLoop(
+        session: DASessionRef,
+        run_loop: CFRunLoopRef,
+        mode: CFStringRef,
+    );
+    fn DASessionUnscheduleFromRunLoop(
+        session: DASessionRef,
+        run_loop: CFRunLoopRef,
+        mode: CFStringRef,
+    );
+    fn DADiskCreateFromBSDName(
+        allocator: CFAllocatorRef,
+        session: DASessionRef,
+        name: *const c_char,
+    ) -> DADiskRef;
     fn DARegisterDiskMountApprovalCallback(
         session: DASessionRef,
         matching: CFDictionaryRef,
         callback: extern "C" fn(DADiskRef, *mut c_void) -> DADissenterRef,
         context: *mut c_void,
     );
-    fn DARegisterDiskDisappearedCallback(session: DASessionRef, matching: CFDictionaryRef, callback: extern "C" fn(DADiskRef, *mut c_void), context: *mut c_void);
-    fn DAUnregisterApprovalCallback(session: DASessionRef, callback: *mut c_void, context: *mut c_void);
+    fn DARegisterDiskDisappearedCallback(
+        session: DASessionRef,
+        matching: CFDictionaryRef,
+        callback: extern "C" fn(DADiskRef, *mut c_void),
+        context: *mut c_void,
+    );
+    fn DAUnregisterApprovalCallback(
+        session: DASessionRef,
+        callback: *mut c_void,
+        context: *mut c_void,
+    );
     fn DAUnregisterCallback(session: DASessionRef, callback: *mut c_void, context: *mut c_void);
     fn DADiskMountWithArguments(
         disk: DADiskRef,
@@ -44,9 +66,23 @@ unsafe extern "C" {
         context: *mut c_void,
         arguments: *const CFStringRef,
     );
-    fn DADiskUnmount(disk: DADiskRef, options: u32, callback: extern "C" fn(DADiskRef, DADissenterRef, *mut c_void), context: *mut c_void);
-    fn DADiskEject(disk: DADiskRef, options: u32, callback: extern "C" fn(DADiskRef, DADissenterRef, *mut c_void), context: *mut c_void);
-    fn DADissenterCreate(allocator: CFAllocatorRef, status: i32, string: CFStringRef) -> DADissenterRef;
+    fn DADiskUnmount(
+        disk: DADiskRef,
+        options: u32,
+        callback: extern "C" fn(DADiskRef, DADissenterRef, *mut c_void),
+        context: *mut c_void,
+    );
+    fn DADiskEject(
+        disk: DADiskRef,
+        options: u32,
+        callback: extern "C" fn(DADiskRef, DADissenterRef, *mut c_void),
+        context: *mut c_void,
+    );
+    fn DADissenterCreate(
+        allocator: CFAllocatorRef,
+        status: i32,
+        string: CFStringRef,
+    ) -> DADissenterRef;
     fn DADissenterGetStatus(dissenter: DADissenterRef) -> i32;
     fn DADissenterGetStatusString(dissenter: DADissenterRef) -> CFStringRef;
 
@@ -78,9 +114,16 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(120);
 enum Request {
     /// Mount read-only at the default place (`/Volumes/<name>`); `browse`:
     /// visible in Finder (to copy a file off), else `nobrowse`.
-    Mount { bsd: String, browse: bool, reply: Sender<Result<PathBuf, DaError>> },
+    Mount {
+        bsd: String,
+        browse: bool,
+        reply: Sender<Result<PathBuf, DaError>>,
+    },
     /// Unmount every volume of the whole disk, then eject it.
-    Eject { bsd: String, reply: Sender<Result<(), DaError>> },
+    Eject {
+        bsd: String,
+        reply: Sender<Result<(), DaError>>,
+    },
     Stop,
 }
 
@@ -104,9 +147,14 @@ impl MountGuard {
     pub fn start(events: Box<dyn Fn(GuardEvent) + Send>) -> std::io::Result<MountGuard> {
         let (requests, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let thread = std::thread::Builder::new().name("diskdrift-careful".into()).spawn(move || run(events, rx, ready_tx))?;
+        let thread = std::thread::Builder::new()
+            .name("diskdrift-careful".into())
+            .spawn(move || run(events, rx, ready_tx))?;
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(Ok(())) => Ok(MountGuard { requests, thread: Some(thread) }),
+            Ok(Ok(())) => Ok(MountGuard {
+                requests,
+                thread: Some(thread),
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(std::io::Error::other("Disk Arbitration did not start")),
         }
@@ -115,19 +163,40 @@ impl MountGuard {
     /// Mounts the volume `bsd` read-only; returns where.
     pub fn mount_read_only(&self, bsd: &str, browse: bool) -> Result<PathBuf, DaError> {
         let (reply, answer) = mpsc::channel();
-        self.ask(Request::Mount { bsd: bsd.into(), browse, reply }, answer)
+        self.ask(
+            Request::Mount {
+                bsd: bsd.into(),
+                browse,
+                reply,
+            },
+            answer,
+        )
     }
 
     /// Unmounts every volume of the disk holding `bsd`, then ejects it.
     pub fn unmount_and_eject(&self, bsd: &str) -> Result<(), DaError> {
         let (reply, answer) = mpsc::channel();
-        self.ask(Request::Eject { bsd: bsd.into(), reply }, answer)
+        self.ask(
+            Request::Eject {
+                bsd: bsd.into(),
+                reply,
+            },
+            answer,
+        )
     }
 
     fn ask<T>(&self, req: Request, answer: Receiver<Result<T, DaError>>) -> Result<T, DaError> {
-        let gone = || DaError { status: 0, message: Some("careful mode is off".into()) };
+        let gone = || DaError {
+            status: 0,
+            message: Some("careful mode is off".into()),
+        };
         self.requests.send(req).map_err(|_| gone())?;
-        answer.recv_timeout(ANSWER_TIMEOUT).unwrap_or_else(|_| Err(DaError { status: 0, message: Some("Disk Arbitration did not answer".into()) }))
+        answer.recv_timeout(ANSWER_TIMEOUT).unwrap_or_else(|_| {
+            Err(DaError {
+                status: 0,
+                message: Some("Disk Arbitration did not answer".into()),
+            })
+        })
     }
 }
 
@@ -141,7 +210,12 @@ impl Drop for MountGuard {
 }
 
 fn dissenter_error(d: DADissenterRef) -> DaError {
-    unsafe { DaError { status: DADissenterGetStatus(d) as u32, message: cf::string_of(DADissenterGetStatusString(d)) } }
+    unsafe {
+        DaError {
+            status: DADissenterGetStatus(d) as u32,
+            message: cf::string_of(DADissenterGetStatusString(d)),
+        }
+    }
 }
 
 /// What a volume is, from its Disk Arbitration description; `None` for one
@@ -151,7 +225,9 @@ fn held_volume(disk: DADiskRef) -> Option<HeldVolume> {
         let desc = Owned::new(DADiskCopyDescription(disk))?;
         let get = |key: CFStringRef| cf::dict_get(desc.0, key);
         let fs_type = cf::string_of(get(kDADiskDescriptionVolumeKindKey))?;
-        if cf::bool_of(get(kDADiskDescriptionVolumeNetworkKey)) == Some(true) || cf::bool_of(get(kDADiskDescriptionDeviceInternalKey)) == Some(true) {
+        if cf::bool_of(get(kDADiskDescriptionVolumeNetworkKey)) == Some(true)
+            || cf::bool_of(get(kDADiskDescriptionDeviceInternalKey)) == Some(true)
+        {
             return None;
         }
         let device = device_of(disk, desc.0);
@@ -169,6 +245,7 @@ fn held_volume(disk: DADiskRef) -> Option<HeldVolume> {
                 capacity_bytes: cf::number_of(get(kDADiskDescriptionMediaSizeKey)),
                 bsd_name: bsd_name(disk),
                 device,
+                ..DiskInfo::default()
             },
         })
     }
@@ -222,8 +299,15 @@ extern "C" fn mounted(disk: DADiskRef, dissenter: DADissenterRef, context: *mut 
     let p = unsafe { Box::from_raw(context as *mut PendingMount) };
     let r = if dissenter.is_null() {
         unsafe { Owned::new(DADiskCopyDescription(disk)) }
-            .and_then(|d| cf::path_of_url(cf::dict_get(d.0, unsafe { kDADiskDescriptionVolumePathKey })))
-            .ok_or(DaError { status: 0, message: Some("mounted, but Disk Arbitration does not say where".into()) })
+            .and_then(|d| {
+                cf::path_of_url(cf::dict_get(d.0, unsafe {
+                    kDADiskDescriptionVolumePathKey
+                }))
+            })
+            .ok_or(DaError {
+                status: 0,
+                message: Some("mounted, but Disk Arbitration does not say where".into()),
+            })
     } else {
         Err(dissenter_error(dissenter))
     };
@@ -246,21 +330,41 @@ extern "C" fn unmounted(disk: DADiskRef, dissenter: DADissenterRef, context: *mu
 
 extern "C" fn ejected(_disk: DADiskRef, dissenter: DADissenterRef, context: *mut c_void) {
     let p = unsafe { Box::from_raw(context as *mut PendingEject) };
-    let _ = p.reply.send(if dissenter.is_null() { Ok(()) } else { Err(dissenter_error(dissenter)) });
+    let _ = p.reply.send(if dissenter.is_null() {
+        Ok(())
+    } else {
+        Err(dissenter_error(dissenter))
+    });
 }
 
 fn disk_named(session: DASessionRef, bsd: &str) -> Result<Owned, DaError> {
-    let name = CString::new(bsd).map_err(|_| DaError { status: 0, message: Some("bad device name".into()) })?;
+    let name = CString::new(bsd).map_err(|_| DaError {
+        status: 0,
+        message: Some("bad device name".into()),
+    })?;
     Owned::new(unsafe { DADiskCreateFromBSDName(std::ptr::null(), session, name.as_ptr()) })
-        .ok_or_else(|| DaError { status: 0, message: Some(format!("no disk {bsd}")) })
+        .ok_or_else(|| DaError {
+            status: 0,
+            message: Some(format!("no disk {bsd}")),
+        })
 }
 
-fn run(events: Box<dyn Fn(GuardEvent) + Send>, requests: Receiver<Request>, ready: Sender<std::io::Result<()>>) {
+fn run(
+    events: Box<dyn Fn(GuardEvent) + Send>,
+    requests: Receiver<Request>,
+    ready: Sender<std::io::Result<()>>,
+) {
     let Some(session) = Owned::new(unsafe { DASessionCreate(std::ptr::null()) }) else {
-        let _ = ready.send(Err(std::io::Error::other("cannot open a Disk Arbitration session")));
+        let _ = ready.send(Err(std::io::Error::other(
+            "cannot open a Disk Arbitration session",
+        )));
         return;
     };
-    let state = Box::into_raw(Box::new(State { events, ours: HashSet::new(), held: HashSet::new() }));
+    let state = Box::into_raw(Box::new(State {
+        events,
+        ours: HashSet::new(),
+        held: HashSet::new(),
+    }));
     let ctx = state as *mut c_void;
     unsafe {
         let run_loop = CFRunLoopGetCurrent();
@@ -281,23 +385,40 @@ fn run(events: Box<dyn Fn(GuardEvent) + Send>, requests: Receiver<Request>, read
                         let mut argv: Vec<CFStringRef> = args.iter().map(|a| a.0).collect();
                         argv.push(std::ptr::null());
                         let pending = Box::into_raw(Box::new(PendingMount { reply, _args: args }));
-                        DADiskMountWithArguments(disk.0, std::ptr::null(), DA_DISK_MOUNT_OPTION_DEFAULT, mounted, pending as *mut c_void, argv.as_ptr());
+                        DADiskMountWithArguments(
+                            disk.0,
+                            std::ptr::null(),
+                            DA_DISK_MOUNT_OPTION_DEFAULT,
+                            mounted,
+                            pending as *mut c_void,
+                            argv.as_ptr(),
+                        );
                     }
                     Err(e) => {
                         let _ = reply.send(Err(e));
                     }
                 },
-                Ok(Request::Eject { bsd, reply }) => match disk_named(session.0, &bsd).and_then(|d| {
-                    Owned::new(DADiskCopyWholeDisk(d.0)).ok_or_else(|| DaError { status: 0, message: Some(format!("no whole disk for {bsd}")) })
-                }) {
-                    Ok(whole) => {
-                        let pending = Box::into_raw(Box::new(PendingEject { reply }));
-                        DADiskUnmount(whole.0, DA_DISK_UNMOUNT_OPTION_WHOLE, unmounted, pending as *mut c_void);
+                Ok(Request::Eject { bsd, reply }) => {
+                    match disk_named(session.0, &bsd).and_then(|d| {
+                        Owned::new(DADiskCopyWholeDisk(d.0)).ok_or_else(|| DaError {
+                            status: 0,
+                            message: Some(format!("no whole disk for {bsd}")),
+                        })
+                    }) {
+                        Ok(whole) => {
+                            let pending = Box::into_raw(Box::new(PendingEject { reply }));
+                            DADiskUnmount(
+                                whole.0,
+                                DA_DISK_UNMOUNT_OPTION_WHOLE,
+                                unmounted,
+                                pending as *mut c_void,
+                            );
+                        }
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                        }
                     }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
-                    }
-                },
+                }
                 Ok(Request::Stop) | Err(mpsc::TryRecvError::Disconnected) => break,
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -325,7 +446,11 @@ mod tests {
         .unwrap();
         std::thread::sleep(Duration::from_millis(200));
         // Disk Arbitration answers (with a refusal), so requests reach it and come back.
-        assert!(guard.mount_read_only("disk-that-does-not-exist", false).is_err());
+        assert!(
+            guard
+                .mount_read_only("disk-that-does-not-exist", false)
+                .is_err()
+        );
         drop(guard);
         assert!(rx.try_recv().is_err(), "no events");
     }

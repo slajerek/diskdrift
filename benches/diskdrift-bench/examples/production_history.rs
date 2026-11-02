@@ -5,6 +5,8 @@
 //!   production_history <entries> <versions> <out.json>
 use diskdrift_bench::synth::{Gen, Params};
 use diskdrift_core::diff::{self, DiffOptions};
+use diskdrift_core::native::{NativePath, NativeRoot};
+use diskdrift_core::record::{FileIdScheme, TimestampResolution};
 use diskdrift_core::walk::WalkReport;
 use diskdrift_storage::{Rebase, ScanOptions, SnapshotMeta, Status, Store, VolumeIdentity, meta};
 use std::time::Instant;
@@ -14,18 +16,42 @@ use std::time::Instant;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn template(name: String) -> SnapshotMeta {
+    let mut descriptor = meta::VolumeDescriptor::new(
+        0,
+        "linux",
+        FileIdScheme::PosixInode64,
+        meta::FileIdScope::Volume,
+        meta::AllocationSemantics::FilesystemReported,
+        TimestampResolution::Seconds,
+        meta::Provenance::Observed("synthetic fixture".into()),
+    );
+    descriptor.identity = NativePath::unix(b"bench".to_vec());
+    descriptor.mount_key = NativePath::unix(b"/synthetic".to_vec());
+    descriptor.identity_strength = "uuid".into();
     SnapshotMeta {
         format_version: meta::META_FORMAT_VERSION,
         id: 0,
         name,
         root: "/synthetic".into(),
+        root_native: Some(NativeRoot::posix(b"/synthetic".to_vec())),
         disk: None,
         root_in_volume: None,
+        root_in_volume_native: Some(NativePath::unix(b"/synthetic".to_vec())),
         status: Status::InProgress,
         started_at: String::new(),
         finished_at: None,
-        volume: VolumeIdentity { uuid: Some("bench".into()), fs_type: "apfs".into(), ..Default::default() },
-        options: ScanOptions { stay_on_filesystem: true, ..Default::default() },
+        volume: VolumeIdentity {
+            uuid: Some("bench".into()),
+            fs_type: "apfs".into(),
+            mount_point: "/synthetic".into(),
+            descriptor: Some(descriptor.clone()),
+            ..Default::default()
+        },
+        volumes: meta::complete_volume_table(&descriptor),
+        options: ScanOptions {
+            stay_on_filesystem: true,
+            ..Default::default()
+        },
         space_before: None,
         space_after: None,
         storage: Default::default(),
@@ -58,20 +84,29 @@ fn main() {
     let n: u64 = args[1].parse().unwrap();
     let versions: u32 = args[2].parse().unwrap();
     let out = &args[3];
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/bench-work/production-history");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/bench-work/production-history");
     let _ = std::fs::remove_dir_all(&dir);
     let store = Store::create(&dir).unwrap();
-    let params = Params { entries: n, seed: 13, change: 0.01, horizon: versions };
+    let params = Params {
+        entries: n,
+        seed: 13,
+        change: 0.01,
+        horizon: versions,
+    };
     let (mut steps, mut sizes, mut kinds) = (Vec::new(), Vec::new(), Vec::new());
     let mut one_full = 0;
     for v in 0..versions {
         let (rb, ms) = time(|| {
-            let lock = store.lock().unwrap();
+            let (lock, _) = store.lock().unwrap();
             let mut w = store.begin(lock, template(format!("v{v}")), None).unwrap();
             for r in Gen::new(params, v) {
                 w.push(&r).unwrap();
             }
-            w.commit_and_rebase(WalkReport::default(), None, String::new()).unwrap().1.unwrap()
+            w.commit_and_rebase(WalkReport::default(), None, String::new())
+                .unwrap()
+                .1
+                .unwrap()
         });
         let size = store.size_on_disk();
         if v == 0 {
@@ -84,7 +119,12 @@ fn main() {
         });
         steps.push(ms);
         sizes.push(size);
-        eprintln!("v{v:3} {ms:7.0} ms  store {:7.1} MB  rss {:5.0} MB  {:?}", size as f64 / 1e6, rss(), rb);
+        eprintln!(
+            "v{v:3} {ms:7.0} ms  store {:7.1} MB  rss {:5.0} MB  {:?}",
+            size as f64 / 1e6,
+            rss(),
+            rb
+        );
     }
     eprintln!("RSS after writes: {:.0} MB", rss());
     let all = store.list().unwrap();
@@ -95,7 +135,14 @@ fn main() {
     eprintln!("RSS after reading latest/previous: {:.0} MB", rss());
     let (_, read_oldest) = time(|| count(first));
     eprintln!("RSS after reading oldest: {:.0} MB", rss());
-    let d = |a: u64, b: u64| diff::diff(store.records(a).unwrap(), store.records(b).unwrap(), DiffOptions::default()).unwrap();
+    let d = |a: u64, b: u64| {
+        diff::diff(
+            store.records(a).unwrap(),
+            store.records(b).unwrap(),
+            DiffOptions::default(),
+        )
+        .unwrap()
+    };
     let (_, diff_adjacent) = time(|| d(all[all.len() - 2].id, last));
     let (_, diff_distant) = time(|| d(first, last));
     let (_, list_ms) = time(|| store.list().unwrap().len());
@@ -111,11 +158,14 @@ fn main() {
     let mut sorted = steps.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median_step = sorted[sorted.len() / 2];
-    println!("{}", serde_json::json!({
-        "ratioAfter10": ratio(9), "ratioAfter30": ratio(29), "ratioAfter100": ratio(99),
-        "medianStepMs": median_step,
-        "readLatestMs": read_latest, "readPreviousMs": read_prev, "readOldestMs": read_oldest,
-        "diffAdjacentMs": diff_adjacent, "diffDistantMs": diff_distant, "peakRssMb": rss()
-    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "ratioAfter10": ratio(9), "ratioAfter30": ratio(29), "ratioAfter100": ratio(99),
+            "medianStepMs": median_step,
+            "readLatestMs": read_latest, "readPreviousMs": read_prev, "readOldestMs": read_oldest,
+            "diffAdjacentMs": diff_adjacent, "diffDistantMs": diff_distant, "peakRssMb": rss()
+        })
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

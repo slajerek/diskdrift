@@ -6,20 +6,34 @@ use crate::prune::{Proposal, Removed};
 use crate::storage::{CompactStep, Compaction};
 
 fn scans(n: usize) -> String {
-    if n == 1 { "1 scan".into() } else { format!("{n} scans") }
+    if n == 1 {
+        "1 scan".into()
+    } else {
+        format!("{n} scans")
+    }
 }
 
 fn short_time(rfc: &str) -> String {
-    rfc.get(..16).map(|s| s.replace('T', " ")).unwrap_or_else(|| rfc.to_string())
+    rfc.get(..16)
+        .map(|s| s.replace('T', " "))
+        .unwrap_or_else(|| rfc.to_string())
 }
 
 /// One line: how much it frees and what else happens.
 pub fn proposal_summary(p: &Proposal, u: SizeUnits) -> String {
-    let mut s = format!("Removing {} frees about {} in the store", scans(p.snapshots.len()), format_size(p.bytes, u));
+    let mut s = format!(
+        "Removing {} frees about {} in the store",
+        scans(p.snapshots.len()),
+        format_size(p.bytes, u)
+    );
     match p.rewritten {
         0 => s.push('.'),
-        1 => s.push_str("; 1 kept scan is rewritten so it stays readable, which can take some of it back."),
-        n => s.push_str(&format!("; {n} kept scans are rewritten so they stay readable, which can take some of it back.")),
+        1 => s.push_str(
+            "; 1 kept scan is rewritten so it stays readable, which can take some of it back.",
+        ),
+        n => s.push_str(&format!(
+            "; {n} kept scans are rewritten so they stay readable, which can take some of it back."
+        )),
     }
     s.push_str(" Scanned files are never touched.");
     s
@@ -35,11 +49,19 @@ pub fn proposal(p: &Proposal, u: SizeUnits) -> String {
         d.dedup();
         d.len() > 1
     };
-    let mut cols = vec![("ID", Align::Right), ("Name", Align::Left), ("Started", Align::Left)];
+    let mut cols = vec![
+        ("ID", Align::Right),
+        ("Name", Align::Left),
+        ("Started", Align::Left),
+    ];
     if with_disk {
         cols.push(("Disk", Align::Left));
     }
-    cols.extend([("Root", Align::Left), ("Status", Align::Left), ("Stored", Align::Right)]);
+    cols.extend([
+        ("Root", Align::Left),
+        ("Status", Align::Left),
+        ("Stored", Align::Right),
+    ]);
     let mut t = Table::new(&cols);
     for r in &p.snapshots {
         let m = &r.meta;
@@ -47,33 +69,66 @@ pub fn proposal(p: &Proposal, u: SizeUnits) -> String {
         if with_disk {
             row.push(r.disk_name.clone().unwrap_or_else(|| "-".into()));
         }
-        row.extend([m.root.clone(), m.status.to_string(), format_size(r.size_on_disk, u)]);
+        row.extend([
+            m.root.clone(),
+            m.status.to_string(),
+            format_size(r.size_on_disk, u),
+        ]);
         t.row(row);
     }
-    format!("{}{} {} kept.\n", t.render(), proposal_summary(p, u), scans(p.kept))
+    format!(
+        "{}{} {} kept.\n",
+        t.render(),
+        proposal_summary(p, u),
+        scans(p.kept)
+    )
 }
 
 pub fn removed(r: &Removed, u: SizeUnits) -> String {
     if r.cancelled {
-        return "Stopped: nothing was removed (scans rewritten so far stay valid).\n".into();
+        let mut s = "Stopped: nothing was removed (scans rewritten so far stay valid).".to_string();
+        if let Some(notice) = r.migration.notice() {
+            s.push(' ');
+            s.push_str(notice);
+        }
+        s.push('\n');
+        return s;
     }
-    let mut s = format!("Removed {}, {} freed.", scans(r.removed.len()), format_size(r.freed_bytes, u));
+    let mut s = format!(
+        "Removed {}, {} freed.",
+        scans(r.removed.len()),
+        format_size(r.freed_bytes, u)
+    );
     match r.rewritten.len() {
         0 => {}
         1 => s.push_str(" 1 kept scan was rewritten so it stays readable."),
-        n => s.push_str(&format!(" {n} kept scans were rewritten so they stay readable.")),
+        n => s.push_str(&format!(
+            " {n} kept scans were rewritten so they stay readable."
+        )),
     }
     if r.uncompacted > 0 {
-        s.push_str(&format!(" Compacting the store (`diskdrift snapshots compact`) can store {} tighter.", scans(r.uncompacted)));
+        s.push_str(&format!(
+            " Compacting the store (`diskdrift snapshots compact`) can store {} tighter.",
+            scans(r.uncompacted)
+        ));
     }
-    s.push_str(" Scanned files are never touched.\n");
+    s.push_str(" Scanned files are never touched.");
+    if let Some(notice) = r.migration.notice() {
+        s.push(' ');
+        s.push_str(notice);
+    }
+    s.push('\n');
     s
 }
 
 pub fn compact_step(s: &CompactStep) -> String {
     match s {
-        CompactStep::Rewriting { id, done, total } => format!("rewriting snapshot {id} ({}/{total})", done + 1),
-        CompactStep::Checking { id, done, total } => format!("checking snapshot {id} ({}/{total})", done + 1),
+        CompactStep::Rewriting { id, done, total } => {
+            format!("rewriting snapshot {id} ({}/{total})", done + 1)
+        }
+        CompactStep::Checking { id, done, total } => {
+            format!("checking snapshot {id} ({}/{total})", done + 1)
+        }
     }
 }
 
@@ -102,5 +157,13 @@ pub fn compaction(c: &Compaction, u: SizeUnits) -> String {
         s.push_str(&format!("Checksums of all {} valid.", scans(c.checked)));
     }
     s.push('\n');
+    s
+}
+
+pub fn compaction_result(r: &crate::prune::CompactionResult, u: SizeUnits) -> String {
+    let mut s = compaction(&r.compaction, u);
+    if let Some(notice) = r.migration.notice() {
+        s.insert_str(0, &format!("{notice}\n"));
+    }
     s
 }

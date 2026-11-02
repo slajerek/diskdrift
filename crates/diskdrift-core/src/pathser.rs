@@ -34,7 +34,11 @@ impl NativePath {
 }
 
 /// Writes `key` (and `key`+"Bytes" if needed) into a map being serialized.
-pub fn serialize_entry<M: SerializeMap>(map: &mut M, key: &str, bytes: &[u8]) -> Result<(), M::Error> {
+pub fn serialize_entry<M: SerializeMap>(
+    map: &mut M,
+    key: &str,
+    bytes: &[u8],
+) -> Result<(), M::Error> {
     match std::str::from_utf8(bytes) {
         Ok(s) => map.serialize_entry(key, s),
         Err(_) => {
@@ -62,7 +66,10 @@ impl<'de> Deserialize<'de> for NativePath {
         }
         let h = Helper::deserialize(d)?;
         match h.path_bytes {
-            Some(b) => STANDARD.decode(b).map(NativePath).map_err(serde::de::Error::custom),
+            Some(b) => STANDARD
+                .decode(b)
+                .map(NativePath)
+                .map_err(serde::de::Error::custom),
             None => Ok(NativePath(h.path.into_bytes())),
         }
     }
@@ -81,11 +88,17 @@ mod tests {
 
     #[test]
     fn utf8_and_non_utf8() {
-        let ok = Item { path: NativePath(b"/Users/a b/\xc3\xa9".to_vec()), size: 1 };
+        let ok = Item {
+            path: NativePath(b"/Users/a b/\xc3\xa9".to_vec()),
+            size: 1,
+        };
         let j = serde_json::to_string(&ok).unwrap();
         assert_eq!(j, r#"{"path":"/Users/a b/é","size":1}"#);
         assert_eq!(serde_json::from_str::<Item>(&j).unwrap(), ok);
-        let bad = Item { path: NativePath(b"/tmp/\xff\xfe".to_vec()), size: 2 };
+        let bad = Item {
+            path: NativePath(b"/tmp/\xff\xfe".to_vec()),
+            size: 2,
+        };
         let j = serde_json::to_string(&bad).unwrap();
         assert!(j.contains(r#""pathBytes":"L3RtcC///g==""#), "{j}");
         assert_eq!(serde_json::from_str::<Item>(&j).unwrap(), bad);

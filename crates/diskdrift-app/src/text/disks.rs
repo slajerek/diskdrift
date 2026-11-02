@@ -24,7 +24,10 @@ fn ago(rfc: &str, now: i64) -> String {
 
 pub fn disk_list(l: &DiskList, u: SizeUnits, now: i64) -> String {
     if l.disks.is_empty() {
-        return format!("No disks in {} yet. A scan records the disk it was taken on.\n", l.store_path.display());
+        return format!(
+            "No disks in {} yet. A scan records the disk it was taken on.\n",
+            l.store_path.display()
+        );
     }
     let mut t = Table::new(&[
         ("Disk", Align::Left),
@@ -46,27 +49,47 @@ pub fn disk_list(l: &DiskList, u: SizeUnits, now: i64) -> String {
             d.id.clone(),
             d.volume.name.clone().unwrap_or_else(|| "-".into()),
             d.volume.fs_type.clone(),
-            d.volume.capacity_bytes.map(|b| format_size(b, u)).unwrap_or_else(|| "-".into()),
-            r.mount_point.as_ref().map(|p| format!("yes, {}", p.display())).unwrap_or_else(|| "no".into()),
+            d.volume
+                .capacity_bytes
+                .map(|b| format_size(b, u))
+                .unwrap_or_else(|| "-".into()),
+            r.mount_point
+                .as_ref()
+                .map(|p| format!("yes, {}", p.display()))
+                .unwrap_or_else(|| "no".into()),
             match (&r.last_scan, r.known) {
                 (_, false) => "new, not scanned".into(),
                 (Some(s), true) => ago(s, now),
                 (None, true) => "never".into(),
             },
             r.snapshots.to_string(),
-            format_size(r.store_bytes, u),
-            if d.sets.is_empty() { "-".into() } else { d.sets.join(", ") },
+            if r.known {
+                format_size(r.store_bytes, u)
+            } else {
+                "-".into()
+            },
+            if d.sets.is_empty() {
+                "-".into()
+            } else {
+                d.sets.join(", ")
+            },
             strength(d.identity.strength).to_string(),
         ]);
     }
 
     let mut out = t.render();
+    for error in &l.mount_errors {
+        let _ = writeln!(out, "  volume unavailable: {error}");
+    }
     for r in &l.disks {
         if let Some(desc) = &r.disk.description {
             let _ = writeln!(out, "  {}: {desc}", r.disk.display_name());
         }
     }
-    if l.disks.iter().any(|r| r.disk.identity.strength == Strength::Weak) {
+    if l.disks
+        .iter()
+        .any(|r| r.disk.identity.strength == Strength::Weak)
+    {
         out.push_str(
             "  weak: the volume reports no UUID (or an unreliable one), so it is recognised by its filesystem, name and size or mount point; \
              DiskDrift asks before treating a match as the same disk. Two entries for one disk can be joined with `disks merge`.\n",
@@ -103,14 +126,22 @@ pub fn disk_entry(d: &Disk) -> String {
 
 pub fn forget(f: &Forget, u: SizeUnits) -> String {
     let n = f.snapshots.len();
-    let scans = if n == 1 { "1 snapshot".to_string() } else { format!("{n} snapshots") };
+    let scans = if n == 1 {
+        "1 snapshot".to_string()
+    } else {
+        format!("{n} snapshots")
+    };
     if f.done {
-        format!(
+        let mut s = format!(
             "Forgot disk {} ({}): removed {scans}, {} freed. Scanned files are never touched.\n",
             f.disk.display_name(),
             f.disk.id,
             format_size(f.bytes, u)
-        )
+        );
+        if let Some(notice) = f.migration.notice() {
+            s.insert_str(s.len() - 1, &format!(" {notice}"));
+        }
+        s
     } else {
         format!(
             "Forgetting disk {} ({}) removes its {scans} ({} in the store) and its label, description and sets. \
