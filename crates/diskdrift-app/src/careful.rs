@@ -34,7 +34,12 @@ impl Held {
     pub fn name(&self) -> String {
         match &self.disk {
             Some(d) if self.doubt.is_none() => d.display_name().to_string(),
-            _ => self.volume.info.volume_name.clone().unwrap_or_else(|| self.volume.bsd_name.clone()),
+            _ => self
+                .volume
+                .info
+                .volume_name
+                .clone()
+                .unwrap_or_else(|| self.volume.bsd_name.clone()),
         }
     }
 }
@@ -55,17 +60,37 @@ pub fn describe(settings: &Effective, volume: HeldVolume) -> Result<Held> {
             Observed::New(_) => (None, None),
             Observed::Ask { existing, doubt } => {
                 let d = reg.get(&existing).cloned();
-                let name = d.as_ref().map(|d| d.display_name().to_string()).unwrap_or(existing);
+                let name = d
+                    .as_ref()
+                    .map(|d| d.display_name().to_string())
+                    .unwrap_or(existing);
                 let why = match doubt {
-                    Doubt::Clone => format!("it has the identity of {name} but is on another device: a copy of it?"),
-                    Doubt::Weak => format!("it reports no UUID; its filesystem, name and size match {name}"),
+                    Doubt::Clone => format!(
+                        "it has the identity of {name} but is on another device: a copy of it?"
+                    ),
+                    Doubt::Weak => {
+                        format!("it reports no UUID; its filesystem, name and size match {name}")
+                    }
                 };
                 (d, Some(why))
             }
         },
     };
-    let last_scan = disk.as_ref().and_then(|d| metas.iter().rev().find(|m| m.status.is_usable() && m.disk.as_deref() == Some(d.id.as_str()))).map(|m| m.started_at.clone());
-    Ok(Held { volume, disk, doubt, last_scan })
+    let last_scan = disk
+        .as_ref()
+        .and_then(|d| {
+            metas
+                .iter()
+                .rev()
+                .find(|m| m.status.is_usable() && m.disk.as_deref() == Some(d.id.as_str()))
+        })
+        .map(|m| m.started_at.clone());
+    Ok(Held {
+        volume,
+        disk,
+        doubt,
+        last_scan,
+    })
 }
 
 /// The command a user can run (with administrator rights) to mount a volume
@@ -79,9 +104,15 @@ pub fn direct_mount_hint(volume: &HeldVolume) -> String {
         "msdos" => "mount_msdos -o rdonly",
         "apfs" => "mount_apfs -o rdonly",
         "ntfs" => "mount_ntfs -o rdonly",
-        other => return format!("mount it read-only with the mount tool of {other} (`-o rdonly`), then `diskdrift scan <folder> --careful`"),
+        other => {
+            return format!(
+                "mount it read-only with the mount tool of {other} (`-o rdonly`), then `diskdrift scan <folder> --careful`"
+            );
+        }
     };
-    format!("sudo mkdir -p {dir} && sudo {tool} {dev} {dir}, then `diskdrift scan {dir} --careful`; afterwards `sudo umount {dir}`")
+    format!(
+        "sudo mkdir -p {dir} && sudo {tool} {dev} {dir}, then `diskdrift scan {dir} --careful`; afterwards `sudo umount {dir}`"
+    )
 }
 
 /// Why a mount failed, in words, with what the user can do.
@@ -90,7 +121,11 @@ pub fn mount_failure(volume: &HeldVolume, e: &DaError) -> String {
         format!(
             "macOS will not mount {} read-only without repairing it first (it was not unmounted cleanly, or its journal is not empty), \
              and careful mode never repairs: it stays unmounted and nothing was written. To read it anyway: {}",
-            volume.info.volume_name.as_deref().unwrap_or(&volume.bsd_name),
+            volume
+                .info
+                .volume_name
+                .as_deref()
+                .unwrap_or(&volume.bsd_name),
             direct_mount_hint(volume)
         )
     } else {
@@ -102,8 +137,14 @@ pub fn mount_failure(volume: &HeldVolume, e: &DaError) -> String {
 pub fn read_only_warning(path: &Path) -> Option<String> {
     match diskdrift_platform::statfs_path(path) {
         Ok(m) if m.read_only => None,
-        Ok(m) => Some(format!("{} is mounted read-write: the system may write to it (careful mode mounts it read-only)", m.mount_point.display())),
-        Err(e) => Some(format!("cannot tell whether {} is read-only: {e}", path.display())),
+        Ok(m) => Some(format!(
+            "{} is mounted read-write: the system may write to it (careful mode mounts it read-only)",
+            m.mount_point.display()
+        )),
+        Err(e) => Some(format!(
+            "cannot tell whether {} is read-only: {e}",
+            path.display()
+        )),
     }
 }
 
@@ -120,7 +161,10 @@ pub struct CarefulOutcome {
     pub ejected: std::result::Result<(), String>,
 }
 
-fn ser_result<T: Serialize, S: serde::Serializer>(r: &std::result::Result<T, String>, s: S) -> std::result::Result<S::Ok, S::Error> {
+fn ser_result<T: Serialize, S: serde::Serializer>(
+    r: &std::result::Result<T, String>,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     enum R<'a, T> {
@@ -145,9 +189,15 @@ pub fn careful_scan(
     progress: Option<&Progress>,
 ) -> Result<CarefulOutcome> {
     if held.doubt.is_some() && choice.is_none() {
-        return Err(AppError::DiskDoubt(format!("{}: {}", held.name(), held.doubt.as_deref().unwrap_or_default())));
+        return Err(AppError::DiskDoubt(format!(
+            "{}: {}",
+            held.name(),
+            held.doubt.as_deref().unwrap_or_default()
+        )));
     }
-    let at = guard.mount_read_only(held.bsd(), false).map_err(|e| AppError::Runtime(mount_failure(&held.volume, &e)))?;
+    let at = guard
+        .mount_read_only(held.bsd(), false)
+        .map_err(|e| AppError::Runtime(mount_failure(&held.volume, &e)))?;
     let scan = match read_only_warning(&at) {
         // Something else mounted it read-write meanwhile: scanning would not be careful.
         Some(w) => Err(format!("{w}; DiskDrift did not scan it")),
@@ -158,18 +208,28 @@ pub fn careful_scan(
             snapshots::scan(settings, &req, cancel, progress).map_err(|e| e.to_string())
         }
     };
-    let ejected = guard.unmount_and_eject(held.bsd()).map_err(|e| format!("could not eject it: {e}; eject it in Finder before unplugging"));
-    Ok(CarefulOutcome { mount_point: at, scan, ejected })
+    let ejected = guard
+        .unmount_and_eject(held.bsd())
+        .map_err(|e| format!("could not eject it: {e}; eject it in Finder before unplugging"));
+    Ok(CarefulOutcome {
+        mount_point: at,
+        scan,
+        ejected,
+    })
 }
 
 /// Mounts `held` read-only and visible in Finder (to copy a file off).
 pub fn mount_for_finder(guard: &MountGuard, held: &Held) -> Result<PathBuf> {
-    guard.mount_read_only(held.bsd(), true).map_err(|e| AppError::Runtime(mount_failure(&held.volume, &e)))
+    guard
+        .mount_read_only(held.bsd(), true)
+        .map_err(|e| AppError::Runtime(mount_failure(&held.volume, &e)))
 }
 
 /// Ejects the disk holding `held` without mounting it.
 pub fn eject(guard: &MountGuard, held: &Held) -> Result<()> {
-    guard.unmount_and_eject(held.bsd()).map_err(|e| AppError::Runtime(format!("could not eject it: {e}")))
+    guard
+        .unmount_and_eject(held.bsd())
+        .map_err(|e| AppError::Runtime(format!("could not eject it: {e}")))
 }
 
 #[cfg(test)]
@@ -190,7 +250,12 @@ mod tests {
                 volume_uuid: uuid.map(String::from),
                 capacity_bytes: Some(500_000_000_000),
                 bsd_name: Some("disk9s1".into()),
-                device: DeviceInfo { bus: Some("USB".into()), serial: Some("SN1".into()), ..Default::default() },
+                device: DeviceInfo {
+                    bus: Some("USB".into()),
+                    serial: Some("SN1".into()),
+                    ..Default::default()
+                },
+                ..DiskInfo::default()
             },
         }
     }
@@ -199,35 +264,85 @@ mod tests {
     fn a_held_volume_is_known_new_or_doubtful_and_nothing_is_written() {
         let t = TestDir::new("app-careful-describe");
         let db = t.path().join("store");
-        let settings = resolve_with(&Overrides { db: Some(db.clone()), ..Default::default() }, t.path(), t.path()).unwrap();
+        let settings = resolve_with(
+            &Overrides {
+                db: Some(db.clone()),
+                ..Default::default()
+            },
+            t.path(),
+            t.path(),
+        )
+        .unwrap();
         // No store: new, and none is created.
-        assert_eq!(describe(&settings, volume("hfs", Some("U1"))).unwrap().disk, None);
+        assert_eq!(
+            describe(&settings, volume("hfs", Some("U1"))).unwrap().disk,
+            None
+        );
         assert!(!db.exists());
         let store = diskdrift_storage::Store::create(&db).unwrap();
-        let known = crate::disks::record_scan_disk(&store, &volume("hfs", Some("U1")).info, "2026-10-01T10:00:00+02:00", None).unwrap();
-        let before = std::fs::read(db.join("disks.json")).unwrap();
+        let known = crate::disks::record_scan_disk(
+            &store,
+            &volume("hfs", Some("U1")).info,
+            "2026-10-01T10:00:00+02:00",
+            None,
+        )
+        .unwrap()
+        .0;
+        let registry_path = store.layout().registry_path();
+        let before = std::fs::read(&registry_path).unwrap();
         let h = describe(&settings, volume("hfs", Some("U1"))).unwrap();
-        assert_eq!((h.disk.map(|d| d.id), h.doubt), (Some(known.disk.id.clone()), None));
+        assert_eq!(
+            (h.disk.map(|d| d.id), h.doubt),
+            (Some(known.disk.id.clone()), None)
+        );
         let mut copy = volume("hfs", Some("U1"));
         copy.info.device.serial = Some("SN2".into());
         let h = describe(&settings, copy).unwrap();
-        assert!(h.doubt.as_deref().unwrap().contains("copy"), "{:?}", h.doubt);
-        assert_eq!(describe(&settings, volume("exfat", Some("V2"))).unwrap().disk, None);
-        assert_eq!(std::fs::read(db.join("disks.json")).unwrap(), before, "describing writes nothing");
+        assert!(
+            h.doubt.as_deref().unwrap().contains("copy"),
+            "{:?}",
+            h.doubt
+        );
+        assert_eq!(
+            describe(&settings, volume("exfat", Some("V2")))
+                .unwrap()
+                .disk,
+            None
+        );
+        assert_eq!(
+            std::fs::read(&registry_path).unwrap(),
+            before,
+            "describing writes nothing"
+        );
     }
 
     #[test]
     fn a_dirty_volume_gets_the_direct_read_only_mount() {
-        let e = DaError { status: 0xc05c, message: None };
+        let e = DaError {
+            status: 0xc05c,
+            message: None,
+        };
         let m = mount_failure(&volume("exfat", Some("V")), &e);
-        assert!(m.contains("never repairs") && m.contains("sudo mount_exfat -o rdonly /dev/disk9s1"), "{m}");
+        assert!(
+            m.contains("never repairs") && m.contains("sudo mount_exfat -o rdonly /dev/disk9s1"),
+            "{m}"
+        );
         assert!(direct_mount_hint(&volume("hfs", None)).contains("mount_hfs -j -o rdonly"));
-        let other = mount_failure(&volume("hfs", None), &DaError { status: 0xf8da0002, message: Some("busy".into()) });
+        let other = mount_failure(
+            &volume("hfs", None),
+            &DaError {
+                status: 0xf8da0002,
+                message: Some("busy".into()),
+            },
+        );
         assert!(other.contains("busy") && !other.contains("sudo"), "{other}");
     }
 
     #[test]
     fn the_read_only_check() {
-        assert!(read_only_warning(Path::new("/System/Volumes/Data")).is_some(), "the data volume is read-write");
+        assert!(
+            read_only_warning(Path::new("/System/Volumes/Data")).is_some(),
+            "the data volume is read-write"
+        );
     }
 }

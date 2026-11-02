@@ -6,7 +6,8 @@
 //! record for record, to the snapshot it was created from.
 
 use crate::diff::{Change, DiffEntry, DiffVisitor, RecordStream};
-use crate::paths::{PathStack, compare_paths};
+use crate::native::NativeName;
+use crate::paths::{PathOrderError, PathStack, compare_paths};
 use crate::record::{Record, get_varint, put_varint};
 use std::cmp::Ordering;
 use std::io;
@@ -24,29 +25,22 @@ pub enum OpKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeltaOp {
     pub kind: OpKind,
-    pub parent: Vec<Vec<u8>>,
+    pub parent: Vec<NativeName>,
     pub record: Record,
 }
 
 impl DeltaOp {
-    fn path_cmp(&self, comps: &[Vec<u8>]) -> Ordering {
-        // Compare parent + [name] against comps without allocating.
-        let own_len = self.parent.len() + 1;
-        for (i, theirs) in comps.iter().enumerate().take(own_len) {
-            let mine: &[u8] = if i < self.parent.len() { &self.parent[i] } else { self.record.name.as_unix_bytes().expect("DDS1 delta requires Unix names") };
-            match mine.cmp(theirs.as_slice()) {
-                Ordering::Equal => continue,
-                o => return o,
-            }
-        }
-        own_len.cmp(&comps.len())
+    fn path_cmp(&self, comps: &[NativeName]) -> Result<Ordering, PathOrderError> {
+        let mut path = self.parent.clone();
+        path.push(self.record.name.clone());
+        compare_paths(&path, comps)
     }
 }
 
 /// Encodes ops compactly; parent paths are front-coded against the previous op.
 #[derive(Default)]
 pub struct OpEncoder {
-    prev_parent: Vec<Vec<u8>>,
+    prev_parent: Vec<NativeName>,
 }
 
 impl OpEncoder {
@@ -56,17 +50,31 @@ impl OpEncoder {
 
     pub fn encode(&mut self, op: &DeltaOp, out: &mut Vec<u8>) -> io::Result<()> {
         out.push(op.kind as u8);
-        let shared = self.prev_parent.iter().zip(op.parent.iter()).take_while(|(a, b)| a == b).count();
+        let shared = self
+            .prev_parent
+            .iter()
+            .zip(op.parent.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
         put_varint(out, shared as u64);
         put_varint(out, (op.parent.len() - shared) as u64);
         for c in &op.parent[shared..] {
             put_varint(out, c.len() as u64);
-            out.extend_from_slice(c);
+            let NativeName::Unix(bytes) = c else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "DDS1 only supports Unix-native path components",
+                ));
+            };
+            out.extend_from_slice(bytes);
         }
         if op.kind == OpKind::Remove {
             put_varint(out, op.record.name.len() as u64);
-            let Some(name) = op.record.name.as_unix_bytes() else {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "DDS1 only supports Unix-native names"));
+            let NativeName::Unix(name) = &op.record.name else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "DDS1 only supports Unix-native names",
+                ));
             };
             out.extend_from_slice(name);
         } else {
@@ -80,11 +88,15 @@ impl OpEncoder {
 
 #[derive(Default)]
 pub struct OpDecoder {
-    prev_parent: Vec<Vec<u8>>,
+    prev_parent: Vec<NativeName>,
 }
 
 fn corrupt(what: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("corrupt delta: {what}"))
+}
+
+fn path_order(error: PathOrderError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
 }
 
 impl OpDecoder {
@@ -111,7 +123,7 @@ impl OpDecoder {
             if buf.len() < len {
                 return Err(corrupt("component length"));
             }
-            self.prev_parent.push(buf[..len].to_vec());
+            self.prev_parent.push(NativeName::unix(buf[..len].to_vec()));
             *buf = &buf[len..];
         }
         let record = if kind == OpKind::Remove {
@@ -119,7 +131,11 @@ impl OpDecoder {
             if buf.len() < len {
                 return Err(corrupt("name length"));
             }
-            let r = Record { depth: self.prev_parent.len() as u16, name: crate::native::NativeName::unix(buf[..len].to_vec()), ..Default::default() };
+            let r = Record {
+                depth: self.prev_parent.len() as u16,
+                name: NativeName::unix(buf[..len].to_vec()),
+                ..Default::default()
+            };
             *buf = &buf[len..];
             r
         } else {
@@ -128,7 +144,11 @@ impl OpDecoder {
         if record.depth as usize != self.prev_parent.len() {
             return Err(corrupt("depth does not match path"));
         }
-        Ok(DeltaOp { kind, parent: self.prev_parent.clone(), record })
+        Ok(DeltaOp {
+            kind,
+            parent: self.prev_parent.clone(),
+            record,
+        })
     }
 }
 
@@ -145,19 +165,39 @@ impl<F: FnMut(&DeltaOp) -> io::Result<()>> DeltaBuilder<F> {
     pub fn new(emit: F) -> Self {
         DeltaBuilder { emit, ops: 0 }
     }
+
+    /// Delta persistence is lossless even when allocation deltas cannot be
+    /// reported for a comparison. The capability belongs to reporting, not to
+    /// the stored records.
+    pub fn with_allocated_deltas(emit: F, _allocated_deltas: bool) -> Self {
+        DeltaBuilder { emit, ops: 0 }
+    }
 }
 
 impl<F: FnMut(&DeltaOp) -> io::Result<()>> DiffVisitor for DeltaBuilder<F> {
     fn entry(&mut self, e: &DiffEntry<'_>) -> io::Result<()> {
-        let (kind, record) = match (e.old, e.new) {
-            (Some(o), Some(n)) if o == n => return Ok(()),
+        let old = e.old.cloned();
+        let new = e.new.cloned();
+        let (kind, record) = match (old.as_ref(), new.as_ref()) {
+            (Some(o), Some(n)) if o.exactly_equal(n) => return Ok(()),
             (Some(_), Some(n)) => (OpKind::Replace, n.clone()),
             (None, Some(n)) => (OpKind::Add, n.clone()),
-            (Some(o), None) => (OpKind::Remove, Record { depth: o.depth, name: o.name.clone(), ..Default::default() }),
+            (Some(o), None) => (
+                OpKind::Remove,
+                Record {
+                    depth: o.depth,
+                    name: o.name.clone(),
+                    ..Default::default()
+                },
+            ),
             (None, None) => return Ok(()),
         };
         debug_assert!(!matches!(e.change, Change::Unchanged) || kind == OpKind::Replace);
-        let op = DeltaOp { kind, parent: e.path[..e.path.len() - 1].to_vec(), record };
+        let op = DeltaOp {
+            kind,
+            parent: e.path[..e.path.len() - 1].to_vec(),
+            record,
+        };
         self.ops += 1;
         (self.emit)(&op)
     }
@@ -174,14 +214,24 @@ pub struct Apply<'a> {
 }
 
 impl<'a> Apply<'a> {
-    pub fn new(base: RecordStream<'a>, ops: Box<dyn Iterator<Item = io::Result<DeltaOp>> + 'a>) -> Self {
-        Apply { base, ops, base_cur: None, base_stack: PathStack::new(), op_cur: None, started: false }
+    pub fn new(
+        base: RecordStream<'a>,
+        ops: Box<dyn Iterator<Item = io::Result<DeltaOp>> + 'a>,
+    ) -> Self {
+        Apply {
+            base,
+            ops,
+            base_cur: None,
+            base_stack: PathStack::new(),
+            op_cur: None,
+            started: false,
+        }
     }
 
     fn advance_base(&mut self) -> io::Result<()> {
         self.base_cur = self.base.next().transpose()?;
         if let Some(r) = &self.base_cur {
-            self.base_stack.set(r.depth, r.name.as_unix_bytes().ok_or_else(|| corrupt("Windows names are not valid in DDS1 deltas"))?)?;
+            self.base_stack.set(r.depth, &r.name)?;
         }
         Ok(())
     }
@@ -202,7 +252,9 @@ impl<'a> Apply<'a> {
                 (None, None) => return Ok(None),
                 (Some(_), None) => Ordering::Greater,
                 (None, Some(_)) => Ordering::Less,
-                (Some(_), Some(op)) => op.path_cmp(self.base_stack.components()),
+                (Some(_), Some(op)) => op
+                    .path_cmp(self.base_stack.components())
+                    .map_err(path_order)?,
             };
             match order {
                 Ordering::Greater => {
@@ -257,13 +309,26 @@ pub type OpSink<'s> = dyn FnMut(&DeltaOp) -> io::Result<()> + 's;
 
 impl<'a> PushDelta<'a> {
     pub fn new(base: RecordStream<'a>) -> Self {
-        PushDelta { base, base_cur: None, base_stack: PathStack::new(), new_stack: PathStack::new(), started: false, ops: 0 }
+        PushDelta {
+            base,
+            base_cur: None,
+            base_stack: PathStack::new(),
+            new_stack: PathStack::new(),
+            started: false,
+            ops: 0,
+        }
+    }
+
+    /// See [`DeltaBuilder::with_allocated_deltas`]: allocation comparability
+    /// must not discard values from a persisted target snapshot.
+    pub fn new_with_allocated_deltas(base: RecordStream<'a>, _allocated_deltas: bool) -> Self {
+        Self::new(base)
     }
 
     fn advance_base(&mut self) -> io::Result<()> {
         self.base_cur = self.base.next().transpose()?;
         if let Some(r) = &self.base_cur {
-            self.base_stack.set(r.depth, r.name.as_unix_bytes().ok_or_else(|| corrupt("Windows names are not valid in DDS1 deltas"))?)?;
+            self.base_stack.set(r.depth, &r.name)?;
         }
         Ok(())
     }
@@ -274,7 +339,11 @@ impl<'a> PushDelta<'a> {
         let op = DeltaOp {
             kind: OpKind::Remove,
             parent: comps[..comps.len() - 1].to_vec(),
-            record: Record { depth: b.depth, name: b.name.clone(), ..Default::default() },
+            record: Record {
+                depth: b.depth,
+                name: b.name.clone(),
+                ..Default::default()
+            },
         };
         self.ops += 1;
         out(&op)
@@ -282,7 +351,11 @@ impl<'a> PushDelta<'a> {
 
     fn emit_new(&mut self, kind: OpKind, rec: &Record, out: &mut OpSink<'_>) -> io::Result<()> {
         let comps = self.new_stack.components();
-        let op = DeltaOp { kind, parent: comps[..comps.len() - 1].to_vec(), record: rec.clone() };
+        let op = DeltaOp {
+            kind,
+            parent: comps[..comps.len() - 1].to_vec(),
+            record: rec.clone(),
+        };
         self.ops += 1;
         out(&op)
     }
@@ -292,23 +365,26 @@ impl<'a> PushDelta<'a> {
             self.started = true;
             self.advance_base()?;
         }
-            self.new_stack.set(rec.depth, rec.name.as_unix_bytes().ok_or_else(|| corrupt("Windows names are not valid in DDS1 deltas"))?)?;
+        let rec = rec.clone();
+        self.new_stack.set(rec.depth, &rec.name)?;
         loop {
             let Some(b) = &self.base_cur else {
-                return self.emit_new(OpKind::Add, rec, out);
+                return self.emit_new(OpKind::Add, &rec, out);
             };
-            match compare_paths(self.base_stack.components(), self.new_stack.components()) {
+            match compare_paths(self.base_stack.components(), self.new_stack.components())
+                .map_err(path_order)?
+            {
                 Ordering::Less => {
                     self.emit_remove(out)?;
                     self.advance_base()?;
                 }
                 Ordering::Equal => {
-                    if b != rec {
-                        self.emit_new(OpKind::Replace, rec, out)?;
+                    if !b.exactly_equal(&rec) {
+                        self.emit_new(OpKind::Replace, &rec, out)?;
                     }
                     return self.advance_base();
                 }
-                Ordering::Greater => return self.emit_new(OpKind::Add, rec, out),
+                Ordering::Greater => return self.emit_new(OpKind::Add, &rec, out),
             }
         }
     }
@@ -340,11 +416,11 @@ pub fn compute(base: RecordStream<'_>, new: RecordStream<'_>) -> io::Result<Vec<
 }
 
 /// Ordering helper used by stores to validate op streams.
-pub fn op_order(a: &DeltaOp, b: &DeltaOp) -> Ordering {
+pub fn op_order(a: &DeltaOp, b: &DeltaOp) -> Result<Ordering, PathOrderError> {
     let mut pa = a.parent.clone();
-    pa.push(a.record.name.as_unix_bytes().expect("DDS1 delta requires Unix names").to_vec());
+    pa.push(a.record.name.clone());
     let mut pb = b.parent.clone();
-    pb.push(b.record.name.as_unix_bytes().expect("DDS1 delta requires Unix names").to_vec());
+    pb.push(b.record.name.clone());
     compare_paths(&pa, &pb)
 }
 
@@ -357,7 +433,11 @@ mod tests {
     fn roundtrip(base: Vec<Record>, new: Vec<Record>) {
         let ops = compute(boxed(base.clone()), boxed(new.clone())).unwrap();
         for w in ops.windows(2) {
-            assert_eq!(op_order(&w[0], &w[1]), Ordering::Less, "ops are in canonical order");
+            assert_eq!(
+                op_order(&w[0], &w[1]).unwrap(),
+                Ordering::Less,
+                "ops are in canonical order"
+            );
         }
         let mut enc = OpEncoder::new();
         let mut buf = Vec::new();
@@ -372,7 +452,9 @@ mod tests {
         }
         assert_eq!(decoded, ops);
         let rebuilt: Vec<Record> =
-            Apply::new(boxed(base.clone()), Box::new(decoded.into_iter().map(Ok))).collect::<io::Result<_>>().unwrap();
+            Apply::new(boxed(base.clone()), Box::new(decoded.into_iter().map(Ok)))
+                .collect::<io::Result<_>>()
+                .unwrap();
         assert_eq!(rebuilt, new);
         let mut pushed = Vec::new();
         let mut collect = |op: &DeltaOp| {
@@ -389,8 +471,25 @@ mod tests {
 
     #[test]
     fn reconstructs_exactly() {
-        let base = stream(&[("", D, 0), ("a", D, 0), ("a/x", F, 1), ("a/y", F, 2), ("b", D, 0), ("b/z", F, 3), ("c", F, 4)]);
-        let mut new = stream(&[("", D, 0), ("a", D, 0), ("a/w", F, 9), ("a/x", F, 1), ("b2", D, 0), ("b2/q", F, 3), ("c", F, 40), ("d", F, 1)]);
+        let base = stream(&[
+            ("", D, 0),
+            ("a", D, 0),
+            ("a/x", F, 1),
+            ("a/y", F, 2),
+            ("b", D, 0),
+            ("b/z", F, 3),
+            ("c", F, 4),
+        ]);
+        let mut new = stream(&[
+            ("", D, 0),
+            ("a", D, 0),
+            ("a/w", F, 9),
+            ("a/x", F, 1),
+            ("b2", D, 0),
+            ("b2/q", F, 3),
+            ("c", F, 40),
+            ("d", F, 1),
+        ]);
         // Keep identity of unchanged records except where we change them on purpose.
         for r in new.iter_mut() {
             if let Some(b) = base.iter().find(|b| b.name == r.name && b.depth == r.depth) {
@@ -398,7 +497,10 @@ mod tests {
                 r.file_id = b.file_id;
             }
         }
-        new.iter_mut().find(|r| r.name == crate::native::NativeName::unix(b"x".to_vec())).unwrap().flags = flags::HARDLINK_DUP;
+        new.iter_mut()
+            .find(|r| r.name == crate::native::NativeName::unix(b"x".to_vec()))
+            .unwrap()
+            .flags = flags::HARDLINK_DUP;
         roundtrip(base.clone(), new);
         roundtrip(base.clone(), base.clone());
         roundtrip(base.clone(), stream(&[("", D, 0)]));
@@ -410,22 +512,51 @@ mod tests {
         let base = stream(&[("", D, 0), ("a", F, 1)]);
         let bad = DeltaOp {
             kind: OpKind::Add,
-            parent: vec![b"/r".to_vec()],
-            record: Record { depth: 1, name: crate::native::NativeName::unix(b"a".to_vec()), ..Default::default() },
+            parent: vec![NativeName::unix(b"/r".to_vec())],
+            record: Record {
+                depth: 1,
+                name: crate::native::NativeName::unix(b"a".to_vec()),
+                ..Default::default()
+            },
         };
-        let r: io::Result<Vec<Record>> = Apply::new(boxed(base), Box::new(std::iter::once(Ok(bad)))).collect();
+        let r: io::Result<Vec<Record>> =
+            Apply::new(boxed(base), Box::new(std::iter::once(Ok(bad)))).collect();
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn allocation_incomparable_delta_preserves_target_records() {
+        let mut base = stream(&[("", D, 0), ("file", F, 10)]);
+        let mut target = base.clone();
+        base[1].size = 1;
+        target[1].size = 1;
+        target[1].alloc = 20;
+
+        let mut ops = Vec::new();
+        let mut builder = DeltaBuilder::with_allocated_deltas(
+            |op: &DeltaOp| {
+                ops.push(op.clone());
+                Ok(())
+            },
+            false,
+        );
+        crate::diff::merge(boxed(base.clone()), boxed(target.clone()), &mut builder).unwrap();
+
+        let rebuilt: Vec<Record> = Apply::new(boxed(base), Box::new(ops.into_iter().map(Ok)))
+            .collect::<io::Result<_>>()
+            .unwrap();
+        assert_eq!(rebuilt, target);
     }
 
     /// Random tree as canonical records: names from a small alphabet so that
     /// mutations collide with existing paths.
-    fn random_tree(rng: &mut fastrand::Rng, n: usize) -> Vec<(Vec<Vec<u8>>, bool, u64)> {
+    fn random_tree(rng: &mut fastrand::Rng, n: usize) -> Vec<(Vec<NativeName>, bool, u64)> {
         let mut set = std::collections::BTreeMap::new();
         for _ in 0..n {
             let depth = rng.usize(1..5);
-            let mut comps = vec![b"/r".to_vec()];
+            let mut comps = vec![NativeName::unix(b"/r".to_vec())];
             for _ in 0..depth {
-                comps.push(vec![b'a' + rng.u8(0..6)]);
+                comps.push(NativeName::unix(vec![b'a' + rng.u8(0..6)]));
             }
             // every prefix is a directory
             for d in 1..comps.len() {
@@ -434,7 +565,7 @@ mod tests {
             set.entry(comps).or_insert((false, rng.u64(0..10_000)));
         }
         // a path cannot be both a file and an ancestor: ancestors win
-        let keys: Vec<Vec<Vec<u8>>> = set.keys().cloned().collect();
+        let keys: Vec<Vec<NativeName>> = set.keys().cloned().collect();
         for k in &keys {
             for d in 1..k.len() {
                 if let Some(v) = set.get_mut(&k[..d]) {
@@ -443,20 +574,29 @@ mod tests {
                 }
             }
         }
-        let mut v: Vec<_> = set.into_iter().map(|(k, (dir, size))| (k, dir, size)).collect();
-        v.sort_by(|a, b| crate::paths::compare_paths(&a.0, &b.0));
+        let mut v: Vec<_> = set
+            .into_iter()
+            .map(|(k, (dir, size))| (k, dir, size))
+            .collect();
+        v.sort_by(|a, b| crate::paths::compare_paths(&a.0, &b.0).unwrap());
         v
     }
 
-    fn records(t: &[(Vec<Vec<u8>>, bool, u64)]) -> Vec<Record> {
+    fn records(t: &[(Vec<NativeName>, bool, u64)]) -> Vec<Record> {
         t.iter()
             .map(|(comps, dir, size)| Record {
                 depth: (comps.len() - 1) as u16,
-                name: crate::native::NativeName::unix(comps.last().unwrap().clone()),
+                name: comps.last().unwrap().clone(),
                 kind: if *dir { D } else { F },
                 size: *size,
                 alloc: size.div_ceil(4096) * 4096,
-                ino: comps.iter().map(|c| c[0] as u64).fold(7, |h, c| h * 31 + c),
+                ino: comps
+                    .iter()
+                    .map(|c| match c {
+                        NativeName::Unix(v) => v.first().copied().unwrap_or_default() as u64,
+                        NativeName::Windows(v) => v.first().copied().unwrap_or_default() as u64,
+                    })
+                    .fold(7, |h, c| h * 31 + c),
                 nlink: 1,
                 ..Default::default()
             })
@@ -470,14 +610,24 @@ mod tests {
             let (na, nb) = (rng.usize(1..60), rng.usize(1..60));
             let a = records(&random_tree(&mut rng, na));
             let b = records(&random_tree(&mut rng, nb));
-            let mut root = vec![Record { depth: 0, name: crate::native::NativeName::unix(b"/r".to_vec()), kind: D, ..Default::default() }];
+            let mut root = vec![Record {
+                depth: 0,
+                name: crate::native::NativeName::unix(b"/r".to_vec()),
+                kind: D,
+                ..Default::default()
+            }];
             let a: Vec<Record> = root.iter().cloned().chain(a).collect();
             root.extend(b);
             let b = root;
             roundtrip(a.clone(), b.clone());
-            let r = crate::diff::diff(boxed(a.clone()), boxed(b.clone()), Default::default()).unwrap();
+            let r =
+                crate::diff::diff(boxed(a.clone()), boxed(b.clone()), Default::default()).unwrap();
             let total = |v: &[Record]| v.iter().map(|r| r.alloc as i128).sum::<i128>();
-            assert_eq!(r.summary.net_allocated_bytes, total(&b) - total(&a), "round {round}");
+            assert_eq!(
+                r.summary.net_allocated_bytes,
+                total(&b) - total(&a),
+                "round {round}"
+            );
         }
     }
 }

@@ -61,7 +61,7 @@ struct IndexEntry {
     raw_len: u32,
     count: u32,
     crc: u32,
-    first_path: Vec<Vec<u8>>,
+    first_path: Vec<diskdrift_core::native::NativeName>,
 }
 
 struct FileWriter {
@@ -111,7 +111,7 @@ impl FileWriter {
             put_varint(&mut idx, e.raw_len as u64);
             put_varint(&mut idx, e.count as u64);
             idx.extend_from_slice(&e.crc.to_le_bytes());
-            blocks::encode_path(&e.first_path, &mut idx);
+            blocks::encode_path(&e.first_path, &mut idx)?;
         }
         self.out.write_all(&idx)?;
         let mut t = Vec::with_capacity(TRAILER);
@@ -390,14 +390,24 @@ impl Store for BinaryStore {
         Ok(out)
     }
 
-    fn read_prefix(&self, id: u32, prefix: &[Vec<u8>]) -> io::Result<RecordStream<'_>> {
+    fn read_prefix(
+        &self,
+        id: u32,
+        prefix: &[diskdrift_core::native::NativeName],
+    ) -> io::Result<RecordStream<'_>> {
         let f = File::open(self.data_path(id))?;
         let kind = file_kind(&f)?;
         let index = read_index(&f)?;
         // Last block whose first path is <= prefix: the prefix starts in it (or later).
-        let start = index.partition_point(|e| {
-            compare_paths(&e.first_path, prefix) != std::cmp::Ordering::Greater
-        });
+        let mut start: usize = 0;
+        for e in &index {
+            match compare_paths(&e.first_path, prefix)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            {
+                std::cmp::Ordering::Greater => break,
+                _ => start += 1,
+            }
+        }
         let start = start.saturating_sub(1);
         let tail: Vec<IndexEntry> = index[start..].to_vec();
         let ctx = match tail.first() {

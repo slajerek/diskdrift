@@ -4,12 +4,24 @@ use crate::careful::{CarefulOutcome, Held};
 use crate::core::units::{SizeUnits, format_size};
 
 /// Shown when careful mode starts.
+#[cfg(target_os = "macos")]
 pub const ON: &str = "Careful mode is on: an external disk connected now is not mounted, so nothing is written to it \
 (no repair, no journal replay, no Finder or Spotlight files). Disks mounted already are left as they are. \
 For a disk that really matters, a hardware write blocker is the only real guarantee.";
 
+/// The non-macOS fallback is kept neutral even though careful mode is unsupported there.
+#[cfg(not(target_os = "macos"))]
+pub const ON: &str = "Careful mode is on: an external disk connected now is not mounted, so nothing is written to it \
+(no automatic repair or filesystem changes). Disks mounted already are left as they are. \
+For a disk that really matters, a hardware write blocker is the only real guarantee.";
+
 /// Shown when it ends.
+#[cfg(target_os = "macos")]
 pub const OFF: &str = "Careful mode is off: macOS mounts disks normally again.";
+
+/// The non-macOS fallback is kept neutral even though careful mode is unsupported there.
+#[cfg(not(target_os = "macos"))]
+pub const OFF: &str = "Careful mode is off: disks mount normally again.";
 
 /// One line on a held volume: what it is and what the store knows.
 pub fn held(h: &Held, u: SizeUnits, now: i64) -> String {
@@ -18,7 +30,10 @@ pub fn held(h: &Held, u: SizeUnits, now: i64) -> String {
     if let Some(c) = v.capacity_bytes {
         facts.push(format_size(c, u));
     }
-    let device: Vec<&str> = [v.device.bus.as_deref(), v.device.model.as_deref()].into_iter().flatten().collect();
+    let device: Vec<&str> = [v.device.bus.as_deref(), v.device.model.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
     if !device.is_empty() {
         facts.push(device.join(" "));
     }
@@ -28,12 +43,22 @@ pub fn held(h: &Held, u: SizeUnits, now: i64) -> String {
     let what = match (&h.disk, &h.doubt) {
         (_, Some(why)) => format!("doubtful: {why}"),
         (Some(d), None) => match &h.last_scan {
-            Some(at) => format!("known disk {}, last scanned {}", d.display_name(), crate::text::search::scan_when(at, now)),
+            Some(at) => format!(
+                "known disk {}, last scanned {}",
+                d.display_name(),
+                crate::text::search::scan_when(at, now)
+            ),
             None => format!("known disk {}, never scanned", d.display_name()),
         },
         (None, None) => "a new disk".into(),
     };
-    format!("{} ({}) held back, not mounted: {} [{}]", h.name(), facts.join(", "), what, h.volume.bsd_name)
+    format!(
+        "{} ({}) held back, not mounted: {} [{}]",
+        h.name(),
+        facts.join(", "),
+        what,
+        h.volume.bsd_name
+    )
 }
 
 /// What a careful scan did, ending with whether the disk can be unplugged.

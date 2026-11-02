@@ -60,10 +60,11 @@ impl Rng {
 
 const T0: i64 = 1_760_000_000;
 const EXTS: [&[u8]; 16] = [
-    b".txt", b".js", b".png", b".json", b".h", b".c", b".rs", b".o", b".dylib", b".plist", b".jpg", b".py", b".md",
-    b".html", b".swift", b"",
+    b".txt", b".js", b".png", b".json", b".h", b".c", b".rs", b".o", b".dylib", b".plist", b".jpg",
+    b".py", b".md", b".html", b".swift", b"",
 ];
-const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const ALPHA: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyz0123456789_-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
 fn name_for(id: u64, dir: bool) -> Vec<u8> {
     let mut r = Rng(id);
@@ -71,7 +72,9 @@ fn name_for(id: u64, dir: bool) -> Vec<u8> {
     if r.next() % 10 < 3 {
         len += r.next() % 18;
     }
-    let mut n: Vec<u8> = (0..len).map(|_| ALPHA[(r.next() % ALPHA.len() as u64) as usize]).collect();
+    let mut n: Vec<u8> = (0..len)
+        .map(|_| ALPHA[(r.next() % ALPHA.len() as u64) as usize])
+        .collect();
     if !dir {
         n.extend_from_slice(EXTS[(r.next() % EXTS.len() as u64) as usize]);
     }
@@ -119,7 +122,13 @@ pub struct Gen {
 
 impl Gen {
     pub fn new(p: Params, version: u32) -> Gen {
-        Gen { rates: Rates::new(&p), p, version, stack: Vec::new(), started: false }
+        Gen {
+            rates: Rates::new(&p),
+            p,
+            version,
+            stack: Vec::new(),
+            started: false,
+        }
     }
 
     fn dir_record(&self, name: Vec<u8>, id: u64) -> Record {
@@ -140,8 +149,16 @@ impl Gen {
         let mut r = Rng(id ^ 0xF11E);
         let base = (8.7 + 2.6 * r.normal()).exp().min(64e9) as u64;
         let v = self.version as u64;
-        let size = if hot && v > 0 { (base as f64 * (0.5 + unit(h2(id, v)))) as u64 } else { base };
-        let mtime = if hot && v > 0 { T0 + v as i64 * 3600 } else { T0 - (mix(id ^ 7) % 90_000_000) as i64 };
+        let size = if hot && v > 0 {
+            (base as f64 * (0.5 + unit(h2(id, v)))) as u64
+        } else {
+            base
+        };
+        let mtime = if hot && v > 0 {
+            T0 + v as i64 * 3600
+        } else {
+            T0 - (mix(id ^ 7) % 90_000_000) as i64
+        };
         Record {
             name: diskdrift_core::native::NativeName::unix(name),
             kind: Kind::File,
@@ -166,11 +183,18 @@ impl Gen {
         if depth >= 16 {
             k = avail.min(20_000);
         }
-        let nd = if avail > k { ((k as f64 * 0.18).round() as u64).clamp(1, k) } else { 0 };
+        let nd = if avail > k {
+            ((k as f64 * 0.18).round() as u64).clamp(1, k)
+        } else {
+            0
+        };
         let rest = avail - k;
         let weights: Vec<f64> = (0..nd).map(|_| rng.f().max(1e-6).powf(-1.2)).collect();
         let wsum: f64 = weights.iter().sum();
-        let mut budgets: Vec<u64> = weights.iter().map(|w| 1 + (rest as f64 * w / wsum) as u64).collect();
+        let mut budgets: Vec<u64> = weights
+            .iter()
+            .map(|w| 1 + (rest as f64 * w / wsum) as u64)
+            .collect();
         let given: u64 = budgets.iter().sum::<u64>() - nd;
         if let Some(b) = budgets.first_mut() {
             *b += rest - given.min(rest);
@@ -183,7 +207,11 @@ impl Gen {
             let id = h2(dir_id, i);
             if i < nd {
                 let rec = self.dir_record(name_for(id, true), id);
-                out.push(Child { rec, budget: budgets[i as usize], id });
+                out.push(Child {
+                    rec,
+                    budget: budgets[i as usize],
+                    id,
+                });
                 continue;
             }
             let u = |salt: u64| unit(h2(id, salt));
@@ -208,8 +236,16 @@ impl Gen {
                 let mut twin = owner.clone();
                 twin.name.extend_from_slice(b".lnk");
                 twin.flags = flags::HARDLINK_DUP;
-                out.push(Child { rec: owner, budget: 0, id });
-                out.push(Child { rec: twin, budget: 0, id });
+                out.push(Child {
+                    rec: owner,
+                    budget: 0,
+                    id,
+                });
+                out.push(Child {
+                    rec: twin,
+                    budget: 0,
+                    id,
+                });
             } else {
                 out.push(Child { rec, budget: 0, id });
             }
@@ -223,7 +259,11 @@ impl Gen {
             if v >= born {
                 let mut name = name_for(id, false);
                 name.extend_from_slice(b".new");
-                out.push(Child { rec: self.file_record(name, id, false), budget: 0, id });
+                out.push(Child {
+                    rec: self.file_record(name, id, false),
+                    budget: 0,
+                    id,
+                });
             }
         }
         out.sort_by(|a, b| a.rec.name.cmp(&b.rec.name));
@@ -247,7 +287,10 @@ impl Iterator for Gen {
             self.started = true;
             let root = self.dir_record(b"/synthetic".to_vec(), 0);
             let children = self.children(0, self.p.entries, 1);
-            self.stack.push(Frame { children: children.into_iter(), depth: 0 });
+            self.stack.push(Frame {
+                children: children.into_iter(),
+                depth: 0,
+            });
             return Some(root);
         }
         loop {
@@ -262,7 +305,10 @@ impl Iterator for Gen {
                     rec.depth = depth;
                     if rec.kind == Kind::Dir {
                         let children = self.children(c.id, c.budget, depth + 1);
-                        self.stack.push(Frame { children: children.into_iter(), depth });
+                        self.stack.push(Frame {
+                            children: children.into_iter(),
+                            depth,
+                        });
                     }
                     return Some(rec);
                 }
@@ -278,18 +324,27 @@ mod tests {
 
     #[test]
     fn deterministic_canonical_and_sized() {
-        let p = Params { entries: 50_000, seed: 1, change: 0.01, horizon: 100 };
+        let p = Params {
+            entries: 50_000,
+            seed: 1,
+            change: 0.01,
+            horizon: 100,
+        };
         let a: Vec<Record> = Gen::new(p, 0).collect();
         let b: Vec<Record> = Gen::new(p, 0).collect();
         assert_eq!(a, b);
-        assert!((a.len() as f64 - 50_000.0).abs() < 2_500.0, "got {}", a.len());
+        assert!(
+            (a.len() as f64 - 50_000.0).abs() < 2_500.0,
+            "got {}",
+            a.len()
+        );
         let mut stack = PathStack::new();
-        let mut prev: Option<Vec<Vec<u8>>> = None;
+        let mut prev: Option<Vec<diskdrift_core::native::NativeName>> = None;
         for r in &a {
-            stack.set(r.depth, r.name.as_unix_bytes().unwrap_or_default()).unwrap();
+            stack.set(r.depth, &r.name).unwrap();
             let cur = stack.components().to_vec();
             if let Some(p) = &prev {
-                assert_eq!(compare_paths(p, &cur), std::cmp::Ordering::Less);
+                assert_eq!(compare_paths(p, &cur).unwrap(), std::cmp::Ordering::Less);
             }
             prev = Some(cur);
         }
@@ -298,12 +353,20 @@ mod tests {
     #[test]
     fn change_rate_is_roughly_calibrated() {
         for change in [0.01, 0.1, 0.5] {
-            let p = Params { entries: 100_000, seed: 2, change, horizon: 1 };
+            let p = Params {
+                entries: 100_000,
+                seed: 2,
+                change,
+                horizon: 1,
+            };
             let a = Box::new(Gen::new(p, 0).map(Ok));
             let b = Box::new(Gen::new(p, 1).map(Ok));
             let ops = diskdrift_core::delta::compute(a, b).unwrap();
             let ratio = ops.len() as f64 / 100_000.0;
-            assert!(ratio > change * 0.5 && ratio < change * 1.5, "change {change}: ratio {ratio}");
+            assert!(
+                ratio > change * 0.5 && ratio < change * 1.5,
+                "change {change}: ratio {ratio}"
+            );
         }
     }
 }

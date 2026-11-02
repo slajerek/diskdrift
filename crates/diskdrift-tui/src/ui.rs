@@ -1,25 +1,38 @@
 //! Rendering. Every screen renders only what fits; long lists are sliced to the
 //! visible window before building widgets.
 
-use crate::app::{AnalysisView, App, BrowseData, BrowseSource, DIFF_LIMIT, DIFF_TABS, DiffFocus, DiffTab, FindRow, Job, TopFocus, LogLine, MenuItem, DISKS_MENU, EXPLORE_MENU, DISKDRIFT_MENU, ScanField, ScanStage, Screen, TopView};
-use diskdrift_app::storage::Strength;
-use diskdrift_app::text::browse::{child_changed, child_detail, child_name, child_size, diff_change, diff_detail, share};
-use diskdrift_app::diagnostics::classify::verdict;
-use diskdrift_app::diagnostics::suspects::Risk;
-use diskdrift_app::diagnostics::usage::is_low;
-use diskdrift_app::text::analyze::{has_owners, item_changed, item_detail, item_owner, item_size, shown_verdict};
+use crate::app::{
+    AnalysisView, App, BrowseData, BrowseSource, DIFF_LIMIT, DIFF_TABS, DISKDRIFT_MENU, DISKS_MENU,
+    DiffFocus, DiffTab, EXPLORE_MENU, FindRow, Job, LogLine, MenuItem, ScanField, ScanStage,
+    Screen, TopFocus, TopView,
+};
+use diskdrift_app::config::FieldKind;
 use diskdrift_app::core::diff::{Change, DiffItem, DiffSort};
+use diskdrift_app::core::measurement::Quality;
 use diskdrift_app::core::top::{SizeMetric, TopItem};
 use diskdrift_app::core::units::{SizeUnits, format_count, format_delta, format_size};
-use diskdrift_app::text::table::ellipsize_start;
+use diskdrift_app::core::walk::Progress;
+use diskdrift_app::diagnostics::classify::verdict;
+use diskdrift_app::diagnostics::suspects::MeasureStatus;
+use diskdrift_app::diagnostics::suspects::Risk;
+use diskdrift_app::diagnostics::usage::is_low;
 use diskdrift_app::snapshots::{self, SnapshotRow};
+use diskdrift_app::storage::Strength;
 use diskdrift_app::storage::{SnapshotMeta, Status};
 use diskdrift_app::text;
-use diskdrift_app::config::FieldKind;
+use diskdrift_app::text::analyze::{
+    has_owners, item_changed, item_detail, item_owner, item_size, shown_verdict,
+};
+use diskdrift_app::text::browse::{
+    child_changed, child_detail, child_name, child_size, diff_change, diff_detail, share,
+};
+use diskdrift_app::text::snapshots::{
+    diff_delta, diff_new_size, diff_old_size, top_size, top_total_size,
+};
+use diskdrift_app::text::table::ellipsize_start;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use diskdrift_app::diagnostics::suspects::MeasureStatus;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap};
 use std::sync::atomic::Ordering;
@@ -32,16 +45,31 @@ fn units(app: &App) -> SizeUnits {
     app.settings.size_units.value
 }
 
+fn progress_size(progress: &Progress, u: SizeUnits) -> String {
+    let (bytes, quality) = progress.allocated_measurement();
+    match (quality, bytes) {
+        (Quality::Observed, Some(bytes)) => format_size(bytes, u),
+        (Quality::LowerBound, Some(bytes)) => format!("≥ {}", format_size(bytes, u)),
+        _ => "unknown".into(),
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
-    let [header, body, footer] =
-        Layout::vertical([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)]).areas(area);
+    let [header, body, footer] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     draw_header(f, app, header);
     match app.screen {
         Screen::Dashboard => draw_dashboard(f, app, body),
         Screen::Usage => draw_job_text(f, app, body, &app.usage, usage_text),
         Screen::Doctor if app.doctor.is_running() => draw_measuring(f, app, body),
-        Screen::Doctor => draw_job_text(f, app, body, &app.doctor, |r, a| text::doctor_summary_first(r, units(a))),
+        Screen::Doctor => draw_job_text(f, app, body, &app.doctor, |r, a| {
+            text::doctor_summary_first(r, units(a))
+        }),
         Screen::Help => draw_text(f, app, body, &help_text(app)),
         Screen::Scan => draw_scan(f, app, body),
         Screen::Snapshots => draw_snapshots(f, app, body),
@@ -79,33 +107,66 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled(" DiskDrift ", Style::new().fg(Color::Black).bg(ACCENT).bold())];
+    let mut spans = vec![Span::styled(
+        " DiskDrift ",
+        Style::new().fg(Color::Black).bg(ACCENT).bold(),
+    )];
     // Where you are comes first: on a narrow terminal the volume figures are cut, not this.
     if app.screen != Screen::Dashboard {
-        spans.push(Span::styled(format!(" › {}", app.screen.title()), Style::new().fg(ACCENT).bold()));
+        spans.push(Span::styled(
+            format!(" › {}", app.screen.title()),
+            Style::new().fg(ACCENT).bold(),
+        ));
     }
     if let Some(d) = &app.disk_filter
-        && matches!(app.screen, Screen::Snapshots | Screen::Diff | Screen::Top | Screen::Scan | Screen::Browse | Screen::Find)
+        && matches!(
+            app.screen,
+            Screen::Snapshots
+                | Screen::Diff
+                | Screen::Top
+                | Screen::Scan
+                | Screen::Browse
+                | Screen::Find
+        )
     {
-        spans.push(Span::styled(format!(" · {}", d.label()), Style::new().fg(Color::Yellow).bold()));
+        spans.push(Span::styled(
+            format!(" · {}", d.label()),
+            Style::new().fg(Color::Yellow).bold(),
+        ));
     }
     // Careful mode changes how macOS mounts disks: always visible while on.
     if app.careful.is_on() && app.screen != Screen::Careful {
-        spans.push(Span::styled(" CAREFUL MODE ", Style::new().fg(Color::White).bg(Color::Red).bold()));
+        spans.push(Span::styled(
+            " CAREFUL MODE ",
+            Style::new().fg(Color::White).bg(Color::Red).bold(),
+        ));
     }
     spans.push(Span::raw("   "));
     match &app.usage {
         Job::Done(u) => {
             if let Some(v) = u.primary() {
-                let avail = v.available_important_bytes.unwrap_or(v.available_bytes);
                 // Narrow: the volume name goes, the free space and the warning stay.
                 if area.width >= 100 {
-                    spans.push(Span::raw(format!("{} · {}   ", v.name, v.fs_type.to_uppercase())));
+                    spans.push(Span::raw(format!(
+                        "{} · {}   ",
+                        v.name,
+                        v.fs_type.to_uppercase()
+                    )));
                 }
                 spans.push(Span::raw("Available: "));
-                spans.push(Span::styled(format_size(avail, units(app)), Style::new().bold()));
-                if is_low(avail, v.total_bytes) {
-                    spans.push(Span::styled("   [!] Low", Style::new().fg(Color::Red).bold()));
+                if let Some(avail) = v.available_important_bytes.or(v.available_bytes) {
+                    spans.push(Span::styled(
+                        format_size(avail, units(app)),
+                        Style::new().bold(),
+                    ));
+                    if v.total_bytes.is_some_and(|total| is_low(avail, total)) {
+                        spans.push(Span::styled(
+                            "   [!] Low",
+                            Style::new().fg(Color::Red).bold(),
+                        ));
+                    }
+                } else {
+                    spans.push(Span::styled("unknown", Style::new().bold()));
                 }
             }
         }
@@ -113,25 +174,48 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         Job::Failed(e) => spans.push(Span::styled(e.clone(), Style::new().fg(Color::Red))),
         Job::Idle => {}
     }
-    if let Some(e) = app.disk_event.as_ref().filter(|_| app.screen != Screen::Dashboard && app.disk_event_is_recent()) {
-        spans.push(Span::styled(format!("   [{}]", clip(&e.text, 60)), Style::new().fg(Color::Yellow)));
+    if let Some(e) = app
+        .disk_event
+        .as_ref()
+        .filter(|_| app.screen != Screen::Dashboard && app.disk_event_is_recent())
+    {
+        spans.push(Span::styled(
+            format!("   [{}]", clip(&e.text, 60)),
+            Style::new().fg(Color::Yellow),
+        ));
     }
     if app.auto_scan_running() {
-        spans.push(Span::styled("   [background scan · S shows it · x stops]", Style::new().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            "   [background scan · S shows it · x stops]",
+            Style::new().fg(Color::Yellow),
+        ));
     } else if app.scan_running() && app.screen != Screen::Scan {
-        spans.push(Span::styled("   [scanning…]", Style::new().fg(Color::Yellow)));
+        spans.push(Span::styled(
+            "   [scanning…]",
+            Style::new().fg(Color::Yellow),
+        ));
     }
-    let p = Paragraph::new(Line::from(spans)).block(Block::new().borders(Borders::ALL).border_style(Style::new().fg(ACCENT)));
+    let p = Paragraph::new(Line::from(spans)).block(
+        Block::new()
+            .borders(Borders::ALL)
+            .border_style(Style::new().fg(ACCENT)),
+    );
     f.render_widget(p, area);
 }
 
 /// The disks panel of the dashboard: every disk the store knows and the new
 /// volumes connected now, newest scan first (spec 3A, item 1).
 fn disk_panel_lines(app: &App, max: usize, width: u16) -> Vec<Line<'static>> {
-    let Some(l) = app.disks.list.done() else { return Vec::new() };
+    let Some(l) = app.disks.list.done() else {
+        return Vec::new();
+    };
     let u = units(app);
     let now = chrono::Local::now().timestamp();
-    let ago = |rfc: &str| chrono::DateTime::parse_from_rfc3339(rfc).map(|t| diskdrift_app::analyze::ago(now - t.timestamp())).unwrap_or_else(|_| rfc.into());
+    let ago = |rfc: &str| {
+        chrono::DateTime::parse_from_rfc3339(rfc)
+            .map(|t| diskdrift_app::analyze::ago(now - t.timestamp()))
+            .unwrap_or_else(|_| rfc.into())
+    };
     let mut lines: Vec<Line> = l
         .disks
         .iter()
@@ -139,21 +223,37 @@ fn disk_panel_lines(app: &App, max: usize, width: u16) -> Vec<Line<'static>> {
         .map(|r| {
             let name = format!(" {:<16} ", clip(r.disk.display_name(), 16));
             let (state, rest) = match (r.known, &r.last_scan) {
-                (false, _) => ("new".to_string(), "not scanned · K to label or scan it".to_string()),
+                (false, _) => (
+                    "new".to_string(),
+                    "not scanned · K to label or scan it".to_string(),
+                ),
                 (true, Some(s)) => (
-                    if r.connected { "connected".into() } else { "not connected".into() },
+                    if r.connected {
+                        "connected".into()
+                    } else {
+                        "not connected".into()
+                    },
                     format!(
                         "scanned {}{}",
                         ago(s),
                         // The size is of the folder that scan covered, which may not be the whole disk.
                         r.last_size
                             .map(|b| {
-                                let whole = r.last_root.as_deref() == r.mount_point.as_deref().and_then(|p| p.to_str()) || r.last_root.as_deref() == Some("/");
+                                let whole = r.last_root.as_deref()
+                                    == r.mount_point.as_deref().and_then(|p| p.to_str())
+                                    || r.last_root.as_deref() == Some("/");
                                 let home = app.settings.home.display().to_string();
                                 let place = match r.last_root.as_deref() {
                                     Some(_) if whole => "on the disk".to_string(),
                                     // What is left of the line after the name, the state and "scanned … · size in … then".
-                                    Some(root) => format!("in {}", home_path(root, &home, width.saturating_sub(2 + 33 + 34).max(12))),
+                                    Some(root) => format!(
+                                        "in {}",
+                                        home_path(
+                                            root,
+                                            &home,
+                                            width.saturating_sub(2 + 33 + 34).max(12)
+                                        )
+                                    ),
                                     None => "in it".to_string(),
                                 };
                                 format!(" · {} {place}", format_size(b, u))
@@ -161,14 +261,28 @@ fn disk_panel_lines(app: &App, max: usize, width: u16) -> Vec<Line<'static>> {
                             .unwrap_or_default()
                     ),
                 ),
-                (true, None) => (if r.connected { "connected".into() } else { "not connected".into() }, "no scan yet".into()),
+                (true, None) => (
+                    if r.connected {
+                        "connected".into()
+                    } else {
+                        "not connected".into()
+                    },
+                    "no scan yet".into(),
+                ),
             };
-            let style = if r.connected { Style::new() } else { Style::new().fg(Color::DarkGray) };
+            let style = if r.connected {
+                Style::new()
+            } else {
+                Style::new().fg(Color::DarkGray)
+            };
             Line::styled(format!("{name}{state:<14} {rest}"), style)
         })
         .collect();
     if l.disks.len() > max {
-        lines.push(Line::styled(format!(" … and {} more: K (My disks)", l.disks.len() - max), Style::new().fg(Color::DarkGray)));
+        lines.push(Line::styled(
+            format!(" … and {} more: K (My disks)", l.disks.len() - max),
+            Style::new().fg(Color::DarkGray),
+        ));
     }
     lines
 }
@@ -182,17 +296,26 @@ fn draw_menu_group(
     start_index: usize,
     horizontal: bool,
 ) {
-    let block = Block::bordered().border_style(Style::new().fg(GROUP_BORDER)).title(title);
+    let block = Block::bordered()
+        .border_style(Style::new().fg(GROUP_BORDER))
+        .title(title);
     let inner = block.inner(area);
     let label_style = |selected| {
         if selected {
-            Style::new().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)
+            Style::new()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::new()
         }
     };
     let label = |item: MenuItem, index: usize| {
-        let marker = if start_index + index == app.menu_index { "> " } else { "  " };
+        let marker = if start_index + index == app.menu_index {
+            "> "
+        } else {
+            "  "
+        };
         format!("{marker}[{}] {}", item.hotkey(), item.title())
     };
     let lines = if horizontal {
@@ -238,20 +361,82 @@ fn draw_dashboard_menu(f: &mut Frame, app: &App, area: Rect) {
         let task_width = area.width.saturating_sub(2) / 2;
         let group = selected_menu_group(app.menu_index);
         if area.height >= 11 {
-            let left = Rect { x: area.x, y: area.y, width: task_width, height: 8 };
-            let right = Rect { x: area.x + task_width + 2, y: area.y, width: task_width, height: 8 };
-            let diskdrift = Rect { x: area.x, y: area.y + 8, width: area.width, height: 3 };
+            let left = Rect {
+                x: area.x,
+                y: area.y,
+                width: task_width,
+                height: 8,
+            };
+            let right = Rect {
+                x: area.x + task_width + 2,
+                y: area.y,
+                width: task_width,
+                height: 8,
+            };
+            let diskdrift = Rect {
+                x: area.x,
+                y: area.y + 8,
+                width: area.width,
+                height: 3,
+            };
             draw_menu_group(f, app, left, "Disks & snapshots", &DISKS_MENU, 0, false);
-            draw_menu_group(f, app, right, "Explore & diagnose", &EXPLORE_MENU, DISKS_MENU.len(), false);
-            draw_menu_group(f, app, diskdrift, "DiskDrift", &DISKDRIFT_MENU, DISKS_MENU.len() + EXPLORE_MENU.len(), true);
+            draw_menu_group(
+                f,
+                app,
+                right,
+                "Explore & diagnose",
+                &EXPLORE_MENU,
+                DISKS_MENU.len(),
+                false,
+            );
+            draw_menu_group(
+                f,
+                app,
+                diskdrift,
+                "DiskDrift",
+                &DISKDRIFT_MENU,
+                DISKS_MENU.len() + EXPLORE_MENU.len(),
+                true,
+            );
         } else if group == 2 {
-            let diskdrift = Rect { x: area.x, y: area.y, width: area.width, height: 3.min(area.height) };
-            draw_menu_group(f, app, diskdrift, "DiskDrift", &DISKDRIFT_MENU, DISKS_MENU.len() + EXPLORE_MENU.len(), true);
+            let diskdrift = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: 3.min(area.height),
+            };
+            draw_menu_group(
+                f,
+                app,
+                diskdrift,
+                "DiskDrift",
+                &DISKDRIFT_MENU,
+                DISKS_MENU.len() + EXPLORE_MENU.len(),
+                true,
+            );
         } else {
-            let left = Rect { x: area.x, y: area.y, width: task_width, height: task_height };
-            let right = Rect { x: area.x + task_width + 2, y: area.y, width: task_width, height: task_height };
+            let left = Rect {
+                x: area.x,
+                y: area.y,
+                width: task_width,
+                height: task_height,
+            };
+            let right = Rect {
+                x: area.x + task_width + 2,
+                y: area.y,
+                width: task_width,
+                height: task_height,
+            };
             draw_menu_group(f, app, left, "Disks & snapshots", &DISKS_MENU, 0, false);
-            draw_menu_group(f, app, right, "Explore & diagnose", &EXPLORE_MENU, DISKS_MENU.len(), false);
+            draw_menu_group(
+                f,
+                app,
+                right,
+                "Explore & diagnose",
+                &EXPLORE_MENU,
+                DISKS_MENU.len(),
+                false,
+            );
         }
         return;
     }
@@ -259,7 +444,12 @@ fn draw_dashboard_menu(f: &mut Frame, app: &App, area: Rect) {
     let groups = [
         ("Disks & snapshots", &DISKS_MENU[..], 0, 6),
         ("Explore & diagnose", &EXPLORE_MENU[..], DISKS_MENU.len(), 8),
-        ("DiskDrift", &DISKDRIFT_MENU[..], DISKS_MENU.len() + EXPLORE_MENU.len(), 5),
+        (
+            "DiskDrift",
+            &DISKDRIFT_MENU[..],
+            DISKS_MENU.len() + EXPLORE_MENU.len(),
+            5,
+        ),
     ];
     let heights = [6u16, 8, 5];
     let selected = selected_menu_group(app.menu_index);
@@ -281,7 +471,20 @@ fn draw_dashboard_menu(f: &mut Frame, app: &App, area: Rect) {
             continue;
         }
         let height = height.min(area.bottom().saturating_sub(y));
-        draw_menu_group(f, app, Rect { x: area.x, y, width: area.width, height }, title, items, start_index, false);
+        draw_menu_group(
+            f,
+            app,
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height,
+            },
+            title,
+            items,
+            start_index,
+            false,
+        );
         y += height;
     }
 }
@@ -298,7 +501,10 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
     let (mut menu_h, status_h) = if area.height >= ideal_menu_h + preferred_status_h {
         (ideal_menu_h, preferred_status_h)
     } else if area.height >= ideal_menu_h + 3 {
-        (ideal_menu_h, (area.height - ideal_menu_h).min(preferred_status_h))
+        (
+            ideal_menu_h,
+            (area.height - ideal_menu_h).min(preferred_status_h),
+        )
     } else if area.height >= selected_menu_h + 3 {
         (area.height - 3, 3)
     } else {
@@ -318,15 +524,26 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
-    let disks_h = if disk_lines.is_empty() { 0 } else { available_disks_h };
+    let disks_h = if disk_lines.is_empty() {
+        0
+    } else {
+        available_disks_h
+    };
     if disks_h == 0 {
         menu_h = area.height.saturating_sub(status_h);
     }
-    let [menu_area, disks_area, status_area] =
-        Layout::vertical([Constraint::Length(menu_h), Constraint::Length(disks_h), Constraint::Length(status_h)]).areas(area);
+    let [menu_area, disks_area, status_area] = Layout::vertical([
+        Constraint::Length(menu_h),
+        Constraint::Length(disks_h),
+        Constraint::Length(status_h),
+    ])
+    .areas(area);
     draw_dashboard_menu(f, app, menu_area);
     if disks_h > 0 {
-        f.render_widget(Paragraph::new(disk_lines).block(Block::bordered().title(" Disks ")), disks_area);
+        f.render_widget(
+            Paragraph::new(disk_lines).block(Block::bordered().title(" Disks ")),
+            disks_area,
+        );
     }
 
     if status_h == 0 {
@@ -334,14 +551,20 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
     }
     let s = &app.settings;
     let status = vec![
-        Line::from(vec![Span::raw(" Last scan: "), Span::styled(last_scan_text(app), Style::new().bold())]),
+        Line::from(vec![
+            Span::raw(" Last scan: "),
+            Span::styled(last_scan_text(app), Style::new().bold()),
+        ]),
         Line::raw(format!(" Latest change: {}", latest_change_text(app))),
         Line::raw(format!(" Storage: {}", s.storage_path.value.display())),
         scan_status_line(app),
     ];
     let mut status = status;
     if let Some(e) = &app.disk_event {
-        status.push(Line::styled(format!(" {} {}", e.at, e.text), Style::new().fg(Color::Yellow)));
+        status.push(Line::styled(
+            format!(" {} {}", e.at, e.text),
+            Style::new().fg(Color::Yellow),
+        ));
     }
     f.render_widget(Paragraph::new(status).block(Block::bordered()), status_area);
 }
@@ -349,40 +572,72 @@ fn draw_dashboard(f: &mut Frame, app: &App, area: Rect) {
 /// The scan running now (live counters and an estimate against the previous
 /// scan), or what the automatic scan did.
 fn scan_status_line(app: &App) -> Line<'static> {
-    if let ScanStage::Running { progress, started, root, auto, expected } = &app.scan {
+    if let ScanStage::Running {
+        progress,
+        started,
+        root,
+        auto,
+        expected,
+    } = &app.scan
+    {
         let n = progress.entries.load(Ordering::Relaxed);
-        let pct = expected.filter(|&e| e > 0).map(|e| format!(" · ~{:.0}% of the last scan's entries", (n as f64 * 100.0 / e as f64).min(99.0))).unwrap_or_default();
+        let pct = expected
+            .filter(|&e| e > 0)
+            .map(|e| {
+                format!(
+                    " · ~{:.0}% of the last scan's entries",
+                    (n as f64 * 100.0 / e as f64).min(99.0)
+                )
+            })
+            .unwrap_or_default();
         let label = if *auto { "Background scan" } else { "Scan" };
-        let stop = if *auto { " · x stops it" } else { " · S to watch · x stops it" };
+        let stop = if *auto {
+            " · x stops it"
+        } else {
+            " · S to watch · x stops it"
+        };
         return Line::from(vec![
             Span::styled(format!(" {label}: "), Style::new().fg(Color::Yellow).bold()),
             Span::raw(format!(
                 "{root} · {} entries · {}{pct} · {:.0}s{stop}",
                 format_count(n),
-                format_size(progress.bytes_alloc.load(Ordering::Relaxed), units(app)),
+                progress_size(progress, units(app)),
                 started.elapsed().as_secs_f64()
             )),
         ]);
     }
     match &app.auto_status {
-        Some(m) => Line::styled(format!(" {}", capitalize(m)), Style::new().fg(Color::DarkGray)),
+        Some(m) => Line::styled(
+            format!(" {}", capitalize(m)),
+            Style::new().fg(Color::DarkGray),
+        ),
         None => Line::raw(""),
     }
 }
 
 fn capitalize(s: &str) -> String {
     let mut c = s.chars();
-    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+    c.next()
+        .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
 }
 
 fn short_time(rfc: &str) -> String {
-    rfc.get(..16).map(|s| s.replace('T', " ")).unwrap_or_else(|| rfc.to_string())
+    rfc.get(..16)
+        .map(|s| s.replace('T', " "))
+        .unwrap_or_else(|| rfc.to_string())
 }
 
 fn last_scan_text(app: &App) -> String {
     match &app.snapshots {
         // The latest with data: a cancelled or failed one is not "the last scan".
-        Job::Done(l) => match l.snapshots.iter().rev().find(|r| r.meta.status.is_usable()).or(l.snapshots.last()) {
+        Job::Done(l) => match l
+            .snapshots
+            .iter()
+            .rev()
+            .find(|r| r.meta.status.is_usable())
+            .or(l.snapshots.last())
+        {
             Some(r) => {
                 let m = &r.meta;
                 let cov = match m.status {
@@ -405,17 +660,40 @@ fn latest_change_text(app: &App) -> String {
         return "needs two scans (press D to compare once you have them)".into();
     }
     let (a, b) = (&u[u.len() - 2].meta, &u[u.len() - 1].meta);
-    let tracked = |m: &diskdrift_app::storage::SnapshotMeta| m.counts.as_ref().map(|c| c.allocated_bytes as i128).unwrap_or(0);
+    let tracked = |m: &diskdrift_app::storage::SnapshotMeta| {
+        m.counts
+            .as_ref()
+            .map(|c| c.allocated_bytes as i128)
+            .unwrap_or(0)
+    };
     let free = match (&a.space_after, &b.space_after) {
-        (Some(x), Some(y)) => format!(", OS free {}", format_delta(y.free_bytes as i128 - x.free_bytes as i128, units(app))),
+        (Some(x), Some(y)) => x
+            .free_bytes
+            .zip(y.free_bytes)
+            .map(|(old, new)| {
+                format!(
+                    ", OS free {}",
+                    format_delta(new as i128 - old as i128, units(app))
+                )
+            })
+            .unwrap_or_else(|| ", OS free unknown".into()),
         _ => String::new(),
     };
-    format!("{} → {}: tracked {}{free}", a.name, b.name, format_delta(tracked(b) - tracked(a), units(app)))
+    format!(
+        "{} → {}: tracked {}{free}",
+        a.name,
+        b.name,
+        format_delta(tracked(b) - tracked(a), units(app))
+    )
 }
 
 /// The answer first, then the full table.
 fn usage_text(r: &diskdrift_app::diagnostics::usage::UsageReport, app: &App) -> String {
-    let at = app.usage_at.as_deref().map(|t| format!(" (read at {t}; F5 reads again)")).unwrap_or_default();
+    let at = app
+        .usage_at
+        .as_deref()
+        .map(|t| format!(" (read at {t}; F5 reads again)"))
+        .unwrap_or_default();
     let mut out = format!("In short{at}:\n");
     for l in text::usage_summary(r, units(app)) {
         out.push_str(&format!("  • {l}\n"));
@@ -425,10 +703,21 @@ fn usage_text(r: &diskdrift_app::diagnostics::usage::UsageReport, app: &App) -> 
     out
 }
 
-fn draw_job_text<T>(f: &mut Frame, app: &App, area: Rect, job: &Job<T>, render: impl Fn(&T, &App) -> String) {
+fn draw_job_text<T>(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    job: &Job<T>,
+    render: impl Fn(&T, &App) -> String,
+) {
     match job {
         Job::Idle => draw_text(f, app, area, "Starting…"),
-        Job::Running(msg) => draw_text(f, app, area, &format!("{msg}\n\nEsc goes back; the task keeps running.")),
+        Job::Running(msg) => draw_text(
+            f,
+            app,
+            area,
+            &format!("{msg}\n\nEsc goes back; the task keeps running."),
+        ),
         Job::Failed(e) => draw_text(f, app, area, &format!("Failed: {e}")),
         Job::Done(r) => draw_text(f, app, area, &render(r, app)),
     }
@@ -437,7 +726,9 @@ fn draw_job_text<T>(f: &mut Frame, app: &App, area: Rect, job: &Job<T>, render: 
 /// Rows `text` takes when wrapped to `width` columns.
 fn wrapped_rows(text: &str, width: u16) -> u16 {
     let w = width.max(1) as usize;
-    text.lines().map(|l| l.chars().count().max(1).div_ceil(w) as u16).sum()
+    text.lines()
+        .map(|l| l.chars().count().max(1).div_ceil(w) as u16)
+        .sum()
 }
 
 /// Long lines wrap rather than being cut: nothing of a report is lost.
@@ -458,7 +749,11 @@ fn draw_scan(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let home = app.settings.home.display().to_string();
-    let store = home_path(&app.settings.storage_path.value.display().to_string(), &home, inner.width.saturating_sub(20));
+    let store = home_path(
+        &app.settings.storage_path.value.display().to_string(),
+        &home,
+        inner.width.saturating_sub(20),
+    );
     let dim = Style::new().fg(Color::DarkGray);
     // What the previous scan of this folder took: how long this one will.
     let last_time = |root: &str| match app.last_scan_of(root) {
@@ -467,7 +762,7 @@ fn draw_scan(f: &mut Frame, app: &App, area: Rect) {
                 "{}: {} entries, {}, took {:.0} s",
                 scan_title(&m),
                 format_count(c.entries),
-                format_size(c.allocated_bytes, u),
+                text::snapshots::scan_size(c, c.allocated_bytes, u),
                 c.elapsed_ms as f64 / 1000.0
             ),
             None => scan_title(&m),
@@ -476,83 +771,190 @@ fn draw_scan(f: &mut Frame, app: &App, area: Rect) {
     };
     let mut lines: Vec<Line> = Vec::new();
     match &app.scan {
-        ScanStage::Setup { root, name, field, error } => {
+        ScanStage::Setup {
+            root,
+            name,
+            field,
+            error,
+        } => {
             let fieldline = |label: &str, value: &str, active: bool| {
-                let style = if active { Style::new().fg(Color::Black).bg(ACCENT) } else { Style::new().add_modifier(Modifier::UNDERLINED) };
+                let style = if active {
+                    Style::new().fg(Color::Black).bg(ACCENT)
+                } else {
+                    Style::new().add_modifier(Modifier::UNDERLINED)
+                };
                 Line::from(vec![
                     Span::raw(format!(" {label:<18}")),
                     Span::styled(format!("{value}{}", if active { "▏" } else { " " }), style),
                 ])
             };
-            let note = |text: String, style: Style| Line::styled(format!(" {:<18}{text}", ""), style);
+            let note =
+                |text: String, style: Style| Line::styled(format!(" {:<18}{text}", ""), style);
             lines.push(Line::raw(""));
-            lines.push(fieldline("Folder to scan:", root, *field == ScanField::Root));
+            lines.push(fieldline(
+                "Folder to scan:",
+                root,
+                *field == ScanField::Root,
+            ));
             match error {
                 Some(e) => lines.push(note(e.clone(), Style::new().fg(Color::Red))),
-                None => lines.push(note("/ the whole disk · ~ your home folder · or any folder, e.g. ~/Library".into(), dim)),
+                None => lines.push(note(
+                    "/ the whole disk · ~ your home folder · or any folder, e.g. ~/Library".into(),
+                    dim,
+                )),
             }
             lines.push(Line::raw(""));
-            lines.push(fieldline("Name (optional):", name, *field == ScanField::Name));
-            lines.push(note("Empty: named by its start time. A name helps find it in the history.".into(), dim));
+            lines.push(fieldline(
+                "Name (optional):",
+                name,
+                *field == ScanField::Name,
+            ));
+            lines.push(note(
+                "Empty: named by its start time. A name helps find it in the history.".into(),
+                dim,
+            ));
             lines.push(Line::raw(""));
-            let last = snapshots::check_root(root, &app.settings.home).map(|p| last_time(&p.display().to_string()));
-            lines.push(Line::raw(format!(" {:<18}{}", "Last scanned:", last.unwrap_or_else(|_| "-".into()))));
+            let last = snapshots::check_root(root, &app.settings.home)
+                .map(|p| last_time(&p.display().to_string()));
+            lines.push(Line::raw(format!(
+                " {:<18}{}",
+                "Last scanned:",
+                last.unwrap_or_else(|_| "-".into())
+            )));
             lines.push(Line::raw(format!(" {:<18}{store}", "Saved to:")));
             lines.push(Line::raw(""));
-            lines.push(Line::styled(" Reads names, sizes and dates only: never file contents, never changes a file.", dim));
+            lines.push(Line::styled(
+                " Reads names, sizes and dates only: never file contents, never changes a file.",
+                dim,
+            ));
         }
         ScanStage::Confirm { root, name } => {
             lines.push(Line::raw(""));
             lines.push(Line::raw(format!(" {:<18}{root}", "Scan:")));
-            lines.push(Line::raw(format!(" {:<18}{}", "Name:", if name.is_empty() { "(its start time)" } else { name })));
-            lines.push(Line::raw(format!(" {:<18}{}", "Last scanned:", last_time(root))));
+            lines.push(Line::raw(format!(
+                " {:<18}{}",
+                "Name:",
+                if name.is_empty() {
+                    "(its start time)"
+                } else {
+                    name
+                }
+            )));
+            lines.push(Line::raw(format!(
+                " {:<18}{}",
+                "Last scanned:",
+                last_time(root)
+            )));
             lines.push(Line::raw(format!(" {:<18}{store}", "Saved to:")));
             lines.push(Line::raw(""));
-            lines.push(Line::styled(" Enter starts the scan · Esc changes it", Style::new().bold()));
-            lines.push(Line::styled(" (Settings: \"Confirm before a scan\" off skips this step.)", dim));
+            lines.push(Line::styled(
+                " Enter starts the scan · Esc changes it",
+                Style::new().bold(),
+            ));
+            lines.push(Line::styled(
+                " (Settings: \"Confirm before a scan\" off skips this step.)",
+                dim,
+            ));
         }
         ScanStage::AskDisk { root, message, .. } => {
             lines.push(Line::raw(""));
             lines.push(Line::raw(format!(" {:<18}{root}", "Scan:")));
             lines.push(Line::raw(""));
-            lines.push(Line::styled(" Is this the disk DiskDrift knows?", Style::new().bold().fg(Color::Yellow)));
+            lines.push(Line::styled(
+                " Is this the disk DiskDrift knows?",
+                Style::new().bold().fg(Color::Yellow),
+            ));
             lines.push(Line::raw(format!(" {message}")));
             lines.push(Line::raw(""));
-            lines.push(Line::raw(" s  the same disk: its scans join that disk's history"));
+            lines.push(Line::raw(
+                " s  the same disk: its scans join that disk's history",
+            ));
             lines.push(Line::raw(" n  another disk: it gets an entry of its own"));
             lines.push(Line::raw(" Esc  not now (nothing is scanned)"));
             lines.push(Line::raw(""));
-            lines.push(Line::styled(" DiskDrift asks every time, because a copy of a disk looks the same to it.", dim));
+            lines.push(Line::styled(
+                " DiskDrift asks every time, because a copy of a disk looks the same to it.",
+                dim,
+            ));
         }
-        ScanStage::Running { progress, started, root, expected, .. } => {
+        ScanStage::Running {
+            progress,
+            started,
+            root,
+            expected,
+            ..
+        } => {
             let n = progress.entries.load(Ordering::Relaxed);
             let secs = started.elapsed().as_secs_f64().max(0.001);
-            let cur = progress.current.lock().map(|c| c.clone()).unwrap_or_default();
+            let cur = progress
+                .current
+                .lock()
+                .map(|c| c.clone())
+                .unwrap_or_default();
             let issues = progress.issues.load(Ordering::Relaxed);
             let of_last = expected
                 .filter(|&e| e > 0)
-                .map(|e| format!("   (the last scan of it had {}: about {:.0}% so far)", format_count(e), (n as f64 * 100.0 / e as f64).min(99.0)))
+                .map(|e| {
+                    format!(
+                        "   (the last scan of it had {}: about {:.0}% so far)",
+                        format_count(e),
+                        (n as f64 * 100.0 / e as f64).min(99.0)
+                    )
+                })
                 .unwrap_or_default();
             lines.push(Line::raw(""));
             lines.push(Line::raw(format!(" Scanning {root}")).bold());
             lines.push(Line::raw(""));
-            lines.push(Line::from(vec![Span::raw(" Entries:    "), Span::styled(format_count(n), Style::new().bold()), Span::styled(of_last, dim)]));
-            lines.push(Line::raw(format!(" Allocated:  {}", format_size(progress.bytes_alloc.load(Ordering::Relaxed), u))));
-            lines.push(Line::raw(format!(" Rate:       {:.0}k entries/s · {:.0} s", n as f64 / secs / 1000.0, secs)));
-            let unreadable = if issues == 0 { "none so far".to_string() } else { format!("{} (folders macOS protects; listed when the scan ends)", format_count(issues)) };
+            lines.push(Line::from(vec![
+                Span::raw(" Entries:    "),
+                Span::styled(format_count(n), Style::new().bold()),
+                Span::styled(of_last, dim),
+            ]));
+            lines.push(Line::raw(format!(
+                " Allocated:  {}",
+                progress_size(progress, u)
+            )));
+            lines.push(Line::raw(format!(
+                " Rate:       {:.0}k entries/s · {:.0} s",
+                n as f64 / secs / 1000.0,
+                secs
+            )));
+            let unreadable = if issues == 0 {
+                "none so far".to_string()
+            } else {
+                format!(
+                    "{} (folders the operating system protects; listed when the scan ends)",
+                    format_count(issues)
+                )
+            };
             lines.push(Line::raw(format!(" Unreadable: {unreadable}")));
-            lines.push(Line::raw(format!(" Now in:     {}", tail(&cur, inner.width.saturating_sub(14) as usize))));
+            lines.push(Line::raw(format!(
+                " Now in:     {}",
+                tail(&cur, inner.width.saturating_sub(14) as usize)
+            )));
             lines.push(Line::raw(""));
-            lines.push(Line::styled(" ← back to the menu (the scan goes on) · Esc or x stops it (asks first)", dim));
+            lines.push(Line::styled(
+                " ← back to the menu (the scan goes on) · Esc or x stops it (asks first)",
+                dim,
+            ));
         }
         ScanStage::Finished(r) => {
             lines.push(Line::raw(""));
             match r {
                 Ok(o) => {
-                    let prev = app.previous_comparable(&o.snapshot).filter(|_| !o.cancelled);
+                    let prev = app
+                        .previous_comparable(&o.snapshot)
+                        .filter(|_| !o.cancelled);
                     let now = chrono::Local::now().timestamp();
-                    for (i, l) in text::scan_summary(o, prev.as_ref(), now, u).into_iter().enumerate() {
-                        lines.push(if i == 0 { Line::raw(format!(" {l}")).bold() } else { Line::raw(format!(" {l}")) });
+                    for (i, l) in text::scan_summary(o, prev.as_ref(), now, u)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        lines.push(if i == 0 {
+                            Line::raw(format!(" {l}")).bold()
+                        } else {
+                            Line::raw(format!(" {l}"))
+                        });
                     }
                     lines.push(Line::raw(""));
                     let mut keys = Vec::new();
@@ -564,17 +966,28 @@ fn draw_scan(f: &mut Frame, app: &App, area: Rect) {
                     }
                     keys.push("n new scan".into());
                     keys.push("Esc back".into());
-                    lines.push(Line::styled(format!(" {}", keys.join(" · ")), Style::new().fg(ACCENT)));
+                    lines.push(Line::styled(
+                        format!(" {}", keys.join(" · ")),
+                        Style::new().fg(ACCENT),
+                    ));
                     if !o.cancelled {
                         lines.push(Line::raw(""));
                         lines.push(Line::styled(" Details", dim));
-                        lines.extend(text::scan_outcome(o, u).lines().skip(1).map(|l| Line::raw(format!(" {l}"))));
+                        lines.extend(
+                            text::scan_outcome(o, u)
+                                .lines()
+                                .skip(1)
+                                .map(|l| Line::raw(format!(" {l}"))),
+                        );
                     }
                 }
                 Err(e) => {
                     lines.push(Line::raw(format!(" Scan failed: {e}")).bold());
                     lines.push(Line::raw(""));
-                    lines.push(Line::styled(" Enter back to the form (the folder is kept) · Esc back", Style::new().fg(ACCENT)));
+                    lines.push(Line::styled(
+                        " Enter back to the form (the folder is kept) · Esc back",
+                        Style::new().fg(ACCENT),
+                    ));
                 }
             }
         }
@@ -584,7 +997,11 @@ fn draw_scan(f: &mut Frame, app: &App, area: Rect) {
 
 fn tail(s: &str, max: usize) -> String {
     let n = s.chars().count();
-    if n <= max || max < 2 { s.to_string() } else { format!("…{}", s.chars().skip(n - max + 1).collect::<String>()) }
+    if n <= max || max < 2 {
+        s.to_string()
+    } else {
+        format!("…{}", s.chars().skip(n - max + 1).collect::<String>())
+    }
 }
 
 /// Rows `scroll..scroll+height` of `items`, with the scroll clamped.
@@ -596,15 +1013,32 @@ fn window<T>(items: &[T], scroll: u16, height: u16) -> (&[T], usize) {
 
 fn snapshot_cells(r: &SnapshotRow, u: SizeUnits) -> Vec<String> {
     let m = &r.meta;
+    let counts = m.counts.as_ref().filter(|_| m.status.is_usable());
+    let entries = counts
+        .map(|c| {
+            if m.status == Status::Partial {
+                format!("≥ {}", format_count(c.entries))
+            } else {
+                format_count(c.entries)
+            }
+        })
+        .unwrap_or_else(|| "-".into());
+    let allocated = counts
+        .map(|c| text::snapshots::scan_size(c, c.allocated_bytes, u))
+        .unwrap_or_else(|| "-".into());
     vec![
         m.id.to_string(),
-        if m.name.starts_with("auto-") { "(background scan)".into() } else { m.name.clone() },
+        if m.name.starts_with("auto-") {
+            "(background scan)".into()
+        } else {
+            m.name.clone()
+        },
         short_time(&m.started_at),
         m.root.clone(),
         m.status.to_string(),
         // A cancelled or failed scan's partial counts are not data: leave them out.
-        m.counts.as_ref().filter(|_| m.status.is_usable()).map(|c| format_count(c.entries)).unwrap_or_else(|| "-".into()),
-        m.counts.as_ref().filter(|_| m.status.is_usable()).map(|c| format_size(c.allocated_bytes, u)).unwrap_or_else(|| "-".into()),
+        entries,
+        allocated,
         format_size(r.size_on_disk, u),
     ]
 }
@@ -616,13 +1050,30 @@ fn draw_snapshots(f: &mut Frame, app: &App, area: Rect) {
         _ => return draw_text(f, app, area, "Loading…"),
     };
     if l.snapshots.is_empty() {
-        return draw_text(f, app, area, &format!("No snapshots yet in {}.\n\nPress S to scan.", l.store_path.display()));
+        return draw_text(
+            f,
+            app,
+            area,
+            &format!(
+                "No snapshots yet in {}.\n\nPress S to scan.",
+                l.store_path.display()
+            ),
+        );
     }
     let shown = app.history();
     let u = units(app);
     let mut title = match &app.disk_filter {
-        Some(d) => format!(" Snapshot history — {}: {} of {} scans · * every disk ", d.label(), shown.len(), l.snapshots.len()),
-        None => format!(" Snapshot history — {} scans, store {} ", l.snapshots.len(), format_size(l.store_bytes, u)),
+        Some(d) => format!(
+            " Snapshot history — {}: {} of {} scans · * every disk ",
+            d.label(),
+            shown.len(),
+            l.snapshots.len()
+        ),
+        None => format!(
+            " Snapshot history — {} scans, store {} ",
+            l.snapshots.len(),
+            format_size(l.store_bytes, u)
+        ),
     };
     if !app.snap_marks.is_empty() {
         title.push_str(&format!("· {} marked ", app.snap_marks.len()));
@@ -633,7 +1084,10 @@ fn draw_snapshots(f: &mut Frame, app: &App, area: Rect) {
     let [list, detail] = Layout::vertical([Constraint::Min(2), Constraint::Length(6)]).areas(inner);
     let height = list.height.saturating_sub(1);
     let (rows, start) = window(&shown, follow(app.snap_sel, height), height);
-    let header = Row::new(["ID", "Name", "Started", "Root", "Status", "Entries", "On disk", "Stored"]).style(Style::new().bold());
+    let header = Row::new([
+        "ID", "Name", "Started", "Root", "Status", "Entries", "On disk", "Stored",
+    ])
+    .style(Style::new().bold());
     let rows: Vec<Row> = rows
         .iter()
         .enumerate()
@@ -669,33 +1123,66 @@ fn draw_snapshots(f: &mut Frame, app: &App, area: Rect) {
     ];
     f.render_widget(Table::new(rows, widths).header(header), list);
     // What the selected scan is, and what can be done with it.
-    let rule = Block::new().borders(Borders::TOP).border_style(Style::new().fg(Color::DarkGray));
+    let rule = Block::new()
+        .borders(Borders::TOP)
+        .border_style(Style::new().fg(Color::DarkGray));
     // The question takes the whole panel: it must not be cut off.
     if let Some(p) = &app.snap_remove {
-        let ids: Vec<String> = p.snapshots.iter().map(|r| format!("#{}", r.meta.id)).collect();
+        let ids: Vec<String> = p
+            .snapshots
+            .iter()
+            .map(|r| format!("#{}", r.meta.id))
+            .collect();
         let lines = vec![
-            Line::styled(format!(" Remove {}?", ids.join(" ")), Style::new().fg(Color::Yellow).bold()),
-            Line::styled(format!(" {}", text::prune::proposal_summary(p, u)), Style::new().fg(Color::Yellow)),
+            Line::styled(
+                format!(" Remove {}?", ids.join(" ")),
+                Style::new().fg(Color::Yellow).bold(),
+            ),
+            Line::styled(
+                format!(" {}", text::prune::proposal_summary(p, u)),
+                Style::new().fg(Color::Yellow),
+            ),
             Line::raw(" y removes them, any other key keeps them."),
         ];
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(rule), detail);
+        f.render_widget(
+            Paragraph::new(lines).wrap(Wrap { trim: false }).block(rule),
+            detail,
+        );
         return;
     }
-    let Some(r) = shown.get(app.snap_sel) else { return };
+    let Some(r) = shown.get(app.snap_sel) else {
+        return;
+    };
     let m = &r.meta;
-    let mut lines = vec![Line::styled(format!(" {} · {}", scan_title(m), m.root), Style::new().bold())];
-    lines.extend(text::snapshots::snapshot_detail(m).into_iter().map(|t| Line::raw(format!(" {t}"))));
+    let mut lines = vec![Line::styled(
+        format!(" {} · {}", scan_title(m), m.root),
+        Style::new().bold(),
+    )];
+    lines.extend(
+        text::snapshots::snapshot_detail(m)
+            .into_iter()
+            .map(|t| Line::raw(format!(" {t}"))),
+    );
     if let Some(job) = &app.store_job {
-        lines.push(Line::styled(format!(" {job}… (x stops; the store stays valid)"), Style::new().fg(Color::Yellow)));
+        lines.push(Line::styled(
+            format!(" {job}… (x stops; the store stays valid)"),
+            Style::new().fg(Color::Yellow),
+        ));
     } else if let Some(note) = &app.snap_note {
-        lines.push(Line::styled(format!(" {note}"), Style::new().fg(Color::Yellow)));
+        lines.push(Line::styled(
+            format!(" {note}"),
+            Style::new().fg(Color::Yellow),
+        ));
     } else if app.snap_marks.is_empty() {
         lines.push(Line::styled(
             " Space marks scans to remove (o older ones, n those without data, p by the retention rules); Del removes; z compacts the store.",
             Style::new().fg(Color::DarkGray),
         ));
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(rule), detail);
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(rule),
+        detail,
+    );
 }
 
 fn sort_label(s: DiffSort) -> &'static str {
@@ -716,6 +1203,7 @@ fn change_label(c: Change) -> &'static str {
         Change::Modified => "changed",
         Change::NewlyVisible => "now visible",
         Change::NoLongerVisible => "not visible",
+        Change::CoverageChanged => "coverage changed",
     }
 }
 
@@ -734,21 +1222,34 @@ fn short_path(path: &str, root: &str, width: u16) -> String {
 /// Width left for the last column of a table after the fixed ones (and the
 /// one-cell gaps between columns).
 fn rest_width(area: Rect, fixed: &[u16]) -> u16 {
-    area.width.saturating_sub(fixed.iter().sum::<u16>() + fixed.len() as u16).max(10)
+    area.width
+        .saturating_sub(fixed.iter().sum::<u16>() + fixed.len() as u16)
+        .max(10)
 }
 
-fn diff_rows<'a>(items: &'a [DiffItem], u: SizeUnits, start: usize, sel: usize, root: &str, width: u16) -> Vec<Row<'a>> {
+fn diff_rows<'a>(
+    items: &'a [DiffItem],
+    u: SizeUnits,
+    start: usize,
+    sel: usize,
+    root: &str,
+    width: u16,
+) -> Vec<Row<'a>> {
     items
         .iter()
         .enumerate()
         .map(|(n, i)| {
-            let color = if i.delta_allocated > 0 { Color::Yellow } else { Color::Green };
+            let color = if i.delta_allocated > 0 {
+                Color::Yellow
+            } else {
+                Color::Green
+            };
             let row = Row::new(vec![
-                Cell::from(format_delta(i.delta_allocated as i128, u)).style(Style::new().fg(color)),
-                Cell::from(format_size(i.old_allocated, u)),
-                Cell::from(format_size(i.new_allocated, u)),
+                Cell::from(diff_delta(i, u)).style(Style::new().fg(color)),
+                Cell::from(diff_old_size(i, u)),
+                Cell::from(diff_new_size(i, u)),
                 Cell::from(if i.is_dir { "" } else { change_label(i.change) }),
-                Cell::from(short_path(&i.path.lossy(), root, width)),
+                Cell::from(short_path(&i.path.display(), root, width)),
             ]);
             selected(row, start + n == sel)
         })
@@ -785,17 +1286,39 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let u = units(app);
-    let [head, tabs, body] = Layout::vertical([Constraint::Length(2), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
-    let (old, new) = (usable.get(d.old).map(|r| &r.meta), usable.get(d.new).map(|r| &r.meta));
+    let [head, tabs, body] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
+    let (old, new) = (
+        usable.get(d.old).map(|r| &r.meta),
+        usable.get(d.new).map(|r| &r.meta),
+    );
     if let (Some(o), Some(n)) = (old, new) {
         let focused = d.focus == DiffFocus::Header;
         let pair = format!(" {}  →  {} ", scan_title(o), scan_title(n));
-        let hint = if focused { "  Enter choose other scans" } else { "  ↑ or p to choose other scans" };
-        let style = if focused { Style::new().fg(Color::Black).bg(ACCENT) } else { Style::new().bold() };
+        let hint = if focused {
+            "  Enter choose other scans"
+        } else {
+            "  ↑ or p to choose other scans"
+        };
+        let style = if focused {
+            Style::new().fg(Color::Black).bg(ACCENT)
+        } else {
+            Style::new().bold()
+        };
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(vec![Span::styled(pair, style), Span::styled(hint, Style::new().fg(Color::DarkGray))]),
-                Line::styled(format!(" of {} (paths below are inside it)", n.root), Style::new().fg(Color::DarkGray)),
+                Line::from(vec![
+                    Span::styled(pair, style),
+                    Span::styled(hint, Style::new().fg(Color::DarkGray)),
+                ]),
+                Line::styled(
+                    format!(" of {} (paths below are inside it)", n.root),
+                    Style::new().fg(Color::DarkGray),
+                ),
             ]),
             head,
         );
@@ -806,7 +1329,10 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
             return;
         }
         Job::Failed(e) => {
-            f.render_widget(Paragraph::new(format!("\n {e}")).wrap(Wrap { trim: true }), body);
+            f.render_widget(
+                Paragraph::new(format!("\n {e}")).wrap(Wrap { trim: true }),
+                body,
+            );
             return;
         }
         Job::Done(r) => r,
@@ -816,16 +1342,25 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
     // A list cut at the limit shows "200+": the true count is not known.
     let count = |lists: &[usize]| {
         let n: usize = lists.iter().sum();
-        if lists.iter().any(|&l| l >= DIFF_LIMIT) { format!("{n}+") } else { n.to_string() }
+        if lists.iter().any(|&l| l >= DIFF_LIMIT) {
+            format!("{n}+")
+        } else {
+            n.to_string()
+        }
     };
     let tab_spans: Vec<Span> = DIFF_TABS
         .iter()
         .map(|t| {
             let name = match t {
                 DiffTab::Summary => " Summary ".to_string(),
-                DiffTab::GrowingDirs => format!(" Growing folders ({}) ", count(&[rep.growing_dirs.len()])),
+                DiffTab::GrowingDirs => {
+                    format!(" Growing folders ({}) ", count(&[rep.growing_dirs.len()]))
+                }
                 DiffTab::Files => format!(" Changed files ({}) ", count(&[rep.files.len()])),
-                DiffTab::Shrinking => format!(" Shrinking ({}) ", count(&[rep.shrinking_dirs.len(), rep.shrinking_files.len()])),
+                DiffTab::Shrinking => format!(
+                    " Shrinking ({}) ",
+                    count(&[rep.shrinking_dirs.len(), rep.shrinking_files.len()])
+                ),
             };
             if *t == d.tab {
                 Span::styled(name, Style::new().fg(Color::Black).bg(ACCENT))
@@ -838,17 +1373,35 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
     if d.tab == DiffTab::Summary {
         // The line above already names the two scans.
         let full = text::diff(r, u, false, false);
-        let full = if full.starts_with("Comparing snapshot") { full.split_once('\n').map(|x| x.1.to_string()).unwrap_or_default() } else { full };
+        let full = if full.starts_with("Comparing snapshot") {
+            full.split_once('\n')
+                .map(|x| x.1.to_string())
+                .unwrap_or_default()
+        } else {
+            full
+        };
         let lines = wrapped_rows(&full, body.width);
         let scroll = app.scroll.min(lines.saturating_sub(body.height));
-        f.render_widget(Paragraph::new(full).wrap(Wrap { trim: false }).scroll((scroll, 0)), body);
+        f.render_widget(
+            Paragraph::new(full)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0)),
+            body,
+        );
         return;
     }
     let [info, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body);
-    let min = if d.min_size == 0 { "any size".to_string() } else { format!("at least {}", format_size(d.min_size, u)) };
+    let min = if d.min_size == 0 {
+        "any size".to_string()
+    } else {
+        format!("at least {}", format_size(d.min_size, u))
+    };
     f.render_widget(
         Paragraph::new(Line::styled(
-            format!(" sorted by {} · {min}    o change order · f change minimum size", sort_label(d.sort)),
+            format!(
+                " sorted by {} · {min}    o change order · f change minimum size",
+                sort_label(d.sort)
+            ),
             Style::new().fg(Color::DarkGray),
         )),
         info,
@@ -859,13 +1412,33 @@ fn draw_diff(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let height = list.height.saturating_sub(1);
-    let sel = if d.focus == DiffFocus::Results { d.sel } else { usize::MAX };
+    let sel = if d.focus == DiffFocus::Results {
+        d.sel
+    } else {
+        usize::MAX
+    };
     let (slice, start) = window(&items, follow(d.sel, height), height);
     let header = Row::new(["Change", "Before", "After", "", "Path"]).style(Style::new().bold());
     let fixed = [11, 10, 10, 11];
-    let widths = [Constraint::Length(11), Constraint::Length(10), Constraint::Length(10), Constraint::Length(11), Constraint::Min(10)];
-    let root = usable.get(d.new).map(|r| r.meta.root.as_str()).unwrap_or("");
-    f.render_widget(Table::new(diff_rows(slice, u, start, sel, root, rest_width(list, &fixed)), widths).header(header), list);
+    let widths = [
+        Constraint::Length(11),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(11),
+        Constraint::Min(10),
+    ];
+    let root = usable
+        .get(d.new)
+        .map(|r| r.meta.root.as_str())
+        .unwrap_or("");
+    f.render_widget(
+        Table::new(
+            diff_rows(slice, u, start, sel, root, rest_width(list, &fixed)),
+            widths,
+        )
+        .header(header),
+        list,
+    );
 }
 
 /// Choosing the two scans: a list like the history, in two steps.
@@ -873,26 +1446,44 @@ fn draw_diff_picker(f: &mut Frame, app: &App, area: Rect) {
     let usable = app.usable();
     let d = &app.diff;
     let second = d.focus == DiffFocus::PickNew;
-    let title = if second { " Compare — step 2 of 2: compare it with which later scan? " } else { " Compare — step 1 of 2: compare from which scan? " };
+    let title = if second {
+        " Compare — step 2 of 2: compare it with which later scan? "
+    } else {
+        " Compare — step 1 of 2: compare from which scan? "
+    };
     let info = match usable.get(d.old) {
         Some(o) if second => format!(" From {}. Greyed scans are older or cover another folder.", scan_title(&o.meta)),
         _ => " Pick the earlier scan. Greyed scans have no later scan of the same folder to compare with.".to_string(),
     };
     let from = if second { Some(d.old) } else { None };
-    draw_scan_picker(f, app, area, title, &info, d.cursor, from, &|i| app.diff_choosable(i));
+    draw_scan_picker(f, app, area, title, &info, d.cursor, from, &|i| {
+        app.diff_choosable(i)
+    });
 }
 
 /// A list of the scans that hold data, to pick one from: `cursor` is marked ▶,
 /// `from` (an earlier choice) "from", and rows `choosable` rejects are greyed.
 #[allow(clippy::too_many_arguments)]
-fn draw_scan_picker(f: &mut Frame, app: &App, area: Rect, title: &str, info: &str, cursor: usize, from: Option<usize>, choosable: &dyn Fn(usize) -> bool) {
+fn draw_scan_picker(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    title: &str,
+    info: &str,
+    cursor: usize,
+    from: Option<usize>,
+    choosable: &dyn Fn(usize) -> bool,
+) {
     let usable = app.usable();
     let u = units(app);
     let block = Block::bordered().title(title.to_string());
     let inner = block.inner(area);
     f.render_widget(block, area);
     let [top, list] = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(inner);
-    f.render_widget(Paragraph::new(info.to_string()).style(Style::new().fg(Color::DarkGray)), top);
+    f.render_widget(
+        Paragraph::new(info.to_string()).style(Style::new().fg(Color::DarkGray)),
+        top,
+    );
     let height = list.height.saturating_sub(1);
     let (slice, start) = window(&usable, follow(cursor, height), height);
     let rows: Vec<Row> = slice
@@ -900,7 +1491,13 @@ fn draw_scan_picker(f: &mut Frame, app: &App, area: Rect, title: &str, info: &st
         .enumerate()
         .map(|(n, r)| {
             let i = start + n;
-            let mark = if i == cursor { " ▶" } else if Some(i) == from { "from" } else { "" };
+            let mark = if i == cursor {
+                " ▶"
+            } else if Some(i) == from {
+                "from"
+            } else {
+                ""
+            };
             let mut cells = vec![mark.to_string()];
             cells.extend(snapshot_cells(r, u).into_iter().take(7));
             let row = Row::new(cells);
@@ -913,7 +1510,10 @@ fn draw_scan_picker(f: &mut Frame, app: &App, area: Rect, title: &str, info: &st
             }
         })
         .collect();
-    let header = Row::new(["", "ID", "Name", "Started", "Root", "Status", "Entries", "On disk"]).style(Style::new().bold());
+    let header = Row::new([
+        "", "ID", "Name", "Started", "Root", "Status", "Entries", "On disk",
+    ])
+    .style(Style::new().bold());
     let widths = [
         Constraint::Length(5),
         Constraint::Length(4),
@@ -927,7 +1527,15 @@ fn draw_scan_picker(f: &mut Frame, app: &App, area: Rect, title: &str, info: &st
     f.render_widget(Table::new(rows, widths).header(header), list);
 }
 
-fn top_rows(items: &[TopItem], u: SizeUnits, metric: SizeMetric, start: usize, sel: usize, root: &str, width: u16) -> Vec<Row<'static>> {
+fn top_rows(
+    items: &[TopItem],
+    u: SizeUnits,
+    metric: SizeMetric,
+    start: usize,
+    sel: usize,
+    root: &str,
+    width: u16,
+) -> Vec<Row<'static>> {
     items
         .iter()
         .enumerate()
@@ -942,11 +1550,19 @@ fn top_rows(items: &[TopItem], u: SizeUnits, metric: SizeMetric, start: usize, s
                 (true, false) => "/",
                 _ => "",
             };
-            let path = short_path(&i.path.lossy(), root, width.saturating_sub(suffix.chars().count() as u16));
+            let path = short_path(
+                &i.path.display(),
+                root,
+                width.saturating_sub(suffix.chars().count() as u16),
+            );
             let row = Row::new(vec![
-                Cell::from(format_size(main, u)).style(Style::new().bold()),
-                Cell::from(format_size(other, u)),
-                Cell::from(if dir { format_count(i.entries) } else { String::new() }),
+                Cell::from(top_size(i, main, u)).style(Style::new().bold()),
+                Cell::from(top_size(i, other, u)),
+                Cell::from(if dir {
+                    format_count(i.entries)
+                } else {
+                    String::new()
+                }),
                 Cell::from(format!("{path}{suffix}")),
             ]);
             selected(row, start + n == sel)
@@ -959,47 +1575,110 @@ fn draw_top(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.top;
     if t.focus == TopFocus::Pick {
         let info = " Pick the scan to list the largest files and folders of.";
-        return draw_scan_picker(f, app, area, " Largest files — which scan? ", info, t.cursor, None, &|_| true);
+        return draw_scan_picker(
+            f,
+            app,
+            area,
+            " Largest files — which scan? ",
+            info,
+            t.cursor,
+            None,
+            &|_| true,
+        );
     }
     let block = Block::bordered().title(" Largest files and folders ");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let usable = app.usable();
     let Some(m) = usable.get(t.snapshot).map(|r| &r.meta) else {
-        let msg = if app.snapshots.is_running() || matches!(app.snapshots, Job::Idle) { "Loading…" } else { "No scan yet. Press S to scan." };
+        let msg = if app.snapshots.is_running() || matches!(app.snapshots, Job::Idle) {
+            "Loading…"
+        } else {
+            "No scan yet. Press S to scan."
+        };
         f.render_widget(Paragraph::new(format!("\n {msg}")), inner);
         return;
     };
-    let [head, tabs, hint, body] =
-        Layout::vertical([Constraint::Length(2), Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    let [head, tabs, hint, body] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
+    ])
+    .areas(inner);
     let focused = t.focus == TopFocus::Header;
-    let latest = if t.snapshot + 1 == usable.len() { " · latest" } else { "" };
-    let style = if focused { Style::new().fg(Color::Black).bg(ACCENT) } else { Style::new().bold() };
-    let tip = if focused { "  Enter choose another scan" } else { "  ↑ or p to choose another scan" };
+    let latest = if t.snapshot + 1 == usable.len() {
+        " · latest"
+    } else {
+        ""
+    };
+    let style = if focused {
+        Style::new().fg(Color::Black).bg(ACCENT)
+    } else {
+        Style::new().bold()
+    };
+    let tip = if focused {
+        "  Enter choose another scan"
+    } else {
+        "  ↑ or p to choose another scan"
+    };
     let mut second = format!(" of {} (paths below are inside it)", m.root);
     if let Some(r) = t.result.done() {
-        second.push_str(&format!(" · {} entries · {} on disk", format_count(r.report.entries), format_size(r.report.total_allocated, u)));
+        second.push_str(&format!(
+            " · {} entries · {} on disk",
+            if r.report.entries == 0 {
+                "unknown".into()
+            } else {
+                format_count(r.report.entries)
+            },
+            top_total_size(&r.report, u)
+        ));
     }
     f.render_widget(
         Paragraph::new(vec![
-            Line::from(vec![Span::styled(format!(" {}{latest} ", scan_title(m)), style), Span::styled(tip, Style::new().fg(Color::DarkGray))]),
+            Line::from(vec![
+                Span::styled(format!(" {}{latest} ", scan_title(m)), style),
+                Span::styled(tip, Style::new().fg(Color::DarkGray)),
+            ]),
             Line::styled(second, Style::new().fg(Color::DarkGray)),
         ]),
         head,
     );
     let view = |v: TopView, name: &str| {
-        if t.view == v { Span::styled(format!(" {name} "), Style::new().fg(Color::Black).bg(ACCENT)) } else { Span::raw(format!(" {name} ")) }
+        if t.view == v {
+            Span::styled(
+                format!(" {name} "),
+                Style::new().fg(Color::Black).bg(ACCENT),
+            )
+        } else {
+            Span::raw(format!(" {name} "))
+        }
     };
-    f.render_widget(Paragraph::new(Line::from(vec![view(TopView::Files, "Largest files"), Span::raw(" "), view(TopView::Dirs, "Largest folders (deepest)")])), tabs);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            view(TopView::Files, "Largest files"),
+            Span::raw(" "),
+            view(TopView::Dirs, "Largest folders (deepest)"),
+        ])),
+        tabs,
+    );
     let explain = match (t.view, t.metric) {
-        (TopView::Dirs, _) => "where the space sits (a folder is left out when its big subfolder is listed)",
+        (TopView::Dirs, _) => {
+            "where the space sits (a folder is left out when its big subfolder is listed)"
+        }
         (TopView::Files, _) => "single files, biggest first",
     };
     let metric = match t.metric {
         SizeMetric::Allocated => "by space on disk · m: by file size",
         SizeMetric::Logical => "by file size · m: by space on disk",
     };
-    f.render_widget(Paragraph::new(Line::styled(format!(" {explain} · {metric}"), Style::new().fg(Color::DarkGray))), hint);
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            format!(" {explain} · {metric}"),
+            Style::new().fg(Color::DarkGray),
+        )),
+        hint,
+    );
     let r = match &t.result {
         Job::Idle => return,
         Job::Running(m) => {
@@ -1007,14 +1686,25 @@ fn draw_top(f: &mut Frame, app: &App, area: Rect) {
             return;
         }
         Job::Failed(e) => {
-            f.render_widget(Paragraph::new(format!("\n {e}")).wrap(Wrap { trim: true }), body);
+            f.render_widget(
+                Paragraph::new(format!("\n {e}")).wrap(Wrap { trim: true }),
+                body,
+            );
             return;
         }
         Job::Done(r) => r,
     };
-    let items = if t.view == TopView::Dirs { &r.report.dirs } else { &r.report.files };
+    let items = if t.view == TopView::Dirs {
+        &r.report.dirs
+    } else {
+        &r.report.files
+    };
     let height = body.height.saturating_sub(1);
-    let sel = if t.focus == TopFocus::List { t.sel } else { usize::MAX };
+    let sel = if t.focus == TopFocus::List {
+        t.sel
+    } else {
+        usize::MAX
+    };
     let (slice, start) = window(items, follow(t.sel, height), height);
     let (h1, h2) = match t.metric {
         SizeMetric::Allocated => ("On disk", "File size"),
@@ -1022,8 +1712,28 @@ fn draw_top(f: &mut Frame, app: &App, area: Rect) {
     };
     let header = Row::new([h1, h2, "Entries", "Path"]).style(Style::new().bold());
     let fixed = [10, 10, 9];
-    let widths = [Constraint::Length(10), Constraint::Length(10), Constraint::Length(9), Constraint::Min(10)];
-    f.render_widget(Table::new(top_rows(slice, u, t.metric, start, sel, &m.root, rest_width(body, &fixed)), widths).header(header), body);
+    let widths = [
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(9),
+        Constraint::Min(10),
+    ];
+    f.render_widget(
+        Table::new(
+            top_rows(
+                slice,
+                u,
+                t.metric,
+                start,
+                sel,
+                &m.root,
+                rest_width(body, &fixed),
+            ),
+            widths,
+        )
+        .header(header),
+        body,
+    );
 }
 
 /// A timestamped log, newest at the bottom, with an optional live status line.
@@ -1031,15 +1741,25 @@ fn draw_log(f: &mut Frame, area: Rect, title: &str, log: &[LogLine], status: Opt
     let block = Block::bordered().title(title.to_string());
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let room = inner.height.saturating_sub(if status.is_some() { 2 } else { 0 }) as usize;
+    let room = inner
+        .height
+        .saturating_sub(if status.is_some() { 2 } else { 0 }) as usize;
     let mut lines: Vec<Line> = log
         .iter()
         .skip(log.len().saturating_sub(room))
-        .map(|l| Line::from(vec![Span::styled(format!(" {} ", l.at), Style::new().fg(Color::DarkGray)), Span::raw(l.text.clone())]))
+        .map(|l| {
+            Line::from(vec![
+                Span::styled(format!(" {} ", l.at), Style::new().fg(Color::DarkGray)),
+                Span::raw(l.text.clone()),
+            ])
+        })
         .collect();
     if let Some(s) = status {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(format!(" {s}"), Style::new().fg(Color::Yellow)));
+        lines.push(Line::styled(
+            format!(" {s}"),
+            Style::new().fg(Color::Yellow),
+        ));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -1052,7 +1772,10 @@ fn draw_measuring(f: &mut Frame, app: &App, area: Rect) {
     };
     // The keys are in the footer; this line only says what is happening.
     let status = format!("{msg} {:.0}s", app.doctor_started.elapsed().as_secs_f64());
-    let title = format!(" {} — measuring (one run for Doctor and Recovery suggestions) ", app.screen.title());
+    let title = format!(
+        " {} — measuring (one run for Doctor and Recovery suggestions) ",
+        app.screen.title()
+    );
     draw_log(f, area, &title, &app.doctor_log, Some(status));
 }
 
@@ -1082,7 +1805,11 @@ fn follow(sel: usize, height: u16) -> u16 {
 }
 
 fn selected(row: Row<'_>, is_sel: bool) -> Row<'_> {
-    if is_sel { row.style(Style::new().fg(Color::Black).bg(ACCENT)) } else { row }
+    if is_sel {
+        row.style(Style::new().fg(Color::Black).bg(ACCENT))
+    } else {
+        row
+    }
 }
 
 fn draw_recover(f: &mut Frame, app: &App, area: Rect) {
@@ -1091,7 +1818,9 @@ fn draw_recover(f: &mut Frame, app: &App, area: Rect) {
         Job::Running(_) if app.doctor.is_running() => return draw_measuring(f, app, area),
         Job::Running(msg) => return draw_text(f, app, area, msg),
         Job::Idle => return draw_text(f, app, area, "Starting…"),
-        Job::Failed(e) => return draw_text(f, app, area, &format!("Failed: {e}\n\nF5 tries again.")),
+        Job::Failed(e) => {
+            return draw_text(f, app, area, &format!("Failed: {e}\n\nF5 tries again."));
+        }
         Job::Done(r) => r,
     };
     let u = units(app);
@@ -1103,7 +1832,8 @@ fn draw_recover(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let detail_h = 7.min(inner.height / 2);
-    let [list, detail] = Layout::vertical([Constraint::Min(2), Constraint::Length(detail_h)]).areas(inner);
+    let [list, detail] =
+        Layout::vertical([Constraint::Min(2), Constraint::Length(detail_h)]).areas(inner);
     let height = list.height.saturating_sub(1);
     let (rows, start) = window(&r.candidates, follow(ui.sel, height), height);
     let fixed = [3, 11, 7, 34];
@@ -1119,60 +1849,107 @@ fn draw_recover(f: &mut Frame, app: &App, area: Rect) {
                 Some(b) => format_size(b, u),
                 None => "?".into(),
             };
-            let path = c.path.as_deref().map(|p| home_path(p, &home, path_w)).unwrap_or_default();
+            let path = c
+                .path
+                .as_deref()
+                .map(|p| home_path(p, &home, path_w))
+                .unwrap_or_default();
             let cells = vec![
                 Cell::from(format!("{:>2}", c.rank)),
                 Cell::from(size).style(Style::new().bold()),
-                Cell::from(c.risk.clone()).style(Style::new().fg(risk_color(risk_from_label(&c.risk)))),
+                Cell::from(c.risk.clone())
+                    .style(Style::new().fg(risk_color(risk_from_label(&c.risk)))),
                 Cell::from(clip(&c.label, 34)),
                 Cell::from(path),
             ];
             if c.skipped {
-                let row = Row::new(cells).style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM));
-                return if start + i == ui.sel { row.style(Style::new().fg(Color::Black).bg(Color::DarkGray)) } else { row };
+                let row = Row::new(cells)
+                    .style(Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM));
+                return if start + i == ui.sel {
+                    row.style(Style::new().fg(Color::Black).bg(Color::DarkGray))
+                } else {
+                    row
+                };
             }
             selected(Row::new(cells), start + i == ui.sel)
         })
         .collect();
     let header = Row::new(["#", "Size", "Risk", "Location", "Path"]).style(Style::new().bold());
-    let widths = [Constraint::Length(3), Constraint::Length(11), Constraint::Length(7), Constraint::Length(34), Constraint::Min(10)];
+    let widths = [
+        Constraint::Length(3),
+        Constraint::Length(11),
+        Constraint::Length(7),
+        Constraint::Length(34),
+        Constraint::Min(10),
+    ];
     f.render_widget(Table::new(rows, widths).header(header), list);
     if let Some(c) = r.candidates.get(ui.sel) {
-        let analysable = c.path.as_ref().is_some_and(|p| std::path::Path::new(p).is_dir());
-        let mut lines = vec![Line::styled(format!(" {} — reclaimable: {}", c.label, c.reclaimable), Style::new().bold())];
+        let analysable = c
+            .path
+            .as_ref()
+            .is_some_and(|p| std::path::Path::new(p).is_dir());
+        let mut lines = vec![Line::styled(
+            format!(" {} — reclaimable: {}", c.label, c.reclaimable),
+            Style::new().bold(),
+        )];
         if c.skipped {
             lines.push(Line::styled(" Skipped while measuring: size unknown. F5 re-runs all locations; Enter analyses just this one.", Style::new().fg(Color::DarkGray)));
         }
         let risk = match risk_from_label(&c.risk) {
-            Some(Risk::Low) => "risk low: losing it costs little (usually rebuilt or re-downloaded)",
-            Some(Risk::Medium) => "risk medium: may hold settings, offline data or work in progress",
+            Some(Risk::Low) => {
+                "risk low: losing it costs little (usually rebuilt or re-downloaded)"
+            }
+            Some(Risk::Medium) => {
+                "risk medium: may hold settings, offline data or work in progress"
+            }
             Some(Risk::High) => "risk high: likely your own data; removing it can lose work",
-            Some(Risk::SystemManaged) => "managed by macOS: leave it to the system",
+            Some(Risk::SystemManaged) => "managed by the operating system: leave it alone",
             None => "risk unknown: depends on what is inside",
         };
         let mut facts = vec![risk.to_string()];
         if let Some(w) = &c.within {
             facts.push(format!("inside {w}, so its size is counted there too"));
         }
-        lines.push(Line::styled(format!(" {}", capitalize(&facts.join(" · "))), Style::new().fg(Color::DarkGray)));
+        lines.push(Line::styled(
+            format!(" {}", capitalize(&facts.join(" · "))),
+            Style::new().fg(Color::DarkGray),
+        ));
         // For growth the action below does what the CLI hint says; show where instead.
         match (&c.growth, &c.path) {
-            (Some(_), Some(p)) => lines.push(Line::raw(format!(" In {}", home_path(p, &home, u16::MAX)))),
+            (Some(_), Some(p)) => {
+                lines.push(Line::raw(format!(" In {}", home_path(p, &home, u16::MAX))))
+            }
             _ => lines.push(Line::raw(format!(" → {}", c.how))),
         }
         let action = match c.growth {
-            Some((old, new)) => format!(" Enter: browse what changed here (scan #{old} → #{new}) · a: analyse the folder as it is now"),
-            None if analysable => " Enter: analyse this folder (what each subfolder is and whether it matters)".into(),
+            Some((old, new)) => format!(
+                " Enter: browse what changed here (scan #{old} → #{new}) · a: analyse the folder as it is now"
+            ),
+            None if analysable => {
+                " Enter: analyse this folder (what each subfolder is and whether it matters)".into()
+            }
             None => " (not a folder: nothing to open)".into(),
         };
         lines.push(Line::styled(action, Style::new().fg(ACCENT)));
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().borders(Borders::TOP)), detail);
+        f.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::new().borders(Borders::TOP)),
+            detail,
+        );
     }
 }
 
 /// `s` cut to `max` characters at the end (for names, whose start matters).
 fn clip(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>()) }
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!(
+            "{}…",
+            s.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
+    }
 }
 
 /// A path with the home folder shown as `~`, shortened from the start.
@@ -1187,7 +1964,13 @@ fn home_path(path: &str, home: &str, width: u16) -> String {
 fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
     let u = units(app);
     let depth = app.analysis.stack.len();
-    let block = Block::bordered().title(format!(" Analyse ({depth}) {} ", tail(&view.path.display().to_string(), area.width.saturating_sub(16) as usize)));
+    let block = Block::bordered().title(format!(
+        " Analyse ({depth}) {} ",
+        tail(
+            &view.path.display().to_string(),
+            area.width.saturating_sub(16) as usize
+        )
+    ));
     let r = match &view.result {
         Job::Done(r) => r,
         Job::Running(_) | Job::Idle => {
@@ -1196,7 +1979,7 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
             let status = format!(
                 "{} entries · {} · {:.0}s · now in {}",
                 p.entries.load(Ordering::Relaxed),
-                format_size(p.bytes_alloc.load(Ordering::Relaxed), u),
+                progress_size(p, u),
                 view.started.elapsed().as_secs_f64(),
                 tail(&cur, area.width.saturating_sub(50) as usize),
             );
@@ -1204,14 +1987,24 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
             return draw_log(f, area, &title, &view.log, Some(status));
         }
         Job::Failed(e) => {
-            f.render_widget(Paragraph::new(format!("\n {e}\n\n Esc goes back.")).wrap(Wrap { trim: true }).block(block), area);
+            f.render_widget(
+                Paragraph::new(format!("\n {e}\n\n Esc goes back."))
+                    .wrap(Wrap { trim: true })
+                    .block(block),
+                area,
+            );
             return;
         }
     };
     let inner = block.inner(area);
     f.render_widget(block, area);
     let detail_h = 6.min(inner.height / 2);
-    let [head, list, detail] = Layout::vertical([Constraint::Length(3), Constraint::Min(2), Constraint::Length(detail_h)]).areas(inner);
+    let [head, list, detail] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(2),
+        Constraint::Length(detail_h),
+    ])
+    .areas(inner);
     let status = match r.status {
         MeasureStatus::Complete => "complete".to_string(),
         MeasureStatus::Partial => "partial: some folders unreadable".to_string(),
@@ -1227,7 +2020,18 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
             "system" => Some(Risk::SystemManaged),
             _ => None,
         };
-        verdicts.push(Span::styled(format!("{} {}", shown_verdict(&v.verdict), format_size(v.allocated_bytes, u)), Style::new().fg(risk_color(risk))));
+        verdicts.push(Span::styled(
+            format!(
+                "{} {}",
+                shown_verdict(&v.verdict),
+                if v.verdict == "unknown" {
+                    "unknown".into()
+                } else {
+                    format_size(v.allocated_bytes, u)
+                }
+            ),
+            Style::new().fg(risk_color(risk)),
+        ));
         verdicts.push(Span::raw("  "));
     }
     f.render_widget(
@@ -1235,13 +2039,38 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
             Line::from(vec![
                 Span::raw(format!(
                     " {} on disk · {} entries · {}{}",
-                    format_size(r.allocated_bytes, u),
-                    format_count(r.entries),
+                    if matches!(
+                        r.status,
+                        MeasureStatus::Inaccessible
+                            | MeasureStatus::Absent
+                            | MeasureStatus::Skipped
+                    ) {
+                        "unknown".into()
+                    } else {
+                        format_size(r.allocated_bytes, u)
+                    },
+                    if matches!(
+                        r.status,
+                        MeasureStatus::Inaccessible
+                            | MeasureStatus::Absent
+                            | MeasureStatus::Skipped
+                    ) {
+                        "unknown".into()
+                    } else {
+                        format_count(r.entries)
+                    },
                     status,
-                    if r.sizes_from.is_some() { String::new() } else { format!(" · {:.1}s", r.elapsed_ms as f64 / 1000.0) }
+                    if r.sizes_from.is_some() {
+                        String::new()
+                    } else {
+                        format!(" · {:.1}s", r.elapsed_ms as f64 / 1000.0)
+                    }
                 )),
                 Span::styled(
-                    r.sizes_from.as_ref().map(|s| format!(" · from {s} · F5 measures now")).unwrap_or_default(),
+                    r.sizes_from
+                        .as_ref()
+                        .map(|s| format!(" · from {s} · F5 measures now"))
+                        .unwrap_or_default(),
                     Style::new().fg(Color::Yellow),
                 ),
             ]),
@@ -1249,7 +2078,10 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
             match &r.context {
                 Some(c) => Line::from(vec![
                     Span::raw(" Inside: "),
-                    Span::styled(format!("{} [{}]", c.what, verdict(Some(c.risk))), Style::new().fg(risk_color(Some(c.risk)))),
+                    Span::styled(
+                        format!("{} [{}]", c.what, verdict(Some(c.risk))),
+                        Style::new().fg(risk_color(Some(c.risk))),
+                    ),
                 ]),
                 None => Line::raw(""),
             },
@@ -1277,12 +2109,21 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
             if owners {
                 cells.push(Cell::from(item_owner(it)));
             }
-            cells.push(Cell::from(format!("{}{}", it.name, if it.is_dir { "/" } else { "" })));
+            cells.push(Cell::from(format!(
+                "{}{}",
+                it.name,
+                if it.is_dir { "/" } else { "" }
+            )));
             selected(Row::new(cells), start + i == view.sel)
         })
         .collect();
     let mut head_cells = vec!["On disk", "Last change", "Verdict", "What"];
-    let mut widths = vec![Constraint::Length(13), Constraint::Length(15), Constraint::Length(15), Constraint::Length(28)];
+    let mut widths = vec![
+        Constraint::Length(13),
+        Constraint::Length(15),
+        Constraint::Length(15),
+        Constraint::Length(28),
+    ];
     if owners {
         head_cells.push("Owner");
         widths.push(Constraint::Length(18));
@@ -1292,18 +2133,30 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
     let header = Row::new(head_cells).style(Style::new().bold());
     f.render_widget(Table::new(rows, widths).header(header), list);
     if let Some(it) = r.items.get(view.sel) {
-        let mut lines: Vec<Line> = item_detail(it, r.analyzed_at).into_iter().map(|l| Line::raw(format!(" {l}"))).collect();
+        let mut lines: Vec<Line> = item_detail(it, r.analyzed_at)
+            .into_iter()
+            .map(|l| Line::raw(format!(" {l}")))
+            .collect();
         if let Some(first) = lines.first_mut() {
             *first = first.clone().bold();
         }
         if let Some(n) = &view.note {
-            lines.push(Line::styled(format!(" {n}"), Style::new().fg(Color::Yellow)));
+            lines.push(Line::styled(
+                format!(" {n}"),
+                Style::new().fg(Color::Yellow),
+            ));
         }
         if r.more_items > 0 && view.sel + 1 == r.items.len() {
-            lines.push(Line::raw(format!(" … {} more item(s) not listed, {}", r.more_items, format_size(r.more_allocated_bytes, u))));
+            lines.push(Line::raw(format!(
+                " … {} more item(s) not listed, {}",
+                r.more_items,
+                format_size(r.more_allocated_bytes, u)
+            )));
         }
         f.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().borders(Borders::TOP)),
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::new().borders(Borders::TOP)),
             detail,
         );
     }
@@ -1311,8 +2164,16 @@ fn draw_analysis(f: &mut Frame, app: &App, area: Rect, view: &AnalysisView) {
 
 /// A proportional bar, `width` cells wide.
 fn bar(part: u64, whole: u64, width: usize) -> String {
-    let filled = if whole == 0 { 0 } else { ((part as f64 / whole as f64) * width as f64).round() as usize };
-    format!("{}{}", "█".repeat(filled.min(width)), " ".repeat(width - filled.min(width)))
+    let filled = if whole == 0 {
+        0
+    } else {
+        ((part as f64 / whole as f64) * width as f64).round() as usize
+    };
+    format!(
+        "{}{}",
+        "█".repeat(filled.min(width)),
+        " ".repeat(width - filled.min(width))
+    )
 }
 
 /// Column headers and widths of the browser table; the same while a level
@@ -1321,12 +2182,26 @@ fn browse_columns(diff: bool) -> (Row<'static>, Vec<Constraint>) {
     let (names, widths): (Vec<&str>, Vec<Constraint>) = if diff {
         (
             vec!["Size change", "Before", "After", "Entries", "What", "Name"],
-            vec![Constraint::Length(11), Constraint::Length(10), Constraint::Length(10), Constraint::Length(8), Constraint::Length(14), Constraint::Min(10)],
+            vec![
+                Constraint::Length(11),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(8),
+                Constraint::Length(14),
+                Constraint::Min(10),
+            ],
         )
     } else {
         (
             vec!["On disk", "Share", "", "Entries", "Last change", "Name"],
-            vec![Constraint::Length(11), Constraint::Length(5), Constraint::Length(10), Constraint::Length(9), Constraint::Length(15), Constraint::Min(10)],
+            vec![
+                Constraint::Length(11),
+                Constraint::Length(5),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Length(15),
+                Constraint::Min(10),
+            ],
         )
     };
     (Row::new(names).style(Style::new().bold()), widths)
@@ -1341,15 +2216,39 @@ struct BrowseBody {
 
 /// Rows of a level; `pending` greys them out (a folder of it is being opened)
 /// and keeps the opened one marked.
-fn browse_row(cells: Vec<Cell<'static>>, styles: Vec<Style>, is_sel: bool, pending: bool) -> Row<'static> {
+fn browse_row(
+    cells: Vec<Cell<'static>>,
+    styles: Vec<Style>,
+    is_sel: bool,
+    pending: bool,
+) -> Row<'static> {
     if pending {
         let row = Row::new(cells);
-        return if is_sel { row.style(Style::new().fg(Color::Black).bg(Color::DarkGray)) } else { row.style(Style::new().fg(Color::DarkGray)) };
+        return if is_sel {
+            row.style(Style::new().fg(Color::Black).bg(Color::DarkGray))
+        } else {
+            row.style(Style::new().fg(Color::DarkGray))
+        };
     }
-    selected(Row::new(cells.into_iter().zip(styles).map(|(c, st)| c.style(st)).collect::<Vec<_>>()), is_sel)
+    selected(
+        Row::new(
+            cells
+                .into_iter()
+                .zip(styles)
+                .map(|(c, st)| c.style(st))
+                .collect::<Vec<_>>(),
+        ),
+        is_sel,
+    )
 }
 
-fn browse_body(data: &BrowseData, sel: usize, height: u16, u: SizeUnits, pending: bool) -> BrowseBody {
+fn browse_body(
+    data: &BrowseData,
+    sel: usize,
+    height: u16,
+    u: SizeUnits,
+    pending: bool,
+) -> BrowseBody {
     let plain = Style::new();
     match data {
         BrowseData::Snapshot(b) => {
@@ -1362,7 +2261,19 @@ fn browse_body(data: &BrowseData, sel: usize, height: u16, u: SizeUnits, pending
                     child_size(d, u),
                     text::entries(d.entries),
                     l.items.len() as u64 + l.more_items,
-                    if l.more_items > 0 { format!(" ({} more not listed, {})", l.more_items, format_size(l.more_allocated_bytes, u)) } else { String::new() }
+                    if l.more_items > 0 {
+                        format!(
+                            " ({} more not listed, {})",
+                            l.more_items,
+                            if l.dir.as_ref().is_some_and(|d| d.incomplete) {
+                                format!("≥ {}", format_size(l.more_allocated_bytes, u))
+                            } else {
+                                format_size(l.more_allocated_bytes, u)
+                            }
+                        )
+                    } else {
+                        String::new()
+                    }
                 ),
                 None => String::new(),
             };
@@ -1379,12 +2290,27 @@ fn browse_body(data: &BrowseData, sel: usize, height: u16, u: SizeUnits, pending
                         Cell::from(child_changed(c, now)),
                         Cell::from(child_name(c.name(), c.is_dir())),
                     ];
-                    let styles = vec![Style::new().bold(), plain, Style::new().fg(ACCENT), plain, plain, plain];
+                    let styles = vec![
+                        Style::new().bold(),
+                        plain,
+                        Style::new().fg(ACCENT),
+                        plain,
+                        plain,
+                        plain,
+                    ];
                     browse_row(cells, styles, start + i == sel, pending)
                 })
                 .collect();
-            let detail = l.items.get(sel).map(|c| child_detail(c, u, now)).unwrap_or_else(|| vec!["Empty folder.".into()]);
-            BrowseBody { summary, rows, detail }
+            let detail = l
+                .items
+                .get(sel)
+                .map(|c| child_detail(c, u, now))
+                .unwrap_or_else(|| vec!["Empty folder.".into()]);
+            BrowseBody {
+                summary,
+                rows,
+                detail,
+            }
         }
         BrowseData::Diff(d) => {
             let l = &d.listing;
@@ -1393,12 +2319,34 @@ fn browse_body(data: &BrowseData, sel: usize, height: u16, u: SizeUnits, pending
                     let changed = l.items.len() as u64 + l.more_items;
                     format!(
                         " {} → {} ({}) · {} changed, in {changed} of {} items here{}",
-                        format_size(x.old_allocated, u),
-                        format_size(x.new_allocated, u),
-                        format_delta(x.delta_allocated as i128, u),
+                        if matches!(
+                            x.change,
+                            Change::Added | Change::NewlyVisible | Change::NoLongerVisible
+                        ) {
+                            "unknown".into()
+                        } else {
+                            format_size(x.old_allocated, u)
+                        },
+                        if matches!(
+                            x.change,
+                            Change::Deleted | Change::NewlyVisible | Change::NoLongerVisible
+                        ) {
+                            "unknown".into()
+                        } else {
+                            format_size(x.new_allocated, u)
+                        },
+                        if matches!(x.change, Change::NewlyVisible | Change::NoLongerVisible) {
+                            "unknown".into()
+                        } else {
+                            format_delta(x.delta_allocated as i128, u)
+                        },
                         text::entries(x.changed_entries),
                         changed + l.unchanged_items,
-                        if l.unchanged_items > 0 { " (unchanged ones not listed)" } else { "" }
+                        if l.unchanged_items > 0 {
+                            " (unchanged ones not listed)"
+                        } else {
+                            ""
+                        }
                     )
                 }
                 None => String::new(),
@@ -1408,21 +2356,66 @@ fn browse_body(data: &BrowseData, sel: usize, height: u16, u: SizeUnits, pending
                 .iter()
                 .enumerate()
                 .map(|(i, c)| {
-                    let color = if c.delta_allocated > 0 { Color::Yellow } else if c.delta_allocated < 0 { Color::Green } else { Color::DarkGray };
+                    let color = if c.delta_allocated > 0 {
+                        Color::Yellow
+                    } else if c.delta_allocated < 0 {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    };
                     let cells = vec![
-                        Cell::from(format_delta(c.delta_allocated as i128, u)),
-                        Cell::from(format_size(c.old_allocated, u)),
-                        Cell::from(format_size(c.new_allocated, u)),
+                        Cell::from(
+                            if matches!(c.change, Change::NewlyVisible | Change::NoLongerVisible) {
+                                "unknown".into()
+                            } else {
+                                format_delta(c.delta_allocated as i128, u)
+                            },
+                        ),
+                        Cell::from(
+                            if matches!(
+                                c.change,
+                                Change::Added | Change::NewlyVisible | Change::NoLongerVisible
+                            ) {
+                                "unknown".into()
+                            } else {
+                                format_size(c.old_allocated, u)
+                            },
+                        ),
+                        Cell::from(
+                            if matches!(
+                                c.change,
+                                Change::Deleted | Change::NewlyVisible | Change::NoLongerVisible
+                            ) {
+                                "unknown".into()
+                            } else {
+                                format_size(c.new_allocated, u)
+                            },
+                        ),
                         Cell::from(format_count(c.changed_entries)),
                         Cell::from(diff_change(c)),
                         Cell::from(child_name(c.name(), c.is_dir())),
                     ];
-                    let styles = vec![Style::new().fg(color).bold(), plain, plain, plain, plain, plain];
+                    let styles = vec![
+                        Style::new().fg(color).bold(),
+                        plain,
+                        plain,
+                        plain,
+                        plain,
+                        plain,
+                    ];
                     browse_row(cells, styles, start + i == sel, pending)
                 })
                 .collect();
-            let detail = l.items.get(sel).map(|c| diff_detail(c, u)).unwrap_or_else(|| vec!["Nothing changed here.".into()]);
-            BrowseBody { summary, rows, detail }
+            let detail = l
+                .items
+                .get(sel)
+                .map(|c| diff_detail(c, u))
+                .unwrap_or_else(|| vec!["Nothing changed here.".into()]);
+            BrowseBody {
+                summary,
+                rows,
+                detail,
+            }
         }
     }
 }
@@ -1434,7 +2427,13 @@ fn browse_title(data: Option<&BrowseData>, source: BrowseSource) -> String {
             format!(" Browse {} ", scan_title(m))
         }
         (Some(BrowseData::Diff(d)), _) => {
-            format!(" Changes #{} {} → #{} {} ", d.old.id, short_time(&d.old.started_at), d.new.id, short_time(&d.new.started_at))
+            format!(
+                " Changes #{} {} → #{} {} ",
+                d.old.id,
+                short_time(&d.old.started_at),
+                d.new.id,
+                short_time(&d.new.started_at)
+            )
         }
         (None, BrowseSource::Snapshot(id)) => format!(" Browse #{id} "),
         (None, BrowseSource::Diff { old, new }) => format!(" Changes #{old} → #{new} "),
@@ -1443,19 +2442,38 @@ fn browse_title(data: Option<&BrowseData>, source: BrowseSource) -> String {
 
 fn draw_browse(f: &mut Frame, app: &App, area: Rect) {
     let u = units(app);
-    let Some((b, level)) = app.browse.as_ref().and_then(|b| b.stack.last().map(|l| (b, l))) else {
+    let Some((b, level)) = app
+        .browse
+        .as_ref()
+        .and_then(|b| b.stack.last().map(|l| (b, l)))
+    else {
         return draw_text(f, app, area, "Nothing to browse.");
     };
     // While a level loads, the one it was opened from stays on screen, dimmed,
     // with the folder being opened still highlighted: only the rows change.
     let (shown, sel, status) = match &level.result {
         Job::Done(r) => (Some(r.as_ref()), level.sel, None),
-        Job::Failed(e) => (None, 0, Some(Span::styled(format!(" {e} · Esc goes back"), Style::new().fg(Color::Red)))),
+        Job::Failed(e) => (
+            None,
+            0,
+            Some(Span::styled(
+                format!(" {e} · Esc goes back"),
+                Style::new().fg(Color::Red),
+            )),
+        ),
         Job::Running(_) | Job::Idle => {
             let backdrop = b.backdrop();
             let secs = level.started.elapsed().as_secs_f64();
-            let text = if secs < 0.5 { " reading…".to_string() } else { format!(" reading… {secs:.0}s") };
-            (backdrop.and_then(|l| l.result.done()), backdrop.map(|l| l.sel).unwrap_or(0), Some(Span::styled(text, Style::new().fg(Color::Yellow))))
+            let text = if secs < 0.5 {
+                " reading…".to_string()
+            } else {
+                format!(" reading… {secs:.0}s")
+            };
+            (
+                backdrop.and_then(|l| l.result.done()),
+                backdrop.map(|l| l.sel).unwrap_or(0),
+                Some(Span::styled(text, Style::new().fg(Color::Yellow))),
+            )
         }
     };
     let loading = status.is_some();
@@ -1463,17 +2481,36 @@ fn draw_browse(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     let detail_h = 4.min(inner.height / 3);
-    let [head, list, detail] = Layout::vertical([Constraint::Length(2), Constraint::Min(2), Constraint::Length(detail_h)]).areas(inner);
+    let [head, list, detail] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(2),
+        Constraint::Length(detail_h),
+    ])
+    .areas(inner);
     let height = list.height.saturating_sub(1);
     let body = shown.map(|d| browse_body(d, sel, height, u, loading));
-    let path = level.path.as_ref().or(b.root()).map(|p| p.display().to_string()).unwrap_or_default();
+    let path = level
+        .path
+        .as_ref()
+        .or(b.root())
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     let path_line = Line::from(vec![
-        Span::styled(format!(" ({}) ", b.stack.len()), Style::new().fg(Color::DarkGray)),
-        Span::styled(tail(&path, inner.width.saturating_sub(8) as usize), Style::new().bold()),
+        Span::styled(
+            format!(" ({}) ", b.stack.len()),
+            Style::new().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            tail(&path, inner.width.saturating_sub(8) as usize),
+            Style::new().bold(),
+        ),
     ]);
     let summary = match (&status, &body) {
         (Some(s), _) => Line::from(s.clone()),
-        (None, _) if b.note.is_some() => Line::styled(format!(" {}", b.note.as_deref().unwrap_or_default()), Style::new().fg(Color::Yellow)),
+        (None, _) if b.note.is_some() => Line::styled(
+            format!(" {}", b.note.as_deref().unwrap_or_default()),
+            Style::new().fg(Color::Yellow),
+        ),
         (None, Some(body)) => Line::raw(body.summary.clone()),
         (None, None) => Line::raw(""),
     };
@@ -1482,12 +2519,26 @@ fn draw_browse(f: &mut Frame, app: &App, area: Rect) {
     let rows = body.as_ref().map(|b| b.rows.clone()).unwrap_or_default();
     f.render_widget(Table::new(rows, widths).header(header), list);
     let lines: Vec<Line> = match &body {
-        Some(body) if !loading => {
-            body.detail.iter().enumerate().map(|(i, t)| if i == 0 { Line::raw(format!(" {t}")).bold() } else { Line::raw(format!(" {t}")) }).collect()
-        }
+        Some(body) if !loading => body
+            .detail
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                if i == 0 {
+                    Line::raw(format!(" {t}")).bold()
+                } else {
+                    Line::raw(format!(" {t}"))
+                }
+            })
+            .collect(),
         _ => Vec::new(),
     };
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().borders(Borders::TOP)), detail);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::new().borders(Borders::TOP)),
+        detail,
+    );
 }
 
 fn draw_disks(f: &mut Frame, app: &App, area: Rect) {
@@ -1498,18 +2549,34 @@ fn draw_disks(f: &mut Frame, app: &App, area: Rect) {
         _ => return draw_text(f, app, area, "Reading disks…"),
     };
     if l.disks.is_empty() {
-        return draw_text(f, app, area, &format!("No disks yet in {}.\n\nA scan records the disk it was taken on. Press S to scan.", l.store_path.display()));
+        let mut message = format!(
+            "No disks yet in {}.\n\nA scan records the disk it was taken on. Press S to scan.",
+            l.store_path.display()
+        );
+        for error in &l.mount_errors {
+            message.push_str(&format!("\n\n  volume unavailable: {error}"));
+        }
+        return draw_text(f, app, area, &message);
     }
     let u = units(app);
     let now = chrono::Local::now().timestamp();
     let connected = l.disks.iter().filter(|r| r.connected).count();
-    let block = Block::bordered().title(format!(" My disks — {} known, {connected} connected ", l.disks.len()));
+    let block = Block::bordered().title(format!(
+        " My disks — {} known, {connected} connected ",
+        l.disks.len()
+    ));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let [list, detail] = Layout::vertical([Constraint::Min(2), Constraint::Length(7)]).areas(inner);
+    let detail_height = 7u16.saturating_add(l.mount_errors.len() as u16);
+    let [list, detail] =
+        Layout::vertical([Constraint::Min(2), Constraint::Length(detail_height)]).areas(inner);
     let height = list.height.saturating_sub(1);
     let (rows, start) = window(&l.disks, follow(ui.sel, height), height);
-    let ago = |rfc: &str| chrono::DateTime::parse_from_rfc3339(rfc).map(|t| diskdrift_app::analyze::ago(now - t.timestamp())).unwrap_or_else(|_| rfc.into());
+    let ago = |rfc: &str| {
+        chrono::DateTime::parse_from_rfc3339(rfc)
+            .map(|t| diskdrift_app::analyze::ago(now - t.timestamp()))
+            .unwrap_or_else(|_| rfc.into())
+    };
     // Narrow: the volume name moves to the detail lines.
     let wide = area.width >= 100;
     let rows: Vec<Row> = rows
@@ -1518,16 +2585,34 @@ fn draw_disks(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, r)| {
             let d = &r.disk;
             // `?`: recognised weakly (explained below the list).
-            let name = if r.known && d.identity.strength == Strength::Weak { format!("{} ?", d.display_name()) } else { d.display_name().to_string() };
+            let name = if r.known && d.identity.strength == Strength::Weak {
+                format!("{} ?", d.display_name())
+            } else {
+                d.display_name().to_string()
+            };
             let mut cells = vec![name];
             if wide {
                 cells.push(d.volume.name.clone().unwrap_or_else(|| "-".into()));
             }
             cells.extend([
                 d.volume.fs_type.clone(),
-                d.volume.capacity_bytes.map(|b| format_size(b, u)).unwrap_or_else(|| "-".into()),
-                if r.connected { "yes".into() } else { "no".into() },
-                if r.known { r.last_scan.as_deref().map(ago).unwrap_or_else(|| "never".into()) } else { "new".into() },
+                d.volume
+                    .capacity_bytes
+                    .map(|b| format_size(b, u))
+                    .unwrap_or_else(|| "-".into()),
+                if r.connected {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
+                if r.known {
+                    r.last_scan
+                        .as_deref()
+                        .map(ago)
+                        .unwrap_or_else(|| "never".into())
+                } else {
+                    "new".into()
+                },
                 format_count(r.snapshots as u64),
                 d.sets.join(", "),
             ]);
@@ -1557,34 +2642,74 @@ fn draw_disks(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(5),
         Constraint::Min(12),
     ]);
-    f.render_widget(Table::new(rows, widths).header(Row::new(header).style(Style::new().bold())), list);
+    f.render_widget(
+        Table::new(rows, widths).header(Row::new(header).style(Style::new().bold())),
+        list,
+    );
 
     let Some(r) = l.disks.get(ui.sel) else { return };
     let d = &r.disk;
-    let volume = format!("volume {} ({})", d.volume.name.as_deref().unwrap_or("without a name"), d.volume.fs_type);
-    let mut lines = vec![Line::styled(format!(" {} · {volume} · {}", d.display_name(), d.id), Style::new().bold())];
+    let volume = format!(
+        "volume {} ({})",
+        d.volume.name.as_deref().unwrap_or("without a name"),
+        d.volume.fs_type
+    );
+    let mut lines = vec![Line::styled(
+        format!(" {} · {volume} · {}", d.display_name(), d.id),
+        Style::new().bold(),
+    )];
     // A question or a field being typed takes the panel: on a short terminal it must show.
     let asking = ui.edit.is_some() || ui.forget.is_some();
     let place = match &r.mount_point {
         Some(p) => format!("connected at {}", p.display()),
-        None => format!("not connected (last at {}); its scans can still be browsed and compared", d.last_mount_point.as_deref().unwrap_or("?")),
+        None => format!(
+            "not connected (last at {}); its scans can still be browsed and compared",
+            d.last_mount_point.as_deref().unwrap_or("?")
+        ),
     };
     if !asking {
-        lines.push(Line::raw(format!(" {place} · {} in the store", format_size(r.store_bytes, u))));
+        lines.push(Line::raw(format!(
+            " {place} · {} in the store",
+            if r.known {
+                format_size(r.store_bytes, u)
+            } else {
+                "unknown".into()
+            }
+        )));
+    }
+    for error in &l.mount_errors {
+        lines.push(Line::styled(
+            format!(" volume unavailable: {error}"),
+            Style::new().fg(Color::Red),
+        ));
     }
     let device: Vec<String> = d
         .device
         .iter()
-        .flat_map(|dev| [dev.model.clone(), dev.bus.clone(), dev.serial.as_ref().map(|s| format!("serial {s}"))])
+        .flat_map(|dev| {
+            [
+                dev.model.clone(),
+                dev.bus.clone(),
+                dev.serial.as_ref().map(|s| format!("serial {s}")),
+            ]
+        })
         .flatten()
         .collect();
     let identity = match d.identity.strength {
-        _ if !r.known => "new: not in the store yet. l records it with a label, g makes its first scan (DiskDrift never scans a new disk on its own)",
+        _ if !r.known => {
+            "new: not in the store yet. l records it with a label, g makes its first scan (DiskDrift never scans a new disk on its own)"
+        }
         Strength::Uuid => "known by its volume UUID",
-        Strength::Serial => "known by the UUID macOS derives from its FAT/exFAT serial",
-        Strength::Weak => "? recognised weakly (no reliable UUID): a match is asked about; `diskdrift disks merge` joins two entries of one disk",
+        Strength::Serial => "known by the filesystem serial-derived identity",
+        Strength::Weak => {
+            "? recognised weakly (no reliable UUID): a match is asked about; `diskdrift disks merge` joins two entries of one disk"
+        }
     };
-    let device = if device.is_empty() { String::new() } else { format!(" · {}", device.join(", ")) };
+    let device = if device.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", device.join(", "))
+    };
     if !asking {
         lines.push(Line::raw(format!(" {identity}{device}")));
         if let Some(desc) = &d.description {
@@ -1594,11 +2719,20 @@ fn draw_disks(f: &mut Frame, app: &App, area: Rect) {
     if let Some((field, text)) = &ui.edit {
         lines.push(Line::from(vec![
             Span::raw(format!(" {}: ", field.prompt())),
-            Span::styled(format!("{text}▏"), Style::new().fg(Color::Black).bg(Color::Yellow)),
+            Span::styled(
+                format!("{text}▏"),
+                Style::new().fg(Color::Black).bg(Color::Yellow),
+            ),
         ]));
     } else if let Some(plan) = &ui.forget {
         let what = text::forget(plan, u);
-        lines.push(Line::styled(format!(" {} Forget it? y forgets, any other key keeps it.", what.trim_end()), Style::new().fg(Color::Yellow).bold()));
+        lines.push(Line::styled(
+            format!(
+                " {} Forget it? y forgets, any other key keeps it.",
+                what.trim_end()
+            ),
+            Style::new().fg(Color::Yellow).bold(),
+        ));
     }
     match &ui.note {
         Some(Ok(m)) => lines.push(Line::styled(format!(" {m}"), Style::new().fg(Color::Green))),
@@ -1606,18 +2740,27 @@ fn draw_disks(f: &mut Frame, app: &App, area: Rect) {
         None => {}
     }
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().borders(Borders::TOP).border_style(Style::new().fg(Color::DarkGray))),
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(Color::DarkGray)),
+        ),
         detail,
     );
 }
 
 /// The path of `path` below a scan root (the root itself: `.`).
-fn below_root(path: &[u8], root: &str) -> String {
-    let rest = match path.strip_prefix(root.as_bytes()) {
-        Some(r) => r.strip_prefix(b"/").unwrap_or(r),
-        None => path,
+fn below_root(path: &diskdrift_app::core::native::NativePath, root: &str) -> String {
+    let path = path.display();
+    let rest = match path.strip_prefix(root) {
+        Some(r) => r.strip_prefix('/').unwrap_or(r),
+        None => path.as_str(),
     };
-    if rest.is_empty() { ".".into() } else { String::from_utf8_lossy(rest).into_owned() }
+    if rest.is_empty() {
+        ".".into()
+    } else {
+        rest.to_string()
+    }
 }
 
 /// What the search found, in one line above the results.
@@ -1627,19 +2770,49 @@ fn find_status(app: &App) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     match &ui.current {
         Job::Idle => {
-            return Line::styled(" part of a name, *.pdf, re:regex or Docs/plan · case and diacritics ignored", Style::new().fg(Color::DarkGray));
+            return Line::styled(
+                " part of a name, *.pdf, re:regex or Docs/plan · case and diacritics ignored",
+                Style::new().fg(Color::DarkGray),
+            );
         }
         Job::Running(m) => return Line::raw(format!(" {m}")),
-        Job::Failed(e) => return Line::styled(format!(" Cannot search: {e}"), Style::new().fg(Color::Red)),
-        Job::Done(c) if !c.store_exists => return Line::raw(" No scans yet: nothing to search. Press S to scan."),
+        Job::Failed(e) => {
+            return Line::styled(format!(" Cannot search: {e}"), Style::new().fg(Color::Red));
+        }
+        Job::Done(c) if !c.store_exists => {
+            return Line::raw(" No scans yet: nothing to search. Press S to scan.");
+        }
         Job::Done(c) => {
             let entries: u64 = c.searched.iter().map(|s| s.entries).sum();
-            let scans = format!("{} latest {}, {}", c.searched.len(), if c.searched.len() == 1 { "scan" } else { "scans" }, text::entries(entries));
+            let scans = format!(
+                "{} latest {}, {}",
+                c.searched.len(),
+                if c.searched.len() == 1 {
+                    "scan"
+                } else {
+                    "scans"
+                },
+                text::entries(entries)
+            );
             if c.total == 0 {
-                spans.push(Span::styled(" Not on any disk as of the latest scans. ".to_string(), Style::new().bold()));
+                spans.push(Span::styled(
+                    " Not on any disk as of the latest scans. ".to_string(),
+                    Style::new().bold(),
+                ));
             } else {
-                let shown = if c.truncated { format!(", the first {} listed", c.hits.len()) } else { String::new() };
-                spans.push(Span::styled(format!(" {} {}", format_count(c.total), if c.total == 1 { "match" } else { "matches" }), Style::new().bold()));
+                let shown = if c.truncated {
+                    format!(", the first {} listed", c.hits.len())
+                } else {
+                    String::new()
+                };
+                spans.push(Span::styled(
+                    format!(
+                        " {} {}",
+                        format_count(c.total),
+                        if c.total == 1 { "match" } else { "matches" }
+                    ),
+                    Style::new().bold(),
+                ));
                 spans.push(Span::raw(format!(" in {scans}{shown}. ")));
             }
         }
@@ -1675,24 +2848,50 @@ fn draw_find(f: &mut Frame, app: &App, area: Rect) {
     let u = units(app);
     let now = chrono::Local::now().timestamp();
     let title = match &app.disk_filter {
-        Some(d) => format!(" Find a file — only {} (* in History shows every disk) ", d.label()),
+        Some(d) => format!(
+            " Find a file — only {} (* in History shows every disk) ",
+            d.label()
+        ),
         None => " Find a file — every disk, connected or not ".to_string(),
     };
     let block = Block::bordered().title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
     // The status wraps to a second line on a narrow terminal.
-    let [field, status, list, detail] = Layout::vertical([Constraint::Length(1), Constraint::Length(2), Constraint::Min(2), Constraint::Length(6)]).areas(inner);
+    let [field, status, list, detail] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(2),
+        Constraint::Length(6),
+    ])
+    .areas(inner);
     let input = if ui.editing {
-        Span::styled(format!("{}▏", ui.input), Style::new().fg(Color::Black).bg(Color::Yellow))
+        Span::styled(
+            format!("{}▏", ui.input),
+            Style::new().fg(Color::Black).bg(Color::Yellow),
+        )
     } else {
         Span::styled(ui.input.clone(), Style::new().bold())
     };
-    f.render_widget(Paragraph::new(Line::from(vec![Span::raw(" Find: "), input])), field);
-    f.render_widget(Paragraph::new(find_status(app)).wrap(Wrap { trim: false }), status);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::raw(" Find: "), input])),
+        field,
+    );
+    f.render_widget(
+        Paragraph::new(find_status(app)).wrap(Wrap { trim: false }),
+        status,
+    );
 
-    let hits = ui.current.done().map(|c| c.hits.as_slice()).unwrap_or_default();
-    let gone = ui.history.done().map(|h| h.gone.as_slice()).unwrap_or_default();
+    let hits = ui
+        .current
+        .done()
+        .map(|c| c.hits.as_slice())
+        .unwrap_or_default();
+    let gone = ui
+        .history
+        .done()
+        .map(|h| h.gone.as_slice())
+        .unwrap_or_default();
     let total = hits.len() + gone.len();
     let height = list.height.saturating_sub(1);
     let start = follow(ui.sel, height) as usize;
@@ -1707,20 +2906,40 @@ fn draw_find(f: &mut Frame, app: &App, area: Rect) {
             return p.disk_name.clone();
         }
         let room = disk_w - 5;
-        let name: String = if p.disk_name.chars().count() > room { p.disk_name.chars().take(room - 1).chain(['…']).collect() } else { p.disk_name.clone() };
+        let name: String = if p.disk_name.chars().count() > room {
+            p.disk_name.chars().take(room - 1).chain(['…']).collect()
+        } else {
+            p.disk_name.clone()
+        };
         format!("{name} off")
     };
     // Narrow: the day of the scan without the time.
     let when = |rfc: &str| {
         let full = text::search::scan_when(rfc, now);
-        if wide { full } else { full.rsplit_once(' ').map(|(day, _)| day.to_string()).unwrap_or(full) }
+        if wide {
+            full
+        } else {
+            full.rsplit_once(' ')
+                .map(|(day, _)| day.to_string())
+                .unwrap_or(full)
+        }
     };
-    let size_cell = |kind: Kind, size: u64| if kind == Kind::Dir { "folder".to_string() } else { format_size(size, u) };
+    let size_cell = |kind: Kind, size: u64| {
+        if kind == Kind::Dir {
+            "folder".to_string()
+        } else {
+            format_size(size, u)
+        }
+    };
     let mut rows: Vec<Row> = Vec::new();
     for i in start..total.min(start + height as usize) {
         let (mut cells, scan, mtime, dim, is_gone) = match hits.get(i) {
             Some(h) => (
-                vec![disk_cell(&h.place), ellipsize_start(&below_root(&h.path, &h.place.root), path_width), size_cell(h.kind, h.size)],
+                vec![
+                    disk_cell(&h.place),
+                    ellipsize_start(&below_root(&h.path, &h.place.root), path_width),
+                    size_cell(h.kind, h.size),
+                ],
                 format!("#{} · {}", h.scan.id, when(&h.scan.started_at)),
                 h.mtime,
                 !h.place.connected,
@@ -1728,10 +2947,22 @@ fn draw_find(f: &mut Frame, app: &App, area: Rect) {
             ),
             None => {
                 let l = &gone[i - hits.len()];
-                let when = l.gone_in.as_ref().map(|g| format!("gone #{} · {}", g.id, when(&g.started_at))).unwrap_or_default();
+                let when = l
+                    .gone_in
+                    .as_ref()
+                    .map(|g| format!("gone #{} · {}", g.id, when(&g.started_at)))
+                    .unwrap_or_default();
                 (
-                    vec![disk_cell(&l.place), ellipsize_start(&below_root(&l.path, &l.place.root), path_width), size_cell(l.kind, l.size)],
-                    if l.uncertain.is_some() { format!("{when} ?") } else { when },
+                    vec![
+                        disk_cell(&l.place),
+                        ellipsize_start(&below_root(&l.path, &l.place.root), path_width),
+                        size_cell(l.kind, l.size),
+                    ],
+                    if l.uncertain.is_some() {
+                        format!("{when} ?")
+                    } else {
+                        when
+                    },
                     l.mtime,
                     !l.place.connected,
                     true,
@@ -1754,28 +2985,50 @@ fn draw_find(f: &mut Frame, app: &App, area: Rect) {
         });
     }
     let mut header = vec!["Disk", "Path below the scanned folder", "On disk"];
-    let mut widths = vec![Constraint::Length(disk_w as u16), Constraint::Min(12), Constraint::Length(10)];
+    let mut widths = vec![
+        Constraint::Length(disk_w as u16),
+        Constraint::Min(12),
+        Constraint::Length(10),
+    ];
     if wide {
         header.push("Modified");
         widths.push(Constraint::Length(11));
     }
     header.push("Scan");
     widths.push(Constraint::Length(scan_w as u16));
-    f.render_widget(Table::new(rows, widths).header(Row::new(header).style(Style::new().bold())), list);
+    f.render_widget(
+        Table::new(rows, widths).header(Row::new(header).style(Style::new().bold())),
+        list,
+    );
 
     let mut lines: Vec<Line> = Vec::new();
     match app.find_selected().filter(|_| !ui.editing) {
         Some(FindRow::Now(h)) => {
-            lines.push(Line::styled(format!(" {}", h.path.lossy()), Style::new().bold()));
+            lines.push(Line::styled(
+                format!(" {}", h.path.display()),
+                Style::new().bold(),
+            ));
             let place = match &h.place.mount_point {
                 Some(m) => format!("on {}, connected at {}", h.place.disk_name, m.display()),
-                None => format!("on {}, not connected: connect it to get at the file", h.place.disk_name),
+                None => format!(
+                    "on {}, not connected: connect it to get at the file",
+                    h.place.disk_name
+                ),
             };
-            lines.push(Line::raw(format!(" {place} · modified {}", text::date(h.mtime))));
-            lines.push(Line::raw(format!(" as of {} · Enter opens its folder in that scan", text::search::scan_ref(&h.scan, now))));
+            lines.push(Line::raw(format!(
+                " {place} · modified {}",
+                text::date(h.mtime)
+            )));
+            lines.push(Line::raw(format!(
+                " as of {} · Enter opens its folder in that scan",
+                text::search::scan_ref(&h.scan, now)
+            )));
         }
         Some(FindRow::Gone(l)) => {
-            lines.push(Line::styled(format!(" {}", l.path.lossy()), Style::new().bold()));
+            lines.push(Line::styled(
+                format!(" {}", l.path.display()),
+                Style::new().bold(),
+            ));
             if let Some(g) = &l.gone_in {
                 lines.push(Line::raw(format!(
                     " on {}: last seen in {}, gone in {}: deleted or moved between those two",
@@ -1795,20 +3048,30 @@ fn draw_find(f: &mut Frame, app: &App, area: Rect) {
                 extra.push(format!("uncertain: {why}"));
             }
             if !extra.is_empty() {
-                lines.push(Line::styled(format!(" {}", extra.join(" · ")), Style::new().fg(Color::Yellow)));
+                lines.push(Line::styled(
+                    format!(" {}", extra.join(" · ")),
+                    Style::new().fg(Color::Yellow),
+                ));
             }
             lines.push(Line::styled(
-                " DiskDrift cannot bring it back: look in the Trash, Time Machine or the disk's own backups. Enter opens the last scan that has it.",
+                " DiskDrift cannot bring it back: look in the Trash, backups of that disk, or the disk's own backups. Enter opens the last scan that has it.",
                 Style::new().fg(Color::DarkGray),
             ));
         }
         None => {}
     }
     if let Some(n) = &ui.note {
-        lines.push(Line::styled(format!(" {n}"), Style::new().fg(Color::Yellow)));
+        lines.push(Line::styled(
+            format!(" {n}"),
+            Style::new().fg(Color::Yellow),
+        ));
     }
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().borders(Borders::TOP).border_style(Style::new().fg(Color::DarkGray))),
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(Color::DarkGray)),
+        ),
         detail,
     );
 }
@@ -1818,17 +3081,28 @@ fn draw_careful(f: &mut Frame, app: &App, area: Rect) {
     let u = units(app);
     let now = chrono::Local::now().timestamp();
     let (title, style) = match ui.on {
-        Some(true) => (" Careful mode — ON: external disks are not mounted ", Style::new().fg(Color::Red).bold()),
-        Some(false) => (" Careful mode — turning on… ", Style::new().fg(Color::Yellow)),
+        Some(true) => (
+            " Careful mode — ON: external disks are not mounted ",
+            Style::new().fg(Color::Red).bold(),
+        ),
+        Some(false) => (
+            " Careful mode — turning on… ",
+            Style::new().fg(Color::Yellow),
+        ),
         None => (" Careful mode — off ", Style::new()),
     };
     let block = Block::bordered().title(Span::styled(title, style));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let list_h = (ui.held.len() as u16 + 1).clamp(2, 8);
-    let [intro, list, log] = Layout::vertical([Constraint::Length(4), Constraint::Length(list_h), Constraint::Min(2)]).areas(inner);
+    let [intro, list, log] = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Length(list_h),
+        Constraint::Min(2),
+    ])
+    .areas(inner);
     let intro_text = if ui.is_on() {
- " On: an external disk connected now is not mounted, so nothing is written to it. Connect old disks one at a time; \
+        " On: an external disk connected now is not mounted, so nothing is written to it. Connect old disks one at a time; \
          g scans the selected one read-only with one thread and ejects it. A hardware write blocker is the only real guarantee."
             .to_string()
     } else {
@@ -1847,33 +3121,80 @@ fn draw_careful(f: &mut Frame, app: &App, area: Rect) {
             let v = &h.volume.info;
             let what = match (&h.disk, &h.doubt) {
                 (_, Some(_)) => "doubtful: g asks".to_string(),
-                (Some(_), None) => h.last_scan.as_deref().map(|a| format!("known, scanned {}", text::search::scan_when(a, now))).unwrap_or_else(|| "known, never scanned".into()),
+                (Some(_), None) => h
+                    .last_scan
+                    .as_deref()
+                    .map(|a| format!("known, scanned {}", text::search::scan_when(a, now)))
+                    .unwrap_or_else(|| "known, never scanned".into()),
                 (None, None) => "new".into(),
             };
             let state = match &ui.running {
                 Some((bsd, p, started)) if bsd == h.bsd() => {
-                    format!("scanning: {} entries, {}s", format_count(p.entries.load(Ordering::Relaxed)), started.elapsed().as_secs())
+                    format!(
+                        "scanning: {} entries, {}s",
+                        format_count(p.entries.load(Ordering::Relaxed)),
+                        started.elapsed().as_secs()
+                    )
                 }
                 _ => "held, not mounted".into(),
             };
-            let device = [v.device.bus.as_deref(), v.device.model.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" ");
-            let row = Row::new(vec![h.name(), v.fs_type.clone(), v.capacity_bytes.map(|b| format_size(b, u)).unwrap_or_else(|| "-".into()), device, what, state]);
-            if i == ui.sel { row.style(Style::new().fg(Color::Black).bg(ACCENT)) } else { row }
+            let device = [v.device.bus.as_deref(), v.device.model.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let row = Row::new(vec![
+                h.name(),
+                v.fs_type.clone(),
+                v.capacity_bytes
+                    .map(|b| format_size(b, u))
+                    .unwrap_or_else(|| "-".into()),
+                device,
+                what,
+                state,
+            ]);
+            if i == ui.sel {
+                row.style(Style::new().fg(Color::Black).bg(ACCENT))
+            } else {
+                row
+            }
         })
         .collect();
-    let widths = [Constraint::Min(12), Constraint::Length(6), Constraint::Length(9), Constraint::Min(10), Constraint::Length(24), Constraint::Length(26)];
-    let header = Row::new(vec!["Disk", "FS", "Size", "Device", "In the store", "Now"]).style(Style::new().bold());
+    let widths = [
+        Constraint::Min(12),
+        Constraint::Length(6),
+        Constraint::Length(9),
+        Constraint::Min(10),
+        Constraint::Length(24),
+        Constraint::Length(26),
+    ];
+    let header = Row::new(vec!["Disk", "FS", "Size", "Device", "In the store", "Now"])
+        .style(Style::new().bold());
     if ui.held.is_empty() {
-        let empty = if ui.is_on() { " No disk held back yet." } else { "" };
-        f.render_widget(Paragraph::new(empty).style(Style::new().fg(Color::DarkGray)), list);
+        let empty = if ui.is_on() {
+            " No disk held back yet."
+        } else {
+            ""
+        };
+        f.render_widget(
+            Paragraph::new(empty).style(Style::new().fg(Color::DarkGray)),
+            list,
+        );
     } else {
         f.render_widget(Table::new(rows, widths).header(header), list);
     }
     let height = log.height.saturating_sub(1) as usize;
     let start = ui.log.len().saturating_sub(height);
-    let lines: Vec<Line> = ui.log[start..].iter().map(|l| Line::raw(format!(" {} {}", l.at, l.text))).collect();
+    let lines: Vec<Line> = ui.log[start..]
+        .iter()
+        .map(|l| Line::raw(format!(" {} {}", l.at, l.text)))
+        .collect();
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().borders(Borders::TOP).border_style(Style::new().fg(Color::DarkGray))),
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(Style::new().fg(Color::DarkGray)),
+        ),
         log,
     );
 }
@@ -1882,14 +3203,24 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
     use diskdrift_app::config::FIELDS;
     let ui = &app.settings_ui;
     let home = app.settings.home.display().to_string();
-    let title_path = home_path(&app.settings.config_path.value.display().to_string(), &home, area.width.saturating_sub(16));
+    let title_path = home_path(
+        &app.settings.config_path.value.display().to_string(),
+        &home,
+        area.width.saturating_sub(16),
+    );
     let block = Block::bordered().title(format!(" Settings — {title_path} "));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let file = match &ui.file {
         Ok(c) => c,
         Err(e) => {
-            f.render_widget(Paragraph::new(format!("\n {e}\n\n Fix the file by hand; nothing is overwritten.")).wrap(Wrap { trim: true }), inner);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "\n {e}\n\n Fix the file by hand; nothing is overwritten."
+                ))
+                .wrap(Wrap { trim: true }),
+                inner,
+            );
             return;
         }
     };
@@ -1907,8 +3238,16 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
                     None => field.display(file),
                 },
             };
-            let note = if field.overridden(&app.settings) { "command-line flag" } else { "" };
-            let row = Row::new(vec![Cell::from(field.label), Cell::from(value), Cell::from(note).style(Style::new().fg(Color::Yellow))]);
+            let note = if field.overridden(&app.settings) {
+                "command-line flag"
+            } else {
+                ""
+            };
+            let row = Row::new(vec![
+                Cell::from(field.label),
+                Cell::from(value),
+                Cell::from(note).style(Style::new().fg(Color::Yellow)),
+            ]);
             match (&ui.edit, is_sel) {
                 (Some(_), true) => row.style(Style::new().fg(Color::Black).bg(Color::Yellow)),
                 _ => selected(row, is_sel),
@@ -1917,7 +3256,11 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     let header = Row::new(["Setting", "Value", ""]).style(Style::new().bold());
     let flagged = FIELDS.iter().any(|f| f.overridden(&app.settings));
-    let widths = [Constraint::Length(29), Constraint::Min(20), Constraint::Length(if flagged { 18 } else { 0 })];
+    let widths = [
+        Constraint::Length(29),
+        Constraint::Min(20),
+        Constraint::Length(if flagged { 18 } else { 0 }),
+    ];
     f.render_widget(Table::new(rows, widths).header(header), list);
     let field = FIELDS[ui.sel.min(FIELDS.len() - 1)];
     let mut lines = vec![Line::raw(format!(" {} ({})", field.help, field.key))];
@@ -1931,68 +3274,160 @@ fn draw_settings(f: &mut Frame, app: &App, area: Rect) {
         Some(Ok(m)) => lines.push(Line::styled(format!(" {m}"), Style::new().fg(Color::Green))),
         Some(Err(m)) => lines.push(Line::styled(format!(" {m}"), Style::new().fg(Color::Red))),
         None => lines.push(Line::styled(
-            if app.settings.config_exists { " Changes are saved at once." } else { " No config file yet: the first change creates it." },
+            if app.settings.config_exists {
+                " Changes are saved at once."
+            } else {
+                " No config file yet: the first change creates it."
+            },
             Style::new().fg(Color::DarkGray),
         )),
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::new().borders(Borders::TOP)), detail);
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::new().borders(Borders::TOP)),
+        detail,
+    );
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match app.screen {
-        Screen::Dashboard if app.scan_running() => " ↑↓←→ Navigate  Enter Select  x Stop scan (asks)  ? Help  Q Quit",
-        Screen::Dashboard => " ↑↓←→ Navigate  Enter Select  S Scan  D Diff  I Doctor  ? Help  Q Quit",
-        Screen::Doctor if app.doctor.is_running() => " n Skip this location  Tab Suggestions  Esc Back (keeps running)  Q Quit",
-        Screen::Doctor => " ↑↓/PgUp/PgDn Scroll  Tab/Enter Suggestions  F5 Measure again  Esc Back  Q Quit",
-        Screen::Recover if app.doctor.is_running() => " n Skip this location  Tab Diagnosis  Esc Back (keeps running)  Q Quit",
-        Screen::Analyze => " ↑↓ Select  Enter Open folder  Esc/← Up a level  F5 Measure now  Q Quit",
-        Screen::Recover => " ↑↓ Select  Enter Open  a Analyse folder  Tab Diagnosis  F5 Measure again  Esc Back  Q Quit",
-        Screen::Scan if matches!(&app.scan, ScanStage::AskDisk { .. }) => " s Same disk  n Another disk  Esc Not now",
-        Screen::Scan if app.text_input_active() => " Type the folder  Tab Next field  Ctrl+U Clear  Enter Continue  Esc Back",
+        Screen::Dashboard if app.scan_running() => {
+            " ↑↓←→ Navigate  Enter Select  x Stop scan (asks)  ? Help  Q Quit"
+        }
+        Screen::Dashboard => {
+            " ↑↓←→ Navigate  Enter Select  S Scan  D Diff  I Doctor  ? Help  Q Quit"
+        }
+        Screen::Doctor if app.doctor.is_running() => {
+            " n Skip this location  Tab Suggestions  Esc Back (keeps running)  Q Quit"
+        }
+        Screen::Doctor => {
+            " ↑↓/PgUp/PgDn Scroll  Tab/Enter Suggestions  F5 Measure again  Esc Back  Q Quit"
+        }
+        Screen::Recover if app.doctor.is_running() => {
+            " n Skip this location  Tab Diagnosis  Esc Back (keeps running)  Q Quit"
+        }
+        Screen::Analyze => {
+            " ↑↓ Select  Enter Open folder  Esc/← Up a level  F5 Measure now  Q Quit"
+        }
+        Screen::Recover => {
+            " ↑↓ Select  Enter Open  a Analyse folder  Tab Diagnosis  F5 Measure again  Esc Back  Q Quit"
+        }
+        Screen::Scan if matches!(&app.scan, ScanStage::AskDisk { .. }) => {
+            " s Same disk  n Another disk  Esc Not now"
+        }
+        Screen::Scan if app.text_input_active() => {
+            " Type the folder  Tab Next field  Ctrl+U Clear  Enter Continue  Esc Back"
+        }
         Screen::Scan if app.scan_running() => " ← Back (keeps scanning)  Esc/x Stop (asks)  Q Quit",
-        Screen::Scan if matches!(&app.scan, ScanStage::Confirm { .. }) => " Enter Start  Esc Change  Q Quit",
+        Screen::Scan if matches!(&app.scan, ScanStage::Confirm { .. }) => {
+            " Enter Start  Esc Change  Q Quit"
+        }
         Screen::Scan if matches!(&app.scan, ScanStage::Finished(Ok(o)) if o.snapshot.status.is_usable() && !o.cancelled) => {
             " Enter Browse  c Changes since the previous scan  n New scan  Esc Back  Q Quit"
         }
         Screen::Scan => " Enter/n New scan  Esc Back  Q Quit",
-        Screen::Usage => " F5 Read again  I Where did the space go (Doctor)  ↑↓ Scroll  Esc Back  Q Quit",
+        Screen::Usage => {
+            " F5 Read again  I Where did the space go (Doctor)  ↑↓ Scroll  Esc Back  Q Quit"
+        }
         Screen::Snapshots if app.snap_remove.is_some() => " y Remove them  any other key Keep them",
-        Screen::Snapshots if app.store_job.is_some() => " x Stop  ↑↓ Select  Enter Browse  Esc Back (keeps going)",
-        Screen::Snapshots if !app.snap_marks.is_empty() => " Space Mark  o Older  n No data  p Rules  Del Remove  Esc Clear marks",
-        Screen::Snapshots if app.disk_filter.is_some() => " ↑↓ Select  Enter Open  c Changes  t Largest  Space Mark  * Every disk  Esc Back",
-        Screen::Snapshots => " ↑↓ Select  Enter Browse  c Changes  t Largest  Space Mark  z Compact  Esc Back",
+        Screen::Snapshots if app.store_job.is_some() => {
+            " x Stop  ↑↓ Select  Enter Browse  Esc Back (keeps going)"
+        }
+        Screen::Snapshots if !app.snap_marks.is_empty() => {
+            " Space Mark  o Older  n No data  p Rules  Del Remove  Esc Clear marks"
+        }
+        Screen::Snapshots if app.disk_filter.is_some() => {
+            " ↑↓ Select  Enter Open  c Changes  t Largest  Space Mark  * Every disk  Esc Back"
+        }
+        Screen::Snapshots => {
+            " ↑↓ Select  Enter Browse  c Changes  t Largest  Space Mark  z Compact  Esc Back"
+        }
         Screen::Disks if app.disks.edit.is_some() => " Type  Ctrl+U Clear  Enter Save  Esc Cancel",
         Screen::Disks if app.disks.forget.is_some() => " y Forget it  any other key Keep it",
-        Screen::Careful if app.careful.ask.is_some() => " s The same disk  n Another disk  any other key Not now",
-        Screen::Careful if app.careful.running.is_some() => " x Stop the scan (it is still ejected)  ↑↓ Select  Esc Back (keeps scanning)",
-        Screen::Careful if app.careful.is_on() => " ↑↓ Select  g Scan carefully  m Mount read-only for Finder  j Eject  o Turn off  Esc Back",
+        Screen::Careful if app.careful.ask.is_some() => {
+            " s The same disk  n Another disk  any other key Not now"
+        }
+        Screen::Careful if app.careful.running.is_some() => {
+            " x Stop the scan (it is still ejected)  ↑↓ Select  Esc Back (keeps scanning)"
+        }
+        Screen::Careful if app.careful.is_on() => {
+            " ↑↓ Select  g Scan carefully  m Mount read-only for Finder  j Eject  o Turn off  Esc Back"
+        }
         Screen::Careful => " o Turn careful mode on  Esc Back  Q Quit",
-        Screen::Find if app.find.editing => " Type  Enter Search  Ctrl+U Clear  ↓/Tab Results  Esc Back",
-        Screen::Find if app.find.history.is_running() => " ↑↓ Select  Enter Open in its scan  x Stop the history search  / Search field  Q Quit",
-        Screen::Find if app.find.history.done().is_some() => " ↑↓ Select  Enter Open in its scan  / Search field  F5 Again  Esc Field  Q Quit",
-        Screen::Find => " ↑↓ Select  Enter Open in its scan  p Search the history too  / Search field  F5 Again  Esc Field  Q Quit",
-        Screen::Disks => " Enter Scans  l Label  o Describe  +/- Set  g Scan now  f Forget  w Its set  F5 Refresh  Esc Back",
-        Screen::Diff if app.diff.focus == DiffFocus::PickOld && !matches!(app.diff.result, Job::Idle) => {
+        Screen::Find if app.find.editing => {
+            " Type  Enter Search  Ctrl+U Clear  ↓/Tab Results  Esc Back"
+        }
+        Screen::Find if app.find.history.is_running() => {
+            " ↑↓ Select  Enter Open in its scan  x Stop the history search  / Search field  Q Quit"
+        }
+        Screen::Find if app.find.history.done().is_some() => {
+            " ↑↓ Select  Enter Open in its scan  / Search field  F5 Again  Esc Field  Q Quit"
+        }
+        Screen::Find => {
+            " ↑↓ Select  Enter Open in its scan  p Search the history too  / Search field  F5 Again  Esc Field  Q Quit"
+        }
+        Screen::Disks => {
+            " Enter Scans  l Label  o Describe  +/- Set  g Scan now  f Forget  w Its set  F5 Refresh  Esc Back"
+        }
+        Screen::Diff
+            if app.diff.focus == DiffFocus::PickOld && !matches!(app.diff.result, Job::Idle) =>
+        {
             " ↑↓ Choose  Enter Next step  Esc Keep the current comparison"
         }
-        Screen::Diff if app.diff.focus == DiffFocus::PickOld => " ↑↓ Choose  Enter Next step  Esc Back",
-        Screen::Diff if app.diff.focus == DiffFocus::PickNew => " ↑↓ Choose  Enter Compare  Esc/← Previous step",
-        Screen::Diff if app.diff.focus == DiffFocus::Header => " Enter Choose other scans  ↓ Results  ←→ Tabs  Esc Back  Q Quit",
-        Screen::Diff if app.diff.tab == DiffTab::Summary => " ↑↓ Scroll  Enter Browse the changes  ←→ Tabs  p Other scans  Esc Back  Q Quit",
-        Screen::Diff => " ↑↓ Select  Enter Browse here  ←→ Tabs  o Order  f Min size  p Other scans  Esc Back",
-        Screen::Top if app.top.focus == TopFocus::Pick => " ↑↓ Choose  Enter Show this scan  Esc Back",
-        Screen::Top if app.top.focus == TopFocus::Header => " Enter Choose another scan  ↓ List  ←→ Files/Folders  m Sort  Esc Back  Q Quit",
-        Screen::Top => " ↑↓ Select  Enter Browse there  ←→ Files/Folders  m Sort  p Other scan  Esc Back  Q Quit",
-        Screen::Settings if app.settings_ui.edit.is_some() => " Type the value  Ctrl+U Clear  Enter Save  Esc Cancel",
-        Screen::Settings if matches!(app.selected_field().kind, FieldKind::Text | FieldKind::Number) => " ↑↓ Select  Enter Edit  Esc Back  Q Quit",
+        Screen::Diff if app.diff.focus == DiffFocus::PickOld => {
+            " ↑↓ Choose  Enter Next step  Esc Back"
+        }
+        Screen::Diff if app.diff.focus == DiffFocus::PickNew => {
+            " ↑↓ Choose  Enter Compare  Esc/← Previous step"
+        }
+        Screen::Diff if app.diff.focus == DiffFocus::Header => {
+            " Enter Choose other scans  ↓ Results  ←→ Tabs  Esc Back  Q Quit"
+        }
+        Screen::Diff if app.diff.tab == DiffTab::Summary => {
+            " ↑↓ Scroll  Enter Browse the changes  ←→ Tabs  p Other scans  Esc Back  Q Quit"
+        }
+        Screen::Diff => {
+            " ↑↓ Select  Enter Browse here  ←→ Tabs  o Order  f Min size  p Other scans  Esc Back"
+        }
+        Screen::Top if app.top.focus == TopFocus::Pick => {
+            " ↑↓ Choose  Enter Show this scan  Esc Back"
+        }
+        Screen::Top if app.top.focus == TopFocus::Header => {
+            " Enter Choose another scan  ↓ List  ←→ Files/Folders  m Sort  Esc Back  Q Quit"
+        }
+        Screen::Top => {
+            " ↑↓ Select  Enter Browse there  ←→ Files/Folders  m Sort  p Other scan  Esc Back  Q Quit"
+        }
+        Screen::Settings if app.settings_ui.edit.is_some() => {
+            " Type the value  Ctrl+U Clear  Enter Save  Esc Cancel"
+        }
+        Screen::Settings
+            if matches!(
+                app.selected_field().kind,
+                FieldKind::Text | FieldKind::Number
+            ) =>
+        {
+            " ↑↓ Select  Enter Edit  Esc Back  Q Quit"
+        }
         Screen::Settings => " ↑↓ Select  Enter Toggle (saved at once)  Esc Back  Q Quit",
-        Screen::Browse if matches!(app.browse.as_ref().map(|b| b.source), Some(BrowseSource::Diff { .. })) => {
+        Screen::Browse
+            if matches!(
+                app.browse.as_ref().map(|b| b.source),
+                Some(BrowseSource::Diff { .. })
+            ) =>
+        {
             " ↑↓ Select  Enter/→ Open folder  Esc/← Up a level  c This folder in the newer scan  a Analyse now  Q Quit"
         }
-        Screen::Browse => " ↑↓ Select  Enter/→ Open folder  Esc/← Up a level  c What changed here  a Analyse now  Q Quit",
+        Screen::Browse => {
+            " ↑↓ Select  Enter/→ Open folder  Esc/← Up a level  c What changed here  a Analyse now  Q Quit"
+        }
         _ => " ↑↓/PgUp/PgDn Scroll  Esc Back  ? Help  Q Quit",
     };
-    f.render_widget(Paragraph::new(fit_hint(hint, area.width as usize)).style(Style::new().fg(Color::DarkGray)), area);
+    f.render_widget(
+        Paragraph::new(fit_hint(hint, area.width as usize)).style(Style::new().fg(Color::DarkGray)),
+        area,
+    );
 }
 
 /// A footer that fits: when the terminal is narrow, hints are dropped from the
@@ -2005,7 +3440,14 @@ fn fit_hint(hint: &str, width: usize) -> String {
     let parts: Vec<&str> = hint.trim_start().split("  ").collect();
     let exit = |p: &&str| p.starts_with("Esc") || p.starts_with("Q ") || p.starts_with("← Back");
     let mut keep: Vec<bool> = parts.iter().map(|_| true).collect();
-    let len = |keep: &[bool]| 1 + parts.iter().zip(keep).filter(|(_, k)| **k).map(|(p, _)| p.chars().count() + 2).sum::<usize>();
+    let len = |keep: &[bool]| {
+        1 + parts
+            .iter()
+            .zip(keep)
+            .filter(|(_, k)| **k)
+            .map(|(p, _)| p.chars().count() + 2)
+            .sum::<usize>()
+    };
     for i in (1..parts.len()).rev() {
         if len(&keep) <= width {
             break;
@@ -2014,16 +3456,29 @@ fn fit_hint(hint: &str, width: usize) -> String {
             keep[i] = false;
         }
     }
-    let out: Vec<&str> = parts.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| *p).collect();
+    let out: Vec<&str> = parts
+        .iter()
+        .zip(&keep)
+        .filter(|(_, k)| **k)
+        .map(|(p, _)| *p)
+        .collect();
     format!(" {}", out.join("  "))
 }
 
 fn draw_confirm(f: &mut Frame, area: Rect, msg: &str) {
     let w = (msg.chars().count() as u16 + 6).min(area.width);
-    let rect = Rect { x: area.x + (area.width.saturating_sub(w)) / 2, y: area.y + area.height / 2, width: w, height: 3.min(area.height) };
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + area.height / 2,
+        width: w,
+        height: 3.min(area.height),
+    };
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(msg).alignment(Alignment::Center).wrap(Wrap { trim: true }).block(Block::bordered().border_style(Style::new().fg(Color::Yellow))),
+        Paragraph::new(msg)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
+            .block(Block::bordered().border_style(Style::new().fg(Color::Yellow))),
         rect,
     );
 }
@@ -2072,7 +3527,11 @@ pub fn help_text(app: &App) -> String {
          Config file:     {}{}\n\
          Snapshot store:  {}\n",
         s.config_path.value.display(),
-        if s.config_exists { "" } else { " (not present, defaults in use)" },
+        if s.config_exists {
+            ""
+        } else {
+            " (not present, defaults in use)"
+        },
         s.storage_path.value.display(),
     )
 }
@@ -2080,7 +3539,10 @@ pub fn help_text(app: &App) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{MenuItem, MENU, tests::{key, settings}};
+    use crate::app::{
+        MENU, MenuItem,
+        tests::{key, settings},
+    };
     use crossterm::event::KeyCode;
     use diskdrift_app::disks::{DiskList, DiskRow};
     use diskdrift_app::storage::disks::{Disk, Identity, VolumeFacts};
@@ -2106,11 +3568,16 @@ mod tests {
     }
 
     fn row_containing(screen: &str, needle: &str) -> usize {
-        screen.lines().position(|line| line.contains(needle)).unwrap_or_else(|| panic!("missing {needle:?} in:\n{screen}"))
+        screen
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} in:\n{screen}"))
     }
 
     fn buffer_row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
-        (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect()
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
     }
 
     fn buffer_row_containing(buffer: &ratatui::buffer::Buffer, needle: &str) -> u16 {
@@ -2123,7 +3590,13 @@ mod tests {
         buffer_row_containing(buffer, &format!("┌{title}"))
     }
 
-    fn assert_group_box(buffer: &ratatui::buffer::Buffer, top: u16, bottom: u16, left: u16, right: u16) {
+    fn assert_group_box(
+        buffer: &ratatui::buffer::Buffer,
+        top: u16,
+        bottom: u16,
+        left: u16,
+        right: u16,
+    ) {
         for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
             assert_eq!(buffer[(x, y)].fg, GROUP_BORDER, "border cell ({x}, {y})");
         }
@@ -2138,7 +3611,12 @@ mod tests {
                     label: Some(format!("disk-{i}")),
                     description: None,
                     sets: Vec::new(),
-                    volume: VolumeFacts { name: Some(format!("V{i}")), fs_type: "apfs".into(), capacity_bytes: None },
+                    volume: VolumeFacts {
+                        name: Some(format!("V{i}")),
+                        fs_type: "apfs".into(),
+                        capacity_bytes: None,
+                        ..Default::default()
+                    },
                     device: None,
                     first_seen: "2026-01-01T10:00:00+01:00".into(),
                     last_seen: "2026-01-01T10:00:00+01:00".into(),
@@ -2156,7 +3634,28 @@ mod tests {
                 store_bytes: 0,
             })
             .collect();
-        DiskList { store_path: "/s".into(), store_exists: true, disks }
+        DiskList {
+            store_path: "/s".into(),
+            store_exists: true,
+            disks,
+            mount_errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn disks_screen_renders_mount_errors() {
+        let mut app = App::new(settings());
+        let mut list = dashboard_disks(1);
+        list.mount_errors = vec!["/Volumes/failing: permission denied".into()];
+        app.disks.list = Job::Done(Box::new(list));
+        app.screen = Screen::Disks;
+
+        let screen = render(&app, 100, 24);
+
+        assert!(
+            screen.contains("volume unavailable: /Volumes/failing: permission denied"),
+            "{screen}"
+        );
     }
 
     #[test]
@@ -2184,7 +3683,9 @@ mod tests {
         assert!(buffer_row(&buffer, left_title_row).contains("Disks & snapshots"));
         assert!(buffer_row(&buffer, diskdrift_title_row).contains("DiskDrift"));
 
-        let selected_x = buffer_row(&buffer, left_title_row + 1).find("> [S]").unwrap() as u16;
+        let selected_x = buffer_row(&buffer, left_title_row + 1)
+            .find("> [S]")
+            .unwrap() as u16;
         let selected = &buffer[(selected_x, left_title_row + 1)];
         assert_eq!(selected.fg, Color::Black);
         assert_eq!(selected.bg, ACCENT);
@@ -2196,9 +3697,18 @@ mod tests {
         let wide = render(&App::new(settings()), 76, 30);
         let stacked = render(&App::new(settings()), 75, 30);
 
-        assert_eq!(row_containing(&wide, "Disks & snapshots"), row_containing(&wide, "Explore & diagnose"));
-        assert!(row_containing(&stacked, "Disks & snapshots") < row_containing(&stacked, "Explore & diagnose"));
-        let diskdrift_row = stacked.lines().position(|line| line.contains("┌DiskDrift")).unwrap();
+        assert_eq!(
+            row_containing(&wide, "Disks & snapshots"),
+            row_containing(&wide, "Explore & diagnose")
+        );
+        assert!(
+            row_containing(&stacked, "Disks & snapshots")
+                < row_containing(&stacked, "Explore & diagnose")
+        );
+        let diskdrift_row = stacked
+            .lines()
+            .position(|line| line.contains("┌DiskDrift"))
+            .unwrap();
         assert!(row_containing(&stacked, "Explore & diagnose") < diskdrift_row);
         assert!(row_containing(&stacked, "[E] Settings") < row_containing(&stacked, "[?] Help"));
         assert!(row_containing(&stacked, "[?] Help") < row_containing(&stacked, "[Q] Quit"));
@@ -2214,7 +3724,13 @@ mod tests {
 
         let title_row = buffer_row_containing(&buffer, "Explore & diagnose");
         assert_group_box(&buffer, title_row, title_row + 7, 0, 74);
-        for label in ["[F] Find a file", "[T] Largest files", "[D] Compare snapshots", "[I] Investigate / Doctor", "[U] Volume usage"] {
+        for label in [
+            "[F] Find a file",
+            "[T] Largest files",
+            "[D] Compare snapshots",
+            "[I] Investigate / Doctor",
+            "[U] Volume usage",
+        ] {
             assert!(buffer_row_containing(&buffer, label) > title_row);
         }
         let recovery_row = buffer_row_containing(&buffer, "> [R] Recovery suggestions");
@@ -2279,7 +3795,10 @@ mod tests {
         let task_screen = render(&task, 80, 15);
         let task_buffer = render_buffer(&task, 80, 15);
         let task_title_row = buffer_row_containing(&task_buffer, "Disks & snapshots");
-        assert_eq!(task_title_row, buffer_row_containing(&task_buffer, "Explore & diagnose"));
+        assert_eq!(
+            task_title_row,
+            buffer_row_containing(&task_buffer, "Explore & diagnose")
+        );
         assert_group_box(&task_buffer, task_title_row, task_title_row + 7, 0, 38);
         assert_group_box(&task_buffer, task_title_row, task_title_row + 7, 41, 79);
         assert!(buffer_row_containing(&task_buffer, "> [C] Careful mode") > task_title_row);
@@ -2292,12 +3811,27 @@ mod tests {
         let diskdrift_screen = render(&diskdrift, 80, 15);
         let diskdrift_buffer = render_buffer(&diskdrift, 80, 15);
         let diskdrift_title_row = buffer_group_title_row(&diskdrift_buffer, "DiskDrift");
-        assert_group_box(&diskdrift_buffer, diskdrift_title_row, diskdrift_title_row + 2, 0, 79);
+        assert_group_box(
+            &diskdrift_buffer,
+            diskdrift_title_row,
+            diskdrift_title_row + 2,
+            0,
+            79,
+        );
         assert!(buffer_row_containing(&diskdrift_buffer, "> [E] Settings") > diskdrift_title_row);
         assert!(diskdrift_screen.contains("DiskDrift"), "{diskdrift_screen}");
-        assert!(!diskdrift_screen.contains("Disks & snapshots"), "{diskdrift_screen}");
-        assert!(!diskdrift_screen.contains("Explore & diagnose"), "{diskdrift_screen}");
-        assert!(diskdrift_screen.contains("Last scan:"), "{diskdrift_screen}");
+        assert!(
+            !diskdrift_screen.contains("Disks & snapshots"),
+            "{diskdrift_screen}"
+        );
+        assert!(
+            !diskdrift_screen.contains("Explore & diagnose"),
+            "{diskdrift_screen}"
+        );
+        assert!(
+            diskdrift_screen.contains("Last scan:"),
+            "{diskdrift_screen}"
+        );
     }
 
     #[test]
@@ -2316,7 +3850,13 @@ mod tests {
                 _ => "DiskDrift",
             };
             let title_row = buffer_group_title_row(&buffer, title);
-            assert_group_box(&buffer, title_row, title_row + group_height - 1, 0, width - 1);
+            assert_group_box(
+                &buffer,
+                title_row,
+                title_row + group_height - 1,
+                0,
+                width - 1,
+            );
             let selected_row = buffer_row_containing(&buffer, label);
             assert!(selected_row > title_row && selected_row < title_row + group_height);
         }
@@ -2338,7 +3878,9 @@ mod tests {
         let buffer = render_buffer(&app, 90, 24);
 
         assert!(buffer_row_containing(&buffer, "disk-0") > 0);
-        assert!(!buffer_row(&buffer, buffer_row_containing(&buffer, "disk-0")).contains("… and 1 more"));
+        assert!(
+            !buffer_row(&buffer, buffer_row_containing(&buffer, "disk-0")).contains("… and 1 more")
+        );
     }
 
     #[test]
@@ -2348,15 +3890,22 @@ mod tests {
         assert!(s.contains("[S] Scan disk"));
         assert!(s.contains("[?] Help"));
         let app = App::new(settings());
-        assert!(s.contains(&format!("Storage: {}", app.settings.storage_path.value.display())));
+        assert!(s.contains(&format!(
+            "Storage: {}",
+            app.settings.storage_path.value.display()
+        )));
     }
 
     #[test]
     fn every_screen_renders_in_tiny_terminals() {
-        for screen in MENU.iter().filter_map(|item| match item {
-            MenuItem::Screen(screen) => Some(*screen),
-            MenuItem::Quit => None,
-        }).chain([Screen::Dashboard]) {
+        for screen in MENU
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Screen(screen) => Some(*screen),
+                MenuItem::Quit => None,
+            })
+            .chain([Screen::Dashboard])
+        {
             let mut app = App::new(settings());
             app.handle_key(key(KeyCode::Char(screen.hotkey())));
             app.screen = screen;
@@ -2372,23 +3921,55 @@ mod tests {
     }
 
     #[test]
+    fn running_scan_does_not_render_missing_allocation_as_zero() {
+        let mut app = App::new(settings());
+        app.screen = Screen::Scan;
+        app.scan = ScanStage::Running {
+            progress: std::sync::Arc::default(),
+            started: std::time::Instant::now(),
+            root: "/".into(),
+            auto: false,
+            expected: None,
+        };
+
+        let screen = render(&app, 100, 24);
+
+        assert!(screen.contains("Allocated:  unknown"), "{screen}");
+        assert!(!screen.contains("Allocated:  0 B"), "{screen}");
+    }
+
+    #[test]
     fn recover_list_analysis_and_log_render() {
-        use crate::app::tests::{analysis, recover_report};
         use crate::app::Msg;
+        use crate::app::tests::{analysis, recover_report};
         let dir = std::env::temp_dir();
         let mut app = App::new(settings());
         app.handle_key(key(KeyCode::Char('r')));
-        app.handle_msg(Msg::DoctorStep(diskdrift_app::diagnostics::doctor::DoctorStep::OpenFiles));
+        app.handle_msg(Msg::DoctorStep(
+            diskdrift_app::diagnostics::doctor::DoctorStep::OpenFiles,
+        ));
         let s = render(&app, 100, 20);
         assert!(s.contains("checking deleted-but-open files"), "{s}");
         app.handle_msg(Msg::Recover(Box::new(Ok(recover_report(&dir)))));
         let s = render(&app, 120, 20);
-        assert!(s.contains("candidate 1") && s.contains("Enter: analyse this folder"), "{s}");
+        assert!(
+            s.contains("candidate 1") && s.contains("Enter: analyse this folder"),
+            "{s}"
+        );
         app.handle_key(key(KeyCode::Enter));
-        app.handle_msg(Msg::Analyze { id: 1, result: Box::new(Ok(analysis(&dir))) });
+        app.handle_msg(Msg::Analyze {
+            id: 1,
+            result: Box::new(Ok(analysis(&dir))),
+        });
         let s = render(&app, 140, 24);
-        assert!(s.contains("sub/") && s.contains("regenerable") && s.contains("no installed app"), "{s}");
-        assert!(s.contains("Last change inside"), "detail of the selected item: {s}");
+        assert!(
+            s.contains("sub/") && s.contains("regenerable") && s.contains("no installed app"),
+            "{s}"
+        );
+        assert!(
+            s.contains("Last change inside"),
+            "detail of the selected item: {s}"
+        );
         for (w, h) in [(20, 5), (1, 1), (60, 10)] {
             let _ = render(&app, w, h);
         }
@@ -2403,21 +3984,48 @@ mod tests {
         let mut app = App::new(settings());
         app.open_browse(BrowseSource::Snapshot(7), None, None);
         let s = render(&app, 100, 20);
-        assert!(s.contains("Browse #7") && s.contains("reading…") && s.contains("On disk"), "the frame is there while loading: {s}");
-        app.handle_msg(Msg::Browse { id: 1, result: Box::new(Ok(browse_listing("/r", "/r", &[("Library", true), ("big.iso", false)]))) });
+        assert!(
+            s.contains("Browse #7") && s.contains("reading…") && s.contains("On disk"),
+            "the frame is there while loading: {s}"
+        );
+        app.handle_msg(Msg::Browse {
+            id: 1,
+            result: Box::new(Ok(browse_listing(
+                "/r",
+                "/r",
+                &[("Library", true), ("big.iso", false)],
+            ))),
+        });
         let s = render(&app, 110, 20);
-        assert!(s.contains("Browse #7 2026-10-21 10:00 “base”") && s.contains("Library/") && s.contains("big.iso") && s.contains("50%"), "{s}");
+        assert!(
+            s.contains("Browse #7 2026-10-21 10:00 “base”")
+                && s.contains("Library/")
+                && s.contains("big.iso")
+                && s.contains("50%"),
+            "{s}"
+        );
         // Entering a folder keeps the parent's rows (greyed) until the folder is read.
         app.handle_key(key(KeyCode::Enter));
         let s = render(&app, 110, 20);
-        assert!(s.contains("/r/Library") && s.contains("reading…") && s.contains("big.iso"), "{s}");
-        app.handle_msg(Msg::Browse { id: 2, result: Box::new(Ok(browse_listing("/r", "/r/Library", &[("Caches", true)]))) });
+        assert!(
+            s.contains("/r/Library") && s.contains("reading…") && s.contains("big.iso"),
+            "{s}"
+        );
+        app.handle_msg(Msg::Browse {
+            id: 2,
+            result: Box::new(Ok(browse_listing("/r", "/r/Library", &[("Caches", true)]))),
+        });
         let s = render(&app, 110, 20);
-        assert!(s.contains("Caches/") && !s.contains("big.iso") && !s.contains("reading…"), "{s}");
+        assert!(
+            s.contains("Caches/") && !s.contains("big.iso") && !s.contains("reading…"),
+            "{s}"
+        );
 
-        let BrowseData::Snapshot(b) = browse_listing("/r", "/r", &[]) else { unreachable!() };
+        let BrowseData::Snapshot(b) = browse_listing("/r", "/r", &[]) else {
+            unreachable!()
+        };
         let child = |name: &str, change, old, new| DiffChild {
-            path: format!("/r/{name}").into_bytes().into(),
+            path: diskdrift_app::core::native::NativePath::unix(format!("/r/{name}").into_bytes()),
             kind: diskdrift_app::core::record::Kind::Dir,
             change,
             old_allocated: old,
@@ -2433,16 +4041,28 @@ mod tests {
             path: "/r".into(),
             listing: DiffListing {
                 dir: Some(child("", Change::Modified, 10, 5_000_000)),
-                items: vec![child("Downloads", Change::Modified, 0, 4_000_000), child("gone", Change::Deleted, 10, 0)],
+                items: vec![
+                    child("Downloads", Change::Modified, 0, 4_000_000),
+                    child("gone", Change::Deleted, 10, 0),
+                ],
                 more_items: 0,
                 more_delta_allocated: 0,
                 unchanged_items: 4,
             },
         }));
         app.open_browse(BrowseSource::Diff { old: 7, new: 7 }, None, None);
-        app.handle_msg(Msg::Browse { id: 3, result: Box::new(Ok(data)) });
+        app.handle_msg(Msg::Browse {
+            id: 3,
+            result: Box::new(Ok(data)),
+        });
         let s = render(&app, 110, 20);
-        assert!(s.contains("+4.0 MB") && s.contains("Downloads/") && s.contains("deleted") && s.contains("in 2 of 6 items here"), "{s}");
+        assert!(
+            s.contains("+4.0 MB")
+                && s.contains("Downloads/")
+                && s.contains("deleted")
+                && s.contains("in 2 of 6 items here"),
+            "{s}"
+        );
         for (w, h) in [(20, 5), (1, 1), (60, 10)] {
             let _ = render(&app, w, h);
         }
@@ -2454,7 +4074,10 @@ mod tests {
         assert_eq!(fit_hint(hint, 200), hint);
         let short = fit_hint(hint, 60);
         assert!(short.chars().count() <= 60, "{short}");
-        assert!(short.starts_with(" ↑↓ Select") && short.ends_with("Esc Back  Q Quit"), "{short}");
+        assert!(
+            short.starts_with(" ↑↓ Select") && short.ends_with("Esc Back  Q Quit"),
+            "{short}"
+        );
     }
 
     #[test]
@@ -2484,8 +4107,8 @@ mod tests {
 
     #[test]
     fn find_shows_current_and_gone_results_at_80_and_120_columns() {
-        use crate::app::tests::{find_gone, find_hit};
         use crate::app::Msg;
+        use crate::app::tests::{find_gone, find_hit};
         use diskdrift_app::search::{Current, History};
         let mut app = App::new(settings());
         app.open(Screen::Find);
@@ -2497,24 +4120,48 @@ mod tests {
         assert!(typing.contains("case and diacritics ignored"), "{typing}");
         app.handle_key(key(KeyCode::Enter));
         let hits = vec![find_hit("/Volumes/backupy-2014/Docs/wazna-plan.txt", false)];
-        app.handle_msg(Msg::FindCurrent { id: 1, result: Box::new(Ok(Current::for_test(Vec::new(), hits, 1))) });
+        app.handle_msg(Msg::FindCurrent {
+            id: 1,
+            result: Box::new(Ok(Current::for_test(Vec::new(), hits, 1))),
+        });
         app.handle_key(key(KeyCode::Char('p')));
         let mut gone = find_gone("/Volumes/backupy-2014/Docs/wazna10.txt");
         gone.moved_to = Some("/Volumes/backupy-2014/Old/wazna10.txt".into());
-        let h = History { gone: vec![gone], gone_total: 1, pairs: 7, pairs_done: 7, ..Default::default() };
-        app.handle_msg(Msg::FindHistory { id: 1, result: Box::new(Ok(h)) });
+        let h = History {
+            gone: vec![gone],
+            gone_total: 1,
+            pairs: 7,
+            pairs_done: 7,
+            ..Default::default()
+        };
+        app.handle_msg(Msg::FindHistory {
+            id: 1,
+            result: Box::new(Ok(h)),
+        });
         for (w, h) in [(80, 24), (120, 30)] {
             let s = render(&app, w, h);
             assert!(s.contains("1 match in"), "{s}");
             assert!(s.contains("In the history: 1 path no longer there."), "{s}");
-            assert!(s.contains("Docs/wazna-plan.txt") && s.contains("Docs/wazna10.txt"), "{s}");
-            assert!(s.contains(" off "), "a disk that is not connected is marked: {s}");
+            assert!(
+                s.contains("Docs/wazna-plan.txt") && s.contains("Docs/wazna10.txt"),
+                "{s}"
+            );
+            assert!(
+                s.contains(" off "),
+                "a disk that is not connected is marked: {s}"
+            );
             assert!(s.contains("gone #13"), "{s}");
         }
         app.handle_key(key(KeyCode::Down));
         let s = render(&app, 120, 30);
-        assert!(s.contains("last seen in scan #12") && s.contains("gone in scan #13"), "{s}");
-        assert!(s.contains("probably moved to /Volumes/backupy-2014/Old/wazna10.txt"), "{s}");
+        assert!(
+            s.contains("last seen in scan #12") && s.contains("gone in scan #13"),
+            "{s}"
+        );
+        assert!(
+            s.contains("probably moved to /Volumes/backupy-2014/Old/wazna10.txt"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -2524,16 +4171,25 @@ mod tests {
         let mut app = App::new(settings());
         app.open(Screen::Careful);
         let off = render(&app, 100, 24);
-        assert!(off.contains("Careful mode — off") && off.contains("o turns it on"), "{off}");
+        assert!(
+            off.contains("Careful mode — off") && off.contains("o turns it on"),
+            "{off}"
+        );
         assert!(!off.contains("CAREFUL MODE"));
         app.careful.on = Some(true);
         app.handle_msg(Msg::CarefulHeld(Box::new(Ok(held("disk9s1", "OLD", None)))));
         let on = render(&app, 100, 24);
         assert!(on.contains("ON: external disks are not mounted"), "{on}");
-        assert!(on.contains("OLD") && on.contains("held, not mounted") && on.contains("USB Old Stick"), "{on}");
+        assert!(
+            on.contains("OLD") && on.contains("held, not mounted") && on.contains("USB Old Stick"),
+            "{on}"
+        );
         assert!(on.contains("g Scan carefully"), "{on}");
         app.screen = Screen::Dashboard;
-        assert!(render(&app, 80, 24).contains("CAREFUL MODE"), "the header says so everywhere");
+        assert!(
+            render(&app, 80, 24).contains("CAREFUL MODE"),
+            "the header says so everywhere"
+        );
     }
 
     #[test]
@@ -2546,7 +4202,12 @@ mod tests {
             label: label.map(String::from),
             description: None,
             sets: vec!["stare-dyski".into()],
-            volume: VolumeFacts { name: Some("OLD".into()), fs_type: fs.into(), capacity_bytes: Some(500_107_862_016) },
+            volume: VolumeFacts {
+                name: Some("OLD".into()),
+                fs_type: fs.into(),
+                capacity_bytes: Some(500_107_862_016),
+                ..Default::default()
+            },
             device: None,
             first_seen: "2014-03-01T10:00:00+01:00".into(),
             last_seen: "2014-03-01T10:00:00+01:00".into(),
@@ -2571,20 +4232,54 @@ mod tests {
             store_path: "/s".into(),
             store_exists: true,
             disks: vec![
-                row(disk("d11111111", None, Identity::new(Strength::Uuid, "U"), "apfs"), true),
-                row(disk("d22222222", Some("backupy-2014"), Identity::new(Strength::Weak, "w"), "ntfs"), false),
+                row(
+                    disk(
+                        "d11111111",
+                        None,
+                        Identity::new(Strength::Uuid, "U"),
+                        "apfs",
+                    ),
+                    true,
+                ),
+                row(
+                    disk(
+                        "d22222222",
+                        Some("backupy-2014"),
+                        Identity::new(Strength::Weak, "w"),
+                        "ntfs",
+                    ),
+                    false,
+                ),
             ],
+            mount_errors: Vec::new(),
         }));
         app.disks.sel = 1;
         let s = render(&app, 80, 24);
         assert!(s.contains("My disks — 2 known, 1 connected"), "{s}");
-        assert!(s.contains("backupy-2014 ?") && s.contains("stare-dyski"), "{s}");
+        assert!(
+            s.contains("backupy-2014 ?") && s.contains("stare-dyski"),
+            "{s}"
+        );
         assert!(s.contains("not connected (last at /Volumes/OLD)"), "{s}");
         assert!(s.contains("recognised weakly"), "{s}");
         assert!(s.contains("f Forget") && s.contains("Esc Back"), "{s}");
-        app.disks.forget = Some(diskdrift_app::disks::Forget { disk: disk("d22222222", Some("backupy-2014"), Identity::new(Strength::Weak, "w"), "ntfs"), snapshots: vec![1, 2, 3], bytes: 1000, done: false });
+        app.disks.forget = Some(diskdrift_app::disks::Forget {
+            disk: disk(
+                "d22222222",
+                Some("backupy-2014"),
+                Identity::new(Strength::Weak, "w"),
+                "ntfs",
+            ),
+            snapshots: vec![1, 2, 3],
+            bytes: 1000,
+            done: false,
+            migration: diskdrift_app::storage::MigrationOutcome::None,
+        });
         let s = render(&app, 80, 24);
-        assert!(s.contains("removes its 3 snapshots") && s.contains("y forgets"), "{s}");
+        assert!(
+            s.contains("removes its 3 snapshots") && s.contains("y forgets"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -2597,7 +4292,12 @@ mod tests {
             label: Some(label.into()),
             description: None,
             sets: Vec::new(),
-            volume: VolumeFacts { name: Some("V".into()), fs_type: "hfs".into(), capacity_bytes: None },
+            volume: VolumeFacts {
+                name: Some("V".into()),
+                fs_type: "hfs".into(),
+                capacity_bytes: None,
+                ..Default::default()
+            },
             device: None,
             first_seen: "2026-01-01T10:00:00+01:00".into(),
             last_seen: "2026-01-01T10:00:00+01:00".into(),
@@ -2610,20 +4310,68 @@ mod tests {
             store_path: "/s".into(),
             store_exists: true,
             disks: vec![
-                DiskRow { disk: disk("d1", "macbook"), known: true, connected: true, mount_point: Some("/".into()), snapshots: 3, last_scan: Some("2026-01-01T10:00:00+01:00".into()), last_size: Some(288_000_000_000), last_root: Some("/nonexistent-home/Library".into()), store_bytes: 0 },
-                DiskRow { disk: disk("d2", "backupy-2014"), known: true, connected: false, mount_point: None, snapshots: 1, last_scan: Some("2014-03-01T10:00:00+01:00".into()), last_size: Some(450_000_000_000), last_root: Some("/".into()), store_bytes: 0 },
-                DiskRow { disk: disk("d3", "STICK"), known: false, connected: true, mount_point: Some("/Volumes/STICK".into()), snapshots: 0, last_scan: None, last_size: None, last_root: None, store_bytes: 0 },
+                DiskRow {
+                    disk: disk("d1", "macbook"),
+                    known: true,
+                    connected: true,
+                    mount_point: Some("/".into()),
+                    snapshots: 3,
+                    last_scan: Some("2026-01-01T10:00:00+01:00".into()),
+                    last_size: Some(288_000_000_000),
+                    last_root: Some("/nonexistent-home/Library".into()),
+                    store_bytes: 0,
+                },
+                DiskRow {
+                    disk: disk("d2", "backupy-2014"),
+                    known: true,
+                    connected: false,
+                    mount_point: None,
+                    snapshots: 1,
+                    last_scan: Some("2014-03-01T10:00:00+01:00".into()),
+                    last_size: Some(450_000_000_000),
+                    last_root: Some("/".into()),
+                    store_bytes: 0,
+                },
+                DiskRow {
+                    disk: disk("d3", "STICK"),
+                    known: false,
+                    connected: true,
+                    mount_point: Some("/Volumes/STICK".into()),
+                    snapshots: 0,
+                    last_scan: None,
+                    last_size: None,
+                    last_root: None,
+                    store_bytes: 0,
+                },
             ],
+            mount_errors: Vec::new(),
         }));
         let s = render(&app, 100, 30);
         assert!(s.contains(" Disks "), "{s}");
-        assert!(s.contains("backupy-2014") && s.contains("not connected") && s.contains("450 GB on the disk"), "{s}");
-        assert!(s.contains("288 GB in ~/Library"), "the size of the folder scanned, not of the disk: {s}");
+        assert!(
+            s.contains("backupy-2014")
+                && s.contains("not connected")
+                && s.contains("450 GB on the disk"),
+            "{s}"
+        );
+        assert!(
+            s.contains("288 GB in ~/Library"),
+            "the size of the folder scanned, not of the disk: {s}"
+        );
         let narrow = render(&app, 80, 30);
-        assert!(narrow.contains("450 GB on the disk ") && narrow.contains("288 GB in ~/Library "), "the lines fit: {narrow}");
-        assert!(s.contains("STICK") && s.contains("not scanned · K to label or scan it"), "{s}");
+        assert!(
+            narrow.contains("450 GB on the disk ") && narrow.contains("288 GB in ~/Library "),
+            "the lines fit: {narrow}"
+        );
+        assert!(
+            s.contains("STICK") && s.contains("not scanned · K to label or scan it"),
+            "{s}"
+        );
         // A short terminal keeps the menu and the status; the panel shrinks.
         let s = render(&app, 80, 20);
-        assert!(s.contains("[S] Scan disk") && s.contains("Last scan"), "{s}");
+        assert!(
+            s.contains("[S] Scan disk") && s.contains("Last scan"),
+            "{s}"
+        );
     }
 }

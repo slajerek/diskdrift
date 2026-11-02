@@ -2,6 +2,7 @@
 //! and `tmutil` queries.
 
 use crate::command::{self, CommandError};
+use crate::measurement::Envelope;
 use diskdrift_platform::MountInfo;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -24,9 +25,13 @@ pub struct ApfsContainer {
     pub uuid: String,
     pub physical_store: String,
     /// Container size. Volumes share it; their capacities must never be added up.
-    pub capacity_bytes: u64,
-    pub free_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_bytes: Option<u64>,
     pub volumes: Vec<ApfsVolume>,
+    #[serde(flatten)]
+    pub measurement: Envelope,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -36,10 +41,13 @@ pub struct ApfsVolume {
     pub uuid: String,
     pub name: String,
     pub roles: Vec<String>,
-    pub in_use_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_use_bytes: Option<u64>,
     pub encrypted: bool,
     pub locked: bool,
     pub mount_point: Option<PathBuf>,
+    #[serde(flatten)]
+    pub measurement: Envelope,
 }
 
 impl ApfsVolume {
@@ -63,9 +71,9 @@ struct RawContainer {
     #[serde(rename = "DesignatedPhysicalStore", default)]
     physical_store: String,
     #[serde(rename = "CapacityCeiling", default)]
-    capacity: u64,
+    capacity: Option<u64>,
     #[serde(rename = "CapacityFree", default)]
-    free: u64,
+    free: Option<u64>,
     #[serde(rename = "Volumes", default)]
     volumes: Vec<RawVolume>,
 }
@@ -81,7 +89,7 @@ struct RawVolume {
     #[serde(rename = "Roles", default)]
     roles: Vec<String>,
     #[serde(rename = "CapacityInUse", default)]
-    in_use: u64,
+    in_use: Option<u64>,
     #[serde(rename = "Encryption", default)]
     encrypted: bool,
     #[serde(rename = "Locked", default)]
@@ -103,8 +111,12 @@ fn device_matches(mount_device: &str, volume_device: &str) -> bool {
 }
 
 /// Parses `diskutil apfs list -plist` output and attaches mount points.
-pub fn parse_topology(plist_bytes: &[u8], mounts: &[MountInfo]) -> Result<Vec<ApfsContainer>, ApfsError> {
-    let raw: RawList = plist::from_bytes(plist_bytes).map_err(|e| ApfsError::Parse(e.to_string()))?;
+pub fn parse_topology(
+    plist_bytes: &[u8],
+    mounts: &[MountInfo],
+) -> Result<Vec<ApfsContainer>, ApfsError> {
+    let raw: RawList =
+        plist::from_bytes(plist_bytes).map_err(|e| ApfsError::Parse(e.to_string()))?;
     Ok(raw
         .containers
         .into_iter()
@@ -134,9 +146,27 @@ pub fn parse_topology(plist_bytes: &[u8], mounts: &[MountInfo]) -> Result<Vec<Ap
                         encrypted: v.encrypted,
                         locked: v.locked,
                         mount_point,
+                        measurement: if v.in_use.is_some() {
+                            Envelope::observed("apfs_volume", "volume", "diskutil apfs list -plist")
+                        } else {
+                            Envelope::unknown(
+                                "apfs_volume",
+                                "volume",
+                                "diskutil apfs list -plist; CapacityInUse unavailable",
+                            )
+                        },
                     }
                 })
                 .collect(),
+            measurement: if c.capacity.is_some() && c.free.is_some() {
+                Envelope::observed("apfs_container", "container", "diskutil apfs list -plist")
+            } else {
+                Envelope::unknown(
+                    "apfs_container",
+                    "container",
+                    "diskutil apfs list -plist; capacity fields unavailable",
+                )
+            },
         })
         .collect())
 }
@@ -209,8 +239,12 @@ fn classify(name: &str) -> (SnapshotKind, Option<String>) {
     }
 }
 
-pub fn parse_snapshots(plist_bytes: &[u8], volume: &ApfsVolume) -> Result<Vec<LocalSnapshot>, ApfsError> {
-    let raw: RawSnapshots = plist::from_bytes(plist_bytes).map_err(|e| ApfsError::Parse(e.to_string()))?;
+pub fn parse_snapshots(
+    plist_bytes: &[u8],
+    volume: &ApfsVolume,
+) -> Result<Vec<LocalSnapshot>, ApfsError> {
+    let raw: RawSnapshots =
+        plist::from_bytes(plist_bytes).map_err(|e| ApfsError::Parse(e.to_string()))?;
     Ok(raw
         .snapshots
         .into_iter()
@@ -247,13 +281,22 @@ pub fn local_snapshots(containers: &[ApfsContainer]) -> (Vec<LocalSnapshot>, Vec
     let mut errors = Vec::new();
     for c in containers {
         for v in &c.volumes {
-            let interesting = v.has_role("System") || v.has_role("Data") || (v.roles.is_empty() && v.mount_point.as_ref().is_some_and(|m| m.starts_with("/Volumes")));
+            let interesting = v.has_role("System")
+                || v.has_role("Data")
+                || (v.roles.is_empty()
+                    && v.mount_point
+                        .as_ref()
+                        .is_some_and(|m| m.starts_with("/Volumes")));
             if !interesting || v.locked {
                 continue;
             }
-            match command::run("/usr/sbin/diskutil", &["apfs", "listSnapshots", "-plist", &v.device], TIMEOUT)
-                .map_err(ApfsError::from)
-                .and_then(|out| parse_snapshots(&out, v))
+            match command::run(
+                "/usr/sbin/diskutil",
+                &["apfs", "listSnapshots", "-plist", &v.device],
+                TIMEOUT,
+            )
+            .map_err(ApfsError::from)
+            .and_then(|out| parse_snapshots(&out, v))
             {
                 Ok(mut s) => snapshots.append(&mut s),
                 Err(e) => errors.push(format!("{} ({}): {e}", v.name, v.device)),
@@ -310,15 +353,55 @@ mod tests {
 
     #[test]
     fn parses_topology_and_maps_mounts() {
-        let mounts =
-            [mount("/dev/disk3s1s1", "/"), mount("/dev/disk3s5", "/System/Volumes/Data"), mount("/dev/disk3s10", "/x")];
+        let mounts = [
+            mount("/dev/disk3s1s1", "/"),
+            mount("/dev/disk3s5", "/System/Volumes/Data"),
+            mount("/dev/disk3s10", "/x"),
+        ];
         let c = parse_topology(LIST.as_bytes(), &mounts).unwrap();
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].capacity_bytes, 3_996_329_328_640);
-        assert_eq!(c[0].volumes[0].mount_point.as_deref(), Some(std::path::Path::new("/")));
+        assert_eq!(c[0].capacity_bytes, Some(3_996_329_328_640));
+        assert_eq!(
+            c[0].volumes[0].mount_point.as_deref(),
+            Some(std::path::Path::new("/"))
+        );
         assert!(c[0].volumes[0].has_role("System"));
-        assert_eq!(c[0].volumes[1].mount_point.as_deref(), Some(std::path::Path::new("/System/Volumes/Data")));
+        assert_eq!(
+            c[0].volumes[1].mount_point.as_deref(),
+            Some(std::path::Path::new("/System/Volumes/Data"))
+        );
         assert!(!device_matches("/dev/disk3s10", "disk3s1"));
+    }
+
+    #[test]
+    fn missing_apfs_byte_fields_remain_unknown_in_json() {
+        let plist = LIST
+            .replace(
+                "<key>CapacityCeiling</key><integer>3996329328640</integer>",
+                "",
+            )
+            .replace("<key>CapacityFree</key><integer>113119731712</integer>", "")
+            .replace("<key>CapacityInUse</key><integer>18471469056</integer>", "")
+            .replace(
+                "<key>CapacityInUse</key><integer>3843796258816</integer>",
+                "",
+            );
+        let parsed = parse_topology(plist.as_bytes(), &[]).unwrap();
+        assert_eq!(parsed[0].capacity_bytes, None);
+        assert_eq!(parsed[0].free_bytes, None);
+        assert_eq!(parsed[0].volumes[0].in_use_bytes, None);
+        assert_eq!(
+            parsed[0].measurement.quality,
+            Some(crate::measurement::Quality::Unknown)
+        );
+        assert_eq!(
+            parsed[0].volumes[0].measurement.quality,
+            Some(crate::measurement::Quality::Unknown)
+        );
+        let json = serde_json::to_string(&parsed).unwrap();
+        assert!(!json.contains("capacityBytes"));
+        assert!(!json.contains("freeBytes"));
+        assert!(!json.contains("inUseBytes"));
     }
 
     #[test]
@@ -326,13 +409,19 @@ mod tests {
         let (k, created) = classify("com.apple.TimeMachine.2026-10-21-011905.local");
         assert_eq!(k, SnapshotKind::TimeMachine);
         assert_eq!(created.as_deref(), Some("2026-10-21 01:19:05"));
-        assert_eq!(classify("com.apple.os.update-ABC").0, SnapshotKind::OsUpdate);
+        assert_eq!(
+            classify("com.apple.os.update-ABC").0,
+            SnapshotKind::OsUpdate
+        );
         assert_eq!(classify("custom").0, SnapshotKind::Other);
     }
 
     #[test]
     fn parses_dataless_marker() {
         let text = "Snapshots for volume group containing disk /:\ncom.apple.TimeMachine.2026-10-07-142819.local (dataless)\ncom.apple.TimeMachine.2026-10-21-011905.local\n";
-        assert_eq!(parse_tmutil_dataless(text), ["com.apple.TimeMachine.2026-10-07-142819.local"]);
+        assert_eq!(
+            parse_tmutil_dataless(text),
+            ["com.apple.TimeMachine.2026-10-07-142819.local"]
+        );
     }
 }

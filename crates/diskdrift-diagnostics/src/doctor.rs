@@ -2,6 +2,7 @@
 
 use crate::access::{self, AccessCheck};
 use crate::apfs::{self, ApfsContainer, LocalSnapshot};
+use crate::measurement::Quality;
 use crate::openfiles::{self, OpenDeletedReport};
 use crate::suspects::{self, LargeFile, LargeFiles, Measure, MeasureStatus, Risk};
 use crate::usage::{self, UsageReport};
@@ -47,10 +48,25 @@ pub enum DoctorStep {
     Volumes,
     Snapshots,
     /// Location sizes come from a saved scan (`source`); only the others are measured.
-    FromScan { source: String, locations: usize },
-    Measuring { label: String, index: usize, total: usize },
+    FromScan {
+        source: String,
+        locations: usize,
+    },
+    Measuring {
+        label: String,
+        index: usize,
+        total: usize,
+    },
     /// A location (and the ones nested in it) was measured.
-    Measured { label: String, path: PathBuf, status: MeasureStatus, allocated_bytes: u64, entries: u64, elapsed: Duration },
+    Measured {
+        label: String,
+        path: PathBuf,
+        status: MeasureStatus,
+        allocated_bytes: Option<u64>,
+        quality: Quality,
+        entries: u64,
+        elapsed: Duration,
+    },
     OpenFiles,
 }
 
@@ -76,13 +92,19 @@ pub struct Finding {
     /// the parent; never add them together.
     pub within: Option<String>,
     pub status: MeasureStatus,
-    pub logical_bytes: u64,
-    pub allocated_bytes: u64,
-    pub entries: u64,
-    pub inaccessible_dirs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inaccessible_dirs: Option<u64>,
     pub confidence: Confidence,
     pub risk: Risk,
     pub recommendation: String,
+    #[serde(flatten)]
+    pub measurement: crate::measurement::Envelope,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +113,7 @@ pub struct SnapshotInventory {
     pub snapshots: Vec<LocalSnapshot>,
     /// APFS does not report per-snapshot sizes; this stays "unknown" by design.
     pub reclaimable: String,
+    pub reclaimable_measurement: crate::measurement::Envelope,
     pub errors: Vec<String>,
 }
 
@@ -113,14 +136,28 @@ pub struct DoctorReport {
     pub findings: Vec<Finding>,
     pub largest_files: Vec<LargeFile>,
     pub open_deleted: OpenDeletedReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reference_free_bytes: Option<u64>,
+    pub reference_free_measurement: crate::measurement::Envelope,
     /// Reference minus important-usage available now (positive = space lost).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub unexplained_gap_bytes: Option<i128>,
+    pub unexplained_gap_measurement: crate::measurement::Envelope,
     pub conclusion: Vec<String>,
     /// Set when location sizes were taken from a saved scan instead of measured now.
     pub sizes_from: Option<String>,
     pub files_modified: bool,
     pub elapsed_ms: u64,
+}
+
+fn report_uses_macos_terms(usage: &UsageReport) -> bool {
+    cfg!(target_os = "macos")
+        || !usage.containers.is_empty()
+        || usage.other_volumes.iter().any(|v| {
+            v.fs_type.eq_ignore_ascii_case("apfs")
+                || v.available_important_bytes.is_some()
+                || v.purgeable_estimate_bytes.is_some()
+        })
 }
 
 pub fn run(
@@ -131,47 +168,76 @@ pub fn run(
 ) -> DoctorReport {
     let started = Instant::now();
     progress(DoctorStep::Volumes);
-    let mounts = diskdrift_platform::mounts().unwrap_or_default();
+    let (mounts, mounts_error) = match diskdrift_platform::mounts() {
+        Ok(inventory) => (
+            inventory.mounts,
+            (!inventory.errors.is_empty()).then(|| inventory.errors.join("; ")),
+        ),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     let topology = apfs::topology(&mounts);
     let containers: &[ApfsContainer] = topology.as_deref().unwrap_or(&[]);
-    let usage = usage::build(&mounts, topology.as_deref().map_err(|e| e.to_string()), false);
+    let mut usage = usage::build(
+        &mounts,
+        topology.as_deref().map_err(|e| e.to_string()),
+        false,
+    );
+    usage.mounts_error = mounts_error;
 
     progress(DoctorStep::Snapshots);
     let (snaps, snap_errors) = apfs::local_snapshots(containers);
     let access = access::full_disk_access();
+    let macos_terms = report_uses_macos_terms(&usage);
 
     let mut checks = Vec::new();
-    checks.push(Check {
-        name: "APFS container / volume mapping".into(),
-        status: match &topology {
-            Ok(c) if !c.is_empty() => "OK".into(),
-            Ok(_) => "NONE".into(),
-            Err(_) => "ERROR".into(),
-        },
-        detail: match &topology {
-            Ok(c) => format!("{} container(s)", c.len()),
-            Err(e) => e.to_string(),
-        },
-    });
-    let tm = snaps.iter().filter(|s| s.kind == apfs::SnapshotKind::TimeMachine).count();
-    checks.push(Check {
-        name: "Local snapshots".into(),
-        status: format!("{} detected", snaps.len()),
-        detail: format!(
-            "{tm} Time Machine, {} OS update, {} other; reclaimable: unknown",
-            snaps.iter().filter(|s| s.kind == apfs::SnapshotKind::OsUpdate).count(),
-            snaps.iter().filter(|s| s.kind == apfs::SnapshotKind::Other).count()
-        ),
-    });
-    checks.push(Check {
-        name: "Full Disk Access coverage".into(),
-        status: match access.full_disk_access {
-            access::Access::Granted => "FULL".into(),
-            access::Access::NotGranted => "PARTIAL".into(),
-            access::Access::Unknown => "UNKNOWN".into(),
-        },
-        detail: access.detail.clone(),
-    });
+    let tm = snaps
+        .iter()
+        .filter(|s| s.kind == apfs::SnapshotKind::TimeMachine)
+        .count();
+    if macos_terms {
+        checks.push(Check {
+            name: "APFS container / volume mapping".into(),
+            status: match &topology {
+                Ok(c) if !c.is_empty() => "OK".into(),
+                Ok(_) => "NONE".into(),
+                Err(_) => "ERROR".into(),
+            },
+            detail: match &topology {
+                Ok(c) => format!("{} container(s)", c.len()),
+                Err(e) => e.to_string(),
+            },
+        });
+        checks.push(Check {
+            name: "Local snapshots".into(),
+            status: format!("{} detected", snaps.len()),
+            detail: format!(
+                "{tm} Time Machine, {} OS update, {} other; reclaimable: unknown",
+                snaps
+                    .iter()
+                    .filter(|s| s.kind == apfs::SnapshotKind::OsUpdate)
+                    .count(),
+                snaps
+                    .iter()
+                    .filter(|s| s.kind == apfs::SnapshotKind::Other)
+                    .count()
+            ),
+        });
+        checks.push(Check {
+            name: "Full Disk Access coverage".into(),
+            status: match access.full_disk_access {
+                access::Access::Granted => "FULL".into(),
+                access::Access::NotGranted => "PARTIAL".into(),
+                access::Access::Unknown => "UNKNOWN".into(),
+            },
+            detail: access.detail.clone(),
+        });
+    } else {
+        checks.push(Check {
+            name: "Volume discovery".into(),
+            status: "OK".into(),
+            detail: format!("{} volume(s)", usage.other_volumes.len()),
+        });
+    }
 
     let (findings, largest_files) = measure_suspects(opts, lister, cancel, progress);
 
@@ -179,7 +245,7 @@ pub fn run(
     let open_deleted = openfiles::scan(Duration::from_secs(20));
 
     let primary = usage.primary();
-    let available_now = primary.map(|v| v.available_important_bytes.unwrap_or(v.available_bytes));
+    let available_now = primary.and_then(|v| v.available_important_bytes.or(v.available_bytes));
     let unexplained_gap_bytes = match (opts.reference_free, available_now) {
         (Some(r), Some(a)) => Some(r as i128 - a as i128),
         _ => None,
@@ -187,28 +253,39 @@ pub fn run(
 
     let mut conclusion = Vec::new();
     if let Some(v) = primary
-        && let Some(p) = v.purgeable_estimate_bytes.filter(|&p| p > 0) {
-            conclusion.push(format!(
-                "macOS estimates {} of purgeable space on {} (snapshots, evictable caches) that it can free on demand.",
-                diskdrift_core::units::format_size(p, Default::default()),
-                v.name
-            ));
-        }
+        && let Some(p) = v.purgeable_estimate_bytes.filter(|&p| p > 0)
+    {
+        conclusion.push(format!(
+            "The operating system estimates {} of {} space on {} that it can free on demand.",
+            diskdrift_core::units::format_size(p, Default::default()),
+            if macos_terms {
+                "purgeable (snapshots, evictable caches)"
+            } else {
+                "reclaimable"
+            },
+            v.name
+        ));
+    }
     if tm > 0 {
         conclusion.push(format!(
             "{tm} local Time Machine snapshot(s) may hold space of deleted or changed files; APFS does not report how much."
         ));
     }
-    let measurable: Vec<&Finding> = findings.iter().filter(|f| f.within.is_none() && f.allocated_bytes > 0).collect();
+    let measurable: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.within.is_none() && f.allocated_bytes.is_some_and(|bytes| bytes > 0))
+        .collect();
     if let Some(top) = measurable.first() {
         conclusion.push(format!(
             "Largest measured location: {} ({}).",
             top.label,
-            diskdrift_core::units::format_size(top.allocated_bytes, Default::default())
+            diskdrift_core::units::format_size(top.allocated_bytes.unwrap(), Default::default())
         ));
     }
-    if access.full_disk_access != access::Access::Granted {
-        conclusion.push("Some protected locations could not be measured without Full Disk Access.".into());
+    if macos_terms && access.full_disk_access != access::Access::Granted {
+        conclusion.push(
+            "Some protected locations could not be measured without Full Disk Access.".into(),
+        );
     }
     match unexplained_gap_bytes {
         Some(g) if g > 0 => conclusion.push(match &opts.baseline {
@@ -233,14 +310,46 @@ pub fn run(
         usage,
         checks,
         access,
-        snapshots: SnapshotInventory { snapshots: snaps, reclaimable: "unknown".into(), errors: snap_errors },
+        snapshots: SnapshotInventory {
+            snapshots: snaps,
+            reclaimable: "unknown".into(),
+            reclaimable_measurement: crate::measurement::Envelope::unknown(
+                "apfs",
+                "local snapshot reclaimability",
+                "APFS does not report per-snapshot reclaimable bytes",
+            ),
+            errors: snap_errors,
+        },
         findings,
         largest_files,
         open_deleted,
         reference_free_bytes: opts.reference_free,
+        reference_free_measurement: opts
+            .reference_free
+            .map(|_| {
+                crate::measurement::Envelope::estimated(
+                    "filesystem",
+                    "reference free space",
+                    "user supplied; not verified",
+                )
+            })
+            .unwrap_or_default(),
         unexplained_gap_bytes,
+        unexplained_gap_measurement: unexplained_gap_bytes
+            .map(|_| {
+                crate::measurement::Envelope::estimated(
+                    "filesystem",
+                    "free-space accounting",
+                    "user-supplied reference minus OS-reported available space",
+                )
+            })
+            .unwrap_or_default(),
         conclusion,
-        sizes_from: opts.known.as_ref().filter(|k| !k.sizes.is_empty()).map(|k| k.source.clone()),
+        sizes_from: opts
+            .known
+            .as_ref()
+            .filter(|k| !k.sizes.is_empty())
+            .map(|k| k.source.clone()),
         files_modified: false,
         elapsed_ms: started.elapsed().as_millis() as u64,
     }
@@ -252,31 +361,42 @@ fn measure_suspects(
     cancel: &AtomicBool,
     progress: &dyn Fn(DoctorStep),
 ) -> (Vec<Finding>, Vec<LargeFile>) {
-    let catalog = suspects::macos_catalog();
+    let catalog = suspects::catalog();
     let deadline = Instant::now() + opts.budget;
-    let walk_opts = WalkOptions { threads: opts.threads, ..WalkOptions::default() };
+    let walk_opts = WalkOptions {
+        threads: opts.threads,
+        ..WalkOptions::default()
+    };
     let mut large = LargeFiles::new(20);
     let mut findings = Vec::new();
     let tops: Vec<&suspects::Suspect> = catalog.iter().filter(|s| s.within.is_none()).collect();
     let known = opts.known.as_deref().filter(|k| !k.sizes.is_empty());
     if let Some(k) = known {
-        progress(DoctorStep::FromScan { source: k.source.clone(), locations: k.sizes.len() });
+        progress(DoctorStep::FromScan {
+            source: k.source.clone(),
+            locations: k.sizes.len(),
+        });
         for f in &k.large_files {
             large.offer_known(f);
         }
     }
     for (i, s) in tops.iter().enumerate() {
         let root = suspects::expand(s.path, &opts.home);
-        let children: Vec<&suspects::Suspect> = catalog.iter().filter(|c| c.within == Some(s.id)).collect();
-        let child_paths: Vec<PathBuf> = children.iter().map(|c| suspects::expand(c.path, &opts.home)).collect();
+        let children: Vec<&suspects::Suspect> =
+            catalog.iter().filter(|c| c.within == Some(s.id)).collect();
+        let child_paths: Vec<PathBuf> = children
+            .iter()
+            .map(|c| suspects::expand(c.path, &opts.home))
+            .collect();
         if let Some(m) = known.and_then(|k| k.sizes.get(&root)) {
             let k = known.unwrap();
             progress(DoctorStep::Measured {
                 label: format!("{} (from the scan)", s.label),
                 path: root.clone(),
                 status: m.status,
-                allocated_bytes: m.allocated_bytes,
-                entries: m.entries,
+                allocated_bytes: m.allocated_known.then_some(m.allocated_bytes).flatten(),
+                quality: m.measurement.quality.unwrap_or(Quality::Unknown),
+                entries: m.entries.unwrap_or(0),
                 elapsed: Duration::ZERO,
             });
             findings.push(finding(s, &root, m));
@@ -286,18 +406,32 @@ fn measure_suspects(
             }
             continue;
         }
-        progress(DoctorStep::Measuring { label: s.label.to_string(), index: i, total: tops.len() });
+        progress(DoctorStep::Measuring {
+            label: s.label.to_string(),
+            index: i,
+            total: tops.len(),
+        });
         let t0 = Instant::now();
         let no_skip = AtomicBool::new(false);
         let skip = opts.skip.as_deref().unwrap_or(&no_skip);
         skip.store(false, Ordering::SeqCst);
-        let (m, subs) = suspects::measure_tree(&root, &child_paths, lister, &walk_opts, deadline, &mut large, cancel, skip);
+        let (m, subs) = suspects::measure_tree(
+            &root,
+            &child_paths,
+            lister,
+            &walk_opts,
+            deadline,
+            &mut large,
+            cancel,
+            skip,
+        );
         progress(DoctorStep::Measured {
             label: s.label.to_string(),
             path: root.clone(),
             status: m.status,
-            allocated_bytes: m.allocated_bytes,
-            entries: m.entries,
+            allocated_bytes: m.allocated_known.then_some(m.allocated_bytes).flatten(),
+            quality: m.measurement.quality.unwrap_or(Quality::Unknown),
+            entries: m.entries.unwrap_or(0),
             elapsed: t0.elapsed(),
         });
         findings.push(finding(s, &root, &m));
@@ -306,16 +440,25 @@ fn measure_suspects(
         }
     }
     findings.retain(|f| f.status != MeasureStatus::Absent);
-    findings.sort_by(|a, b| b.allocated_bytes.cmp(&a.allocated_bytes).then_with(|| a.id.cmp(&b.id)));
+    findings.sort_by(|a, b| {
+        b.allocated_bytes
+            .unwrap_or(0)
+            .cmp(&a.allocated_bytes.unwrap_or(0))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     (findings, large.into_sorted())
 }
 
 fn finding(s: &suspects::Suspect, path: &Path, m: &Measure) -> Finding {
-    let confidence = match m.status {
-        MeasureStatus::Complete => Confidence::Observed,
-        MeasureStatus::Partial | MeasureStatus::TimedOut => Confidence::LowerBound,
-        MeasureStatus::Inaccessible | MeasureStatus::Absent | MeasureStatus::Skipped => Confidence::Unknown,
+    let confidence = match m.measurement.quality {
+        Some(crate::measurement::Quality::Observed) => Confidence::Observed,
+        Some(crate::measurement::Quality::LowerBound) => Confidence::LowerBound,
+        _ => Confidence::Unknown,
     };
+    let entries_known = !matches!(
+        m.status,
+        MeasureStatus::Inaccessible | MeasureStatus::Absent | MeasureStatus::Skipped
+    );
     Finding {
         id: s.id.into(),
         category: s.category.into(),
@@ -323,12 +466,49 @@ fn finding(s: &suspects::Suspect, path: &Path, m: &Measure) -> Finding {
         path: path.to_path_buf(),
         within: s.within.map(String::from),
         status: m.status,
-        logical_bytes: m.logical_bytes,
-        allocated_bytes: m.allocated_bytes,
-        entries: m.entries,
-        inaccessible_dirs: m.inaccessible_dirs,
+        logical_bytes: m.logical_known.then_some(m.logical_bytes).flatten(),
+        allocated_bytes: m.allocated_known.then_some(m.allocated_bytes).flatten(),
+        entries: entries_known.then_some(m.entries).flatten(),
+        inaccessible_dirs: entries_known.then_some(m.inaccessible_dirs).flatten(),
         confidence,
         risk: s.risk,
         recommendation: s.advice.into(),
+        measurement: m.measurement.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generic_usage_does_not_enable_macos_report_terms() {
+        let usage = UsageReport {
+            containers: Vec::new(),
+            other_volumes: Vec::new(),
+            apfs_error: None,
+            mounts_error: None,
+        };
+        assert_eq!(report_uses_macos_terms(&usage), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn finding_does_not_serialize_zero_bytes_for_unknown_measurement() {
+        let suspect = suspects::catalog().into_iter().next().unwrap();
+        let measure = Measure {
+            status: MeasureStatus::Complete,
+            logical_bytes: Some(0),
+            allocated_bytes: Some(0),
+            entries: Some(1),
+            inaccessible_dirs: Some(0),
+            logical_known: false,
+            allocated_known: false,
+            measurement: crate::measurement::Envelope::default(),
+        };
+        let value =
+            serde_json::to_value(finding(&suspect, Path::new("/unavailable"), &measure)).unwrap();
+        assert!(value.get("logicalBytes").is_none(), "{value}");
+        assert!(value.get("allocatedBytes").is_none(), "{value}");
+        assert_eq!(value["quality"], "unknown");
     }
 }

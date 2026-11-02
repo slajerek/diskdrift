@@ -32,7 +32,7 @@ impl FileId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub struct EntryFields(pub u16);
 
 impl EntryFields {
@@ -57,15 +57,30 @@ impl EntryFields {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FileIdScheme {
     PosixInode64,
     WindowsFileId128,
+    #[default]
     Unavailable,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum FileIdScope {
+    #[default]
+    Volume,
+    Filesystem,
+    Global,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MoveCertainty {
     Definite,
     Probable,
@@ -77,6 +92,7 @@ pub struct IdentityEvidence {
     pub volume: u16,
     pub file_id: FileId,
     pub scheme: FileIdScheme,
+    pub scope: FileIdScope,
     pub stable: bool,
 }
 
@@ -86,6 +102,22 @@ impl IdentityEvidence {
             volume,
             file_id,
             scheme,
+            scope: FileIdScope::Volume,
+            stable,
+        }
+    }
+    pub const fn scoped(
+        volume: u16,
+        file_id: FileId,
+        scheme: FileIdScheme,
+        scope: FileIdScope,
+        stable: bool,
+    ) -> Self {
+        Self {
+            volume,
+            file_id,
+            scheme,
+            scope,
             stable,
         }
     }
@@ -95,26 +127,67 @@ impl IdentityEvidence {
             && (self.file_id.low != 0 || self.file_id.high != 0)
     }
     pub fn move_certainty(self, other: &Self) -> MoveCertainty {
-        if self.volume == other.volume
-            && self.file_id == other.file_id
+        let same_id = self.file_id != FileId::ZERO && self.file_id == other.file_id;
+        if same_id
+            && self.volume == other.volume
+            && self.scope == other.scope
             && self.scheme == other.scheme
-            && self.stable
-            && other.stable
+            && self.supports_hardlinks()
+            && other.supports_hardlinks()
         {
             MoveCertainty::Definite
-        } else if self.volume == other.volume && self.file_id == other.file_id {
+        } else if same_id && self.volume == other.volume && self.scope == other.scope {
             MoveCertainty::Probable
         } else {
             MoveCertainty::None
         }
     }
+
+    pub fn move_certainty_with_comparability(
+        self,
+        other: &Self,
+        file_id_comparable: bool,
+    ) -> MoveCertainty {
+        if !file_id_comparable
+            && self.file_id != FileId::ZERO
+            && self.file_id == other.file_id
+            && self.volume == other.volume
+        {
+            MoveCertainty::Probable
+        } else {
+            self.move_certainty(other)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoverageChange {
+    pub became_available: EntryFields,
+    pub became_unavailable: EntryFields,
+}
+
+impl CoverageChange {
+    pub const fn is_empty(self) -> bool {
+        self.became_available.0 == 0 && self.became_unavailable.0 == 0
+    }
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TimestampResolution {
+    #[default]
     Unknown,
     Seconds,
     Milliseconds,
@@ -209,6 +282,11 @@ pub struct Record {
     pub available: EntryFields,
     /// Index into the snapshot's volume table.
     pub vol: u16,
+    /// Resolution of the timestamp values supplied by the source adapter.
+    pub timestamp_resolution: TimestampResolution,
+    /// Scheme and scope of `file_id` when FILE_ID is available.
+    pub file_id_scheme: FileIdScheme,
+    pub file_id_scope: FileIdScope,
 }
 
 impl PartialEq for Record {
@@ -286,6 +364,9 @@ impl Default for Record {
                 .union(EntryFields::MTIME)
                 .union(EntryFields::LINK_COUNT),
             vol: 0,
+            timestamp_resolution: TimestampResolution::Seconds,
+            file_id_scheme: FileIdScheme::PosixInode64,
+            file_id_scope: FileIdScope::Volume,
         }
     }
 }
@@ -338,20 +419,81 @@ impl Record {
                 && self.alloc != other.alloc)
             || (self.available.contains(EntryFields::MTIME)
                 && other.available.contains(EntryFields::MTIME)
-                && self.mtime != other.mtime)
-            || (self.available.contains(EntryFields::MTIME_NANOS)
-                && other.available.contains(EntryFields::MTIME_NANOS)
-                && self.mtime_nanos != other.mtime_nanos)
+                && !timestamps_equal(
+                    self.mtime,
+                    self.mtime_nanos,
+                    self.timestamp_resolution,
+                    other.mtime,
+                    other.mtime_nanos,
+                    other.timestamp_resolution,
+                ))
             || (self.available.contains(EntryFields::BIRTH_TIME)
                 && other.available.contains(EntryFields::BIRTH_TIME)
-                && self.btime != other.btime)
-            || (self.available.contains(EntryFields::BIRTH_TIME_NANOS)
-                && other.available.contains(EntryFields::BIRTH_TIME_NANOS)
-                && self.btime_nanos != other.btime_nanos)
+                && !timestamps_equal(
+                    self.btime,
+                    self.btime_nanos,
+                    self.timestamp_resolution,
+                    other.btime,
+                    other.btime_nanos,
+                    other.timestamp_resolution,
+                ))
             || (self.available.contains(EntryFields::FILE_ID)
                 && other.available.contains(EntryFields::FILE_ID)
+                && self.file_id_scheme == other.file_id_scheme
+                && self.file_id_scope == other.file_id_scope
                 && self.file_id != other.file_id)
             || (self.flags & !flags::HARDLINK_DUP) != (other.flags & !flags::HARDLINK_DUP)
+    }
+
+    pub fn coverage_change(&self, other: &Record) -> CoverageChange {
+        CoverageChange {
+            became_available: EntryFields(other.available.0 & !self.available.0),
+            became_unavailable: EntryFields(self.available.0 & !other.available.0),
+        }
+    }
+
+    /// Equality for persistence and deltas. Unlike content comparison, a
+    /// coverage change must be stored so reconstruction retains the target's
+    /// availability bits.
+    pub fn exactly_equal(&self, other: &Record) -> bool {
+        self.exactly_equal_with_allocation(other, true)
+    }
+
+    /// Equality used when the two volume descriptors do not support a
+    /// meaningful allocated-byte comparison. Logical/path changes remain
+    /// comparable, while the unavailable allocation field is not emitted as a
+    /// delta payload.
+    pub fn exactly_equal_with_allocation(&self, other: &Record, allocated: bool) -> bool {
+        if !allocated {
+            return self
+                .without_allocated()
+                .exactly_equal(&other.without_allocated());
+        }
+        self == other
+            && self.available == other.available
+            && self.timestamp_resolution == other.timestamp_resolution
+            && self.file_id_scheme == other.file_id_scheme
+            && self.file_id_scope == other.file_id_scope
+    }
+
+    pub fn without_allocated(&self) -> Record {
+        let mut record = self.clone();
+        record.alloc = 0;
+        record.available.0 &= !EntryFields::ALLOCATED_SIZE.0;
+        record
+    }
+
+    pub fn identity_evidence(&self) -> Option<IdentityEvidence> {
+        if !self.available.contains(EntryFields::FILE_ID) || self.file_id == FileId::ZERO {
+            return None;
+        }
+        Some(IdentityEvidence::scoped(
+            self.vol,
+            self.file_id,
+            self.file_id_scheme,
+            self.file_id_scope,
+            !matches!(self.file_id_scheme, FileIdScheme::Unavailable),
+        ))
     }
 
     /// Appends the compact encoding of this record to `out`.
@@ -420,17 +562,30 @@ impl Record {
             rec.ino = 0;
             rec.nlink = 0;
             rec.file_id = FileId::ZERO;
+            rec.timestamp_resolution = TimestampResolution::Unknown;
+            rec.file_id_scheme = FileIdScheme::Unavailable;
             EntryFields::empty()
         } else {
-            // DDS1 has no nanosecond columns and its inode is only the low half
-            // of the portable identity, so only the legacy scalar is retained.
             rec.ino = _ino;
-            rec.file_id = FileId { low: _ino, high: 0 };
+            rec.file_id = if _ino == 0 {
+                FileId::ZERO
+            } else {
+                FileId { low: _ino, high: 0 }
+            };
+            rec.timestamp_resolution = TimestampResolution::Seconds;
+            rec.file_id_scheme = if _ino == 0 {
+                FileIdScheme::Unavailable
+            } else {
+                FileIdScheme::PosixInode64
+            };
             let mut fields = EntryFields::KIND
                 .union(EntryFields::LOGICAL_SIZE)
                 .union(EntryFields::ALLOCATED_SIZE)
                 .union(EntryFields::MTIME)
                 .union(EntryFields::LINK_COUNT);
+            if _ino != 0 {
+                fields = fields.union(EntryFields::FILE_ID);
+            }
             if rec.btime != 0 {
                 fields = fields.union(EntryFields::BIRTH_TIME);
             }
@@ -445,6 +600,26 @@ fn corrupt(what: &str) -> io::Error {
         io::ErrorKind::InvalidData,
         format!("corrupt record: bad {what}"),
     )
+}
+
+fn timestamps_equal(
+    left_seconds: i64,
+    left_nanos: u32,
+    left_resolution: TimestampResolution,
+    right_seconds: i64,
+    right_nanos: u32,
+    right_resolution: TimestampResolution,
+) -> bool {
+    let resolution = left_resolution.common(right_resolution);
+    if resolution == TimestampResolution::Unknown {
+        return true;
+    }
+    let unit = resolution.nanos();
+    let quantize = |seconds: i64, nanos: u32| {
+        let subsecond = (nanos as i64).div_euclid(unit);
+        (seconds, subsecond)
+    };
+    quantize(left_seconds, left_nanos) == quantize(right_seconds, right_nanos)
 }
 
 /// LEB128 unsigned varint.
@@ -514,6 +689,9 @@ mod tests {
             btime_nanos: 0,
             ino: 0,
             file_id: FileId::ZERO,
+            timestamp_resolution: TimestampResolution::Seconds,
+            file_id_scheme: FileIdScheme::Unavailable,
+            file_id_scope: FileIdScope::Volume,
             nlink: 2,
             vol: 1,
             available: EntryFields::empty(),
@@ -568,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn dds1_decode_does_not_claim_unrepresentable_precision_or_identity() {
+    fn dds1_decode_does_not_claim_unrepresentable_precision() {
         let rec = Record {
             name: NativeName::unix(b"legacy".to_vec()),
             mtime: 12,
@@ -595,7 +773,7 @@ mod tests {
         assert_eq!(decoded.btime_nanos, 0);
         assert!(!decoded.available.contains(EntryFields::MTIME_NANOS));
         assert!(!decoded.available.contains(EntryFields::BIRTH_TIME_NANOS));
-        assert!(!decoded.available.contains(EntryFields::FILE_ID));
+        assert!(decoded.available.contains(EntryFields::FILE_ID));
         assert_eq!(
             decoded.file_id,
             FileId {

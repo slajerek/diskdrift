@@ -601,15 +601,23 @@ assert_no_parent "$stale_authority_commit" "$before_noop"
 assert_remote_ref "refs/heads/$stale_local_branch" "$stale_authority_commit"
 assert_no_private_paths "$stale_authority_commit"
 
+# A contaminated public branch is replaced with a clean snapshot rooted in the
+# live public baseline, rather than inheriting the contaminated commit.
 legacy_remote_branch=gh/legacy-remote
-legacy_remote_commit=$(printf '%s\n' 'legacy remote baseline' | git -C "$WORK" commit-tree "$devel_tree" -p "$before_noop")
+legacy_remote_commit=$(printf '%s\n' 'legacy remote baseline' | git -C "$WORK" commit-tree "$devel_next^{tree}" -p "$devel_next")
 push_fixture "$legacy_remote_commit:refs/heads/$legacy_remote_branch"
 legacy_warning="$FIXTURE/legacy-remote-warning"
-if run_publisher -b "$legacy_remote_branch" -r "$source_commit" -m 'Portability CI snapshot' --push \
+if ! run_publisher -b "$legacy_remote_branch" -r "$source_commit" -m 'Portability CI snapshot' --push \
     >/dev/null 2>"$legacy_warning"; then
-    fail 'legacy files in a remote public baseline were accepted'
+    fail 'contaminated remote public branch was not replaced'
 fi
-assert_remote_ref "refs/heads/$legacy_remote_branch" "$legacy_remote_commit"
+grep -F 'replacing contaminated remote public branch' "$legacy_warning" >/dev/null \
+    || fail 'contaminated remote branch replacement warning was not reported'
+legacy_replacement=$(git -C "$WORK" rev-parse "refs/heads/$legacy_remote_branch")
+assert_parent "$legacy_replacement" "$devel_next"
+assert_no_parent "$legacy_replacement" "$legacy_remote_commit"
+assert_remote_ref "refs/heads/$legacy_remote_branch" "$legacy_replacement"
+assert_no_private_paths "$legacy_replacement"
 
 # An ls-remote transport failure is not the same as an absent branch.
 discovery_branch=gh/discovery-failure

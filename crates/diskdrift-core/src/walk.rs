@@ -8,16 +8,20 @@
 //! memory independent of tree size); the directory the consumer is waiting for is
 //! always allowed through, so the budget cannot deadlock the walk.
 
+use crate::measurement::{Envelope, Quality};
 use crate::native::NativeName;
-use crate::record::{FileId, Kind, Record, flags};
+use crate::record::{
+    EntryFields, FileId, FileIdScheme, FileIdScope, Kind, Record, TimestampResolution, flags,
+};
+use serde::{Serialize, Serializer};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::ffi::OsString;
 #[cfg(unix)]
 use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::io;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -39,6 +43,11 @@ pub struct RawEntry {
     pub available: crate::record::EntryFields,
     pub nlink: u32,
     pub dev: u64,
+    /// Precision supplied by the platform adapter.
+    pub timestamp_resolution: TimestampResolution,
+    /// Identity scheme supplied by the platform adapter.
+    pub file_id_scheme: FileIdScheme,
+    pub file_id_scope: FileIdScope,
     /// The lister knows this directory is a mount point.
     pub is_mount_point: bool,
     /// Automount trigger (autofs); never entered.
@@ -91,7 +100,9 @@ impl ExcludeRules {
         let mut rules = ExcludeRules::default();
         for p in patterns {
             if p.starts_with('/') {
-                rules.paths.push(PathBuf::from(p.trim_end_matches('/').to_string()));
+                rules
+                    .paths
+                    .push(PathBuf::from(p.trim_end_matches('/').to_string()));
             } else if !p.is_empty() {
                 rules.names.push(OsString::from(p));
             }
@@ -104,14 +115,18 @@ impl ExcludeRules {
     }
 
     fn matches(&self, path: &Path, name: &NativeName) -> bool {
-        self.names.iter().any(|n| native_name_matches(n, name)) || self.paths.iter().any(|p| path.starts_with(p))
+        self.names.iter().any(|n| native_name_matches(n, name))
+            || self.paths.iter().any(|p| path.starts_with(p))
     }
 
     /// Patterns in config notation, for snapshot metadata.
     pub fn patterns(&self) -> Vec<String> {
-        let mut out: Vec<String> =
-            self.paths.iter().map(|p| p.display().to_string()).collect();
-        out.extend(self.names.iter().map(|n| n.to_str().unwrap_or_default().to_owned()));
+        let mut out: Vec<String> = self.paths.iter().map(|p| p.display().to_string()).collect();
+        out.extend(
+            self.names
+                .iter()
+                .map(|n| n.to_str().unwrap_or_default().to_owned()),
+        );
         out
     }
 }
@@ -165,7 +180,10 @@ impl WalkOptions {
         }
         // M1 benchmarks: APFS metadata throughput peaks at 6-8 threads and drops
         // beyond (kernel contention), so more cores do not mean more threads.
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 8)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(2, 8)
     }
 }
 
@@ -175,8 +193,29 @@ pub struct Progress {
     pub entries: AtomicU64,
     pub dirs: AtomicU64,
     pub bytes_alloc: AtomicU64,
+    pub allocated_known: AtomicU64,
+    pub allocated_unknown: AtomicU64,
     pub issues: AtomicU64,
     pub current: Mutex<String>,
+}
+
+impl Progress {
+    /// Returns the live allocated-byte total and its current measurement quality.
+    pub fn allocated_measurement(&self) -> (Option<u64>, Quality) {
+        let entries = self.entries.load(AtomicOrdering::Acquire);
+        let known = self.allocated_known.load(AtomicOrdering::Relaxed);
+        let unknown = self.allocated_unknown.load(AtomicOrdering::Relaxed);
+        let quality = if entries == 0 || known == 0 {
+            Quality::Unknown
+        } else if unknown > 0 {
+            Quality::LowerBound
+        } else {
+            Quality::Observed
+        };
+        let bytes = matches!(quality, Quality::Observed | Quality::LowerBound)
+            .then_some(self.bytes_alloc.load(AtomicOrdering::Relaxed));
+        (bytes, quality)
+    }
 }
 
 /// Receives records in canonical order.
@@ -208,8 +247,8 @@ pub struct WalkIssue {
 }
 
 /// Summary of a finished (or cancelled) walk.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct WalkReport {
     pub entries: u64,
     pub files: u64,
@@ -237,6 +276,87 @@ pub struct WalkReport {
     pub peak_buffered_entries: u64,
     #[serde(default)]
     pub hardlink_inodes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<Envelope>,
+    #[serde(skip)]
+    pub allocated_known: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WalkReportWire<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dirs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symlinks: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    others: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logical_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allocated_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hardlink_duplicates: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inaccessible_dirs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stat_errors: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skipped_mounts: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excluded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    issue_count: Option<u64>,
+    issues: &'a [WalkIssue],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    devices: Option<&'a [u64]>,
+    cancelled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_pending_dirs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peak_buffered_entries: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hardlink_inodes: Option<u64>,
+    measurement: Envelope,
+}
+
+impl Serialize for WalkReport {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let measured = self
+            .measurement
+            .as_ref()
+            .filter(|m| m.quality != Some(crate::measurement::Quality::Unknown));
+        WalkReportWire {
+            entries: measured.map(|_| self.entries),
+            files: measured.map(|_| self.files),
+            dirs: measured.map(|_| self.dirs),
+            symlinks: measured.map(|_| self.symlinks),
+            others: measured.map(|_| self.others),
+            logical_bytes: measured.map(|_| self.logical_bytes),
+            allocated_bytes: measured.map(|_| self.allocated_bytes),
+            hardlink_duplicates: measured.map(|_| self.hardlink_duplicates),
+            inaccessible_dirs: measured.map(|_| self.inaccessible_dirs),
+            stat_errors: measured.map(|_| self.stat_errors),
+            skipped_mounts: measured.map(|_| self.skipped_mounts),
+            excluded: measured.map(|_| self.excluded),
+            issue_count: measured.map(|_| self.issue_count),
+            issues: &self.issues,
+            devices: measured.map(|_| self.devices.as_slice()),
+            cancelled: self.cancelled,
+            elapsed_ms: measured.map(|_| self.elapsed_ms),
+            peak_pending_dirs: measured.map(|_| self.peak_pending_dirs),
+            peak_buffered_entries: measured.map(|_| self.peak_buffered_entries),
+            hardlink_inodes: measured.map(|_| self.hardlink_inodes),
+            measurement: self.measurement.clone().unwrap_or_default(),
+        }
+        .serialize(serializer)
+    }
 }
 
 impl WalkReport {
@@ -341,7 +461,12 @@ impl State {
                 let mut k = Vec::with_capacity(key.len() + 1);
                 k.extend_from_slice(key);
                 k.push(i as u32);
-                self.pending.push(Task { key: k, slot, path: join_native(dir, &child.raw.name), dev });
+                self.pending.push(Task {
+                    key: k,
+                    slot,
+                    path: join_native(dir, &child.raw.name),
+                    dev,
+                });
                 child.descend = Descend::Queued(slot);
                 queued += 1;
             }
@@ -352,7 +477,87 @@ impl State {
 
 /// Errors worth one retry: anything but "no permission" and "gone".
 fn transient(e: &io::Error) -> bool {
-    !matches!(e.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound | io::ErrorKind::NotADirectory)
+    !matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+fn alias_path_matches(aliases: &HashSet<PathBuf>, path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let path_key = normalize_windows_path(&path.as_os_str().encode_wide().collect::<Vec<_>>());
+        aliases.iter().any(|alias| {
+            normalize_windows_path(&alias.as_os_str().encode_wide().collect::<Vec<_>>()) == path_key
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        aliases
+            .iter()
+            .any(|alias| alias.components().eq(path.components()))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn normalize_windows_path(units: &[u16]) -> Vec<u16> {
+    let mut key = units
+        .iter()
+        .map(|unit| {
+            if *unit == b'/' as u16 {
+                b'\\' as u16
+            } else {
+                *unit
+            }
+        })
+        .collect::<Vec<_>>();
+    const VERBATIM: &[u16] = &[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC: &[u16] = &[
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+    if key.len() >= VERBATIM_UNC.len()
+        && key[..VERBATIM_UNC.len()]
+            .iter()
+            .zip(VERBATIM_UNC)
+            .all(|(a, b)| ascii_lower(*a) == ascii_lower(*b))
+    {
+        key = [
+            vec![b'\\' as u16, b'\\' as u16],
+            key[VERBATIM_UNC.len()..].to_vec(),
+        ]
+        .concat();
+    } else if key.len() >= VERBATIM.len()
+        && key[..VERBATIM.len()]
+            .iter()
+            .zip(VERBATIM)
+            .all(|(a, b)| ascii_lower(*a) == ascii_lower(*b))
+    {
+        key = key[VERBATIM.len()..].to_vec();
+    }
+    while key.len() > 3 && key.last() == Some(&(b'\\' as u16)) {
+        key.pop();
+    }
+    for unit in &mut key {
+        *unit = ascii_lower(*unit);
+    }
+    key
+}
+
+#[cfg(any(windows, test))]
+fn ascii_lower(unit: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+        unit + b'a' as u16 - b'A' as u16
+    } else {
+        unit
+    }
 }
 
 impl Shared<'_> {
@@ -393,7 +598,12 @@ impl Shared<'_> {
                 }
                 r.map(|()| {
                     buf.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-                    buf.drain(..).map(|raw| Child { raw, descend: Descend::No }).collect::<Vec<_>>()
+                    buf.drain(..)
+                        .map(|raw| Child {
+                            raw,
+                            descend: Descend::No,
+                        })
+                        .collect::<Vec<_>>()
                 })
             };
             if buf.capacity() > 16 * 1024 {
@@ -422,22 +632,21 @@ impl Shared<'_> {
     fn classify(&self, task: &Task, children: &mut [Child]) {
         let opts = self.opts;
         for child in children.iter_mut() {
+            let path = join_native(&task.path, &child.raw.name);
+            // Windows mounted-folder aliases are reported as reparse points, so
+            // the lister may classify them as symlinks rather than directories.
+            if !opts.alias_paths.is_empty() && alias_path_matches(&opts.alias_paths, &path) {
+                child.descend = Descend::Omit;
+                continue;
+            }
             if child.raw.kind != Kind::Dir {
-                if !opts.exclude.is_empty() {
-                    let path = join_native(&task.path, &child.raw.name);
-                    if opts.exclude.matches(&path, &child.raw.name) {
-                        child.descend = Descend::Omit;
-                    }
+                if !opts.exclude.is_empty() && opts.exclude.matches(&path, &child.raw.name) {
+                    child.descend = Descend::Omit;
                 }
                 continue;
             }
             if child.raw.error.is_some() {
                 child.descend = Descend::No;
-                continue;
-            }
-            let path = join_native(&task.path, &child.raw.name);
-            if !opts.alias_paths.is_empty() && opts.alias_paths.contains(&path) {
-                child.descend = Descend::Omit;
                 continue;
             }
             if !opts.exclude.is_empty() && opts.exclude.matches(&path, &child.raw.name) {
@@ -536,8 +745,12 @@ impl Emitter<'_> {
             fl |= flags::STAT_ERROR;
         }
         let unavailable = fl & flags::STAT_ERROR != 0;
-        if !unavailable && raw.kind != Kind::Dir && raw.nlink > 1 && raw.available.contains(crate::record::EntryFields::FILE_ID)
-            && !self.hardlinks.insert((raw.dev, raw.file_id)) {
+        if !unavailable
+            && raw.kind != Kind::Dir
+            && raw.nlink > 1
+            && raw.available.contains(crate::record::EntryFields::FILE_ID)
+            && !self.hardlinks.insert((raw.dev, raw.file_id))
+        {
             fl |= flags::HARDLINK_DUP;
         }
         let rec = &mut self.rec;
@@ -552,10 +765,29 @@ impl Emitter<'_> {
         rec.btime = if unavailable { 0 } else { raw.btime };
         rec.btime_nanos = if unavailable { 0 } else { raw.btime_nanos };
         rec.ino = if unavailable { 0 } else { raw.ino };
-        rec.file_id = if unavailable { FileId::ZERO } else { raw.file_id };
-        rec.available = if unavailable { crate::record::EntryFields::empty() } else { raw.available };
+        rec.file_id = if unavailable {
+            FileId::ZERO
+        } else {
+            raw.file_id
+        };
+        rec.available = if unavailable {
+            crate::record::EntryFields::empty()
+        } else {
+            raw.available
+        };
         rec.nlink = if unavailable { 0 } else { raw.nlink };
         rec.vol = vol;
+        rec.timestamp_resolution = if unavailable {
+            TimestampResolution::Unknown
+        } else {
+            raw.timestamp_resolution
+        };
+        rec.file_id_scheme = if unavailable || !raw.available.contains(EntryFields::FILE_ID) {
+            FileIdScheme::Unavailable
+        } else {
+            raw.file_id_scheme
+        };
+        rec.file_id_scope = raw.file_id_scope;
 
         let r = &mut self.report;
         r.entries += 1;
@@ -571,6 +803,13 @@ impl Emitter<'_> {
             r.logical_bytes += rec.counted_size();
             r.allocated_bytes += rec.counted_alloc();
         }
+        if !unavailable
+            && raw
+                .available
+                .contains(crate::record::EntryFields::ALLOCATED_SIZE)
+        {
+            r.allocated_known += 1;
+        }
         if fl & flags::INACCESSIBLE != 0 {
             r.inaccessible_dirs += 1;
         }
@@ -584,18 +823,29 @@ impl Emitter<'_> {
             r.excluded += 1;
         }
         if let Some(p) = self.progress {
-            let n = p.entries.fetch_add(1, AtomicOrdering::Relaxed);
             if fl & flags::HARDLINK_DUP == 0 {
-                p.bytes_alloc.fetch_add(rec.counted_alloc(), AtomicOrdering::Relaxed);
+                p.bytes_alloc
+                    .fetch_add(rec.counted_alloc(), AtomicOrdering::Relaxed);
             }
+            if !unavailable
+                && raw
+                    .available
+                    .contains(crate::record::EntryFields::ALLOCATED_SIZE)
+            {
+                p.allocated_known.fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                p.allocated_unknown.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            let n = p.entries.fetch_add(1, AtomicOrdering::Release);
             if raw.kind == Kind::Dir {
                 p.dirs.fetch_add(1, AtomicOrdering::Relaxed);
             }
             if n % 4096 == 0
-                && let Ok(mut cur) = p.current.try_lock() {
-                    cur.clear();
-                    cur.push_str(&path.display().to_string());
-                }
+                && let Ok(mut cur) = p.current.try_lock()
+            {
+                cur.clear();
+                cur.push_str(&path.display().to_string());
+            }
         }
         self.sink.record(&self.rec, path)
     }
@@ -678,6 +928,19 @@ pub fn walk(
         Err(ConsumeError::Cancelled) => report.cancelled = true,
         Err(ConsumeError::Sink(e)) => return Err(WalkError::Sink(e)),
     }
+    let quality = if report.allocated_known == 0 {
+        Quality::Unknown
+    } else if report.cancelled || report.is_partial() {
+        Quality::LowerBound
+    } else {
+        Quality::Observed
+    };
+    report.measurement = Some(Envelope::with_quality(
+        "filesystem",
+        "scan_root",
+        quality,
+        "bounded read-only walk",
+    ));
     Ok(report)
 }
 
@@ -700,14 +963,24 @@ fn consume(
         {
             let mut st = shared.state.lock().unwrap();
             st.next_slot = 1;
-            st.pending.push(Task { key: Vec::new(), slot: 0, path: root.to_path_buf(), dev: root_raw.dev });
+            st.pending.push(Task {
+                key: Vec::new(),
+                slot: 0,
+                path: root.to_path_buf(),
+                dev: root_raw.dev,
+            });
         }
         shared.work.notify_all();
         let (key, listing) = shared.wait_for(0);
         let children = open_listing(em, &root_raw, listing, 0, &path)?;
-        frames.push(Frame { children, next: 0, key });
+        frames.push(Frame {
+            children,
+            next: 0,
+            key,
+        });
     } else {
-        em.emit(0, &root_raw, 0, &path).map_err(ConsumeError::Sink)?;
+        em.emit(0, &root_raw, 0, &path)
+            .map_err(ConsumeError::Sink)?;
     }
 
     while let Some(frame) = frames.last_mut() {
@@ -734,18 +1007,30 @@ fn consume(
         let descend = frame.children[i].descend;
         path = join_native(&path, &child.name);
         if let Some(errno) = child.error {
-            em.issue(IssueKind::StatFailed, &path, &io::Error::from_raw_os_error(errno));
+            em.issue(
+                IssueKind::StatFailed,
+                &path,
+                &io::Error::from_raw_os_error(errno),
+            );
         }
         match descend {
             Descend::Queued(slot) => {
                 let (key, listing) = shared.wait_for(slot);
                 let children = open_listing(em, &child, listing, depth, &path)?;
-                frames.push(Frame { children, next: 0, key });
+                frames.push(Frame {
+                    children,
+                    next: 0,
+                    key,
+                });
                 continue; // path stays pushed while inside this directory
             }
             Descend::Dev(_) => unreachable!("queued above"),
-            Descend::No => em.emit(depth, &child, 0, &path).map_err(ConsumeError::Sink)?,
-            Descend::Skip(flag) => em.emit(depth, &child, flag, &path).map_err(ConsumeError::Sink)?,
+            Descend::No => em
+                .emit(depth, &child, 0, &path)
+                .map_err(ConsumeError::Sink)?,
+            Descend::Skip(flag) => em
+                .emit(depth, &child, flag, &path)
+                .map_err(ConsumeError::Sink)?,
             Descend::Omit => {}
         }
         path.pop();
@@ -774,7 +1059,8 @@ fn open_listing(
                 IssueKind::ListFailed
             };
             em.issue(kind, path, &e);
-            em.emit(depth, raw, flags::INACCESSIBLE, path).map_err(ConsumeError::Sink)?;
+            em.emit(depth, raw, flags::INACCESSIBLE, path)
+                .map_err(ConsumeError::Sink)?;
             Ok(Vec::new())
         }
     }
@@ -811,7 +1097,9 @@ impl StdLister {
             .union(crate::record::EntryFields::FILE_ID)
             .union(crate::record::EntryFields::LINK_COUNT);
         if md.created().is_ok() {
-            available = available.union(crate::record::EntryFields::BIRTH_TIME).union(crate::record::EntryFields::BIRTH_TIME_NANOS);
+            available = available
+                .union(crate::record::EntryFields::BIRTH_TIME)
+                .union(crate::record::EntryFields::BIRTH_TIME_NANOS);
         }
         available = available.union(crate::record::EntryFields::MTIME_NANOS);
         RawEntry {
@@ -822,12 +1110,23 @@ impl StdLister {
             mtime: md.mtime(),
             mtime_nanos: md.mtime_nsec() as u32,
             btime,
-            btime_nanos: md.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.subsec_nanos()).unwrap_or(0),
+            btime_nanos: md
+                .created()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
             ino: md.ino(),
-            file_id: FileId { low: md.ino(), high: 0 },
+            file_id: FileId {
+                low: md.ino(),
+                high: 0,
+            },
             available,
             nlink: md.nlink() as u32,
             dev: md.dev(),
+            timestamp_resolution: TimestampResolution::Nanoseconds,
+            file_id_scheme: FileIdScheme::PosixInode64,
+            file_id_scope: FileIdScope::Volume,
             is_mount_point: false,
             is_trigger: false,
             error: None,
@@ -843,7 +1142,10 @@ impl DirLister for StdLister {
 
     fn stat(&self, path: &Path) -> io::Result<RawEntry> {
         let md = std::fs::symlink_metadata(path)?;
-        Ok(Self::raw_from_metadata(path.as_os_str().as_bytes().to_vec(), &md))
+        Ok(Self::raw_from_metadata(
+            path.as_os_str().as_bytes().to_vec(),
+            &md,
+        ))
     }
 
     fn list(&self, dir: &Path, out: &mut Vec<RawEntry>) -> io::Result<()> {
@@ -868,9 +1170,20 @@ impl DirLister for StdLister {
 impl StdLister {
     fn raw_from_metadata(name: Vec<u16>, md: &std::fs::Metadata) -> RawEntry {
         let ft = md.file_type();
-        let kind = if ft.is_dir() { Kind::Dir } else if ft.is_file() { Kind::File } else if ft.is_symlink() { Kind::Symlink } else { Kind::Other };
+        let kind = if ft.is_dir() {
+            Kind::Dir
+        } else if ft.is_file() {
+            Kind::File
+        } else if ft.is_symlink() {
+            Kind::Symlink
+        } else {
+            Kind::Other
+        };
         let timestamp = |time: std::io::Result<std::time::SystemTime>| {
-            time.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| (d.as_secs() as i64, d.subsec_nanos())).unwrap_or((0, 0))
+            time.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| (d.as_secs() as i64, d.subsec_nanos()))
+                .unwrap_or((0, 0))
         };
         let (mtime, mtime_nanos) = timestamp(md.modified());
         let (btime, btime_nanos) = timestamp(md.created());
@@ -883,7 +1196,16 @@ impl StdLister {
             mtime_nanos,
             btime,
             btime_nanos,
-            available: crate::record::EntryFields::KIND.union(crate::record::EntryFields::LOGICAL_SIZE).union(crate::record::EntryFields::ALLOCATED_SIZE).union(crate::record::EntryFields::MTIME).union(crate::record::EntryFields::MTIME_NANOS).union(crate::record::EntryFields::BIRTH_TIME).union(crate::record::EntryFields::BIRTH_TIME_NANOS),
+            available: crate::record::EntryFields::KIND
+                .union(crate::record::EntryFields::LOGICAL_SIZE)
+                .union(crate::record::EntryFields::ALLOCATED_SIZE)
+                .union(crate::record::EntryFields::MTIME)
+                .union(crate::record::EntryFields::MTIME_NANOS)
+                .union(crate::record::EntryFields::BIRTH_TIME)
+                .union(crate::record::EntryFields::BIRTH_TIME_NANOS),
+            timestamp_resolution: TimestampResolution::Nanoseconds,
+            file_id_scheme: FileIdScheme::Unavailable,
+            file_id_scope: FileIdScope::Volume,
             ..RawEntry::default()
         }
     }
@@ -891,12 +1213,17 @@ impl StdLister {
 
 #[cfg(windows)]
 impl DirLister for StdLister {
-    fn name(&self) -> &'static str { "readdir" }
+    fn name(&self) -> &'static str {
+        "readdir"
+    }
 
     fn stat(&self, path: &Path) -> io::Result<RawEntry> {
         let md = std::fs::symlink_metadata(path)?;
         use std::os::windows::ffi::OsStrExt;
-        Ok(Self::raw_from_metadata(path.as_os_str().encode_wide().collect(), &md))
+        Ok(Self::raw_from_metadata(
+            path.as_os_str().encode_wide().collect(),
+            &md,
+        ))
     }
 
     fn list(&self, dir: &Path, out: &mut Vec<RawEntry>) -> io::Result<()> {
@@ -907,7 +1234,11 @@ impl DirLister for StdLister {
             match entry.metadata() {
                 Ok(md) => out.push(Self::raw_from_metadata(name, &md)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => out.push(RawEntry { name: NativeName::windows(name), error: Some(e.raw_os_error().unwrap_or(5)), ..RawEntry::default() }),
+                Err(e) => out.push(RawEntry {
+                    name: NativeName::windows(name),
+                    error: Some(e.raw_os_error().unwrap_or(5)),
+                    ..RawEntry::default()
+                }),
             }
         }
         Ok(())
@@ -935,7 +1266,9 @@ fn join_native(path: &Path, name: &NativeName) -> PathBuf {
     }
 }
 #[cfg(unix)]
-fn native_from_path(path: &Path) -> NativeName { NativeName::unix(path.as_os_str().as_bytes().to_vec()) }
+fn native_from_path(path: &Path) -> NativeName {
+    NativeName::unix(path.as_os_str().as_bytes().to_vec())
+}
 #[cfg(windows)]
 fn native_from_path(path: &Path) -> NativeName {
     use std::os::windows::ffi::OsStrExt;
@@ -944,7 +1277,8 @@ fn native_from_path(path: &Path) -> NativeName {
 
 #[cfg(unix)]
 fn native_name_matches(value: &OsString, name: &NativeName) -> bool {
-    name.as_unix_bytes().is_some_and(|bytes| value.as_bytes() == bytes)
+    name.as_unix_bytes()
+        .is_some_and(|bytes| value.as_bytes() == bytes)
 }
 
 #[cfg(windows)]
@@ -977,17 +1311,48 @@ mod tests {
         t.file("a/b/c.dat", 5);
         t.file("a-b/x", 1);
         t.dir("empty");
-        let (records, report) = collect(t.path(), &WalkOptions { threads: 4, ..Default::default() });
+        let (records, report) = collect(
+            t.path(),
+            &WalkOptions {
+                threads: 4,
+                ..Default::default()
+            },
+        );
         let rel: Vec<String> = records
             .iter()
-            .map(|(p, _)| p.strip_prefix(&*t.path().display().to_string()).unwrap().to_string())
+            .map(|(p, _)| {
+                p.strip_prefix(&*t.path().display().to_string())
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
-        assert_eq!(rel, ["", "/a", "/a/b", "/a/b/c.dat", "/a/z.bin", "/a-b", "/a-b/x", "/b.txt", "/empty"]);
+        assert_eq!(
+            rel,
+            [
+                "",
+                "/a",
+                "/a/b",
+                "/a/b/c.dat",
+                "/a/z.bin",
+                "/a-b",
+                "/a-b/x",
+                "/b.txt",
+                "/empty"
+            ]
+        );
         let depths: Vec<u16> = records.iter().map(|(_, r)| r.depth).collect();
         assert_eq!(depths, [0, 1, 2, 3, 2, 1, 2, 1, 1]);
         assert_eq!(report.files, 4);
         assert_eq!(report.dirs, 5);
-        assert_eq!(report.logical_bytes - records.iter().filter(|(_, r)| r.is_dir()).map(|(_, r)| r.size).sum::<u64>(), 19);
+        assert_eq!(
+            report.logical_bytes
+                - records
+                    .iter()
+                    .filter(|(_, r)| r.is_dir())
+                    .map(|(_, r)| r.size)
+                    .sum::<u64>(),
+            19
+        );
         assert!(!report.is_partial());
     }
 
@@ -999,9 +1364,20 @@ mod tests {
                 t.file(&format!("d{i:02}/s{j:02}/f.txt"), (i * j) as usize);
             }
         }
-        let base = collect(t.path(), &WalkOptions { threads: 1, ..Default::default() }).0;
+        let base = collect(
+            t.path(),
+            &WalkOptions {
+                threads: 1,
+                ..Default::default()
+            },
+        )
+        .0;
         for (threads, budget) in [(2, 1), (8, 10), (16, 100_000)] {
-            let opts = WalkOptions { threads, buffer_budget: budget, ..Default::default() };
+            let opts = WalkOptions {
+                threads,
+                buffer_budget: budget,
+                ..Default::default()
+            };
             let other = collect(t.path(), &opts).0;
             assert_eq!(base.len(), other.len());
             for (a, b) in base.iter().zip(other.iter()) {
@@ -1016,10 +1392,16 @@ mod tests {
         t.file("a/original", 5000);
         std::fs::hard_link(t.path().join("a/original"), t.path().join("b-link")).unwrap();
         let (records, report) = collect(t.path(), &WalkOptions::default());
-        let dups: Vec<&String> =
-            records.iter().filter(|(_, r)| r.has(flags::HARDLINK_DUP)).map(|(p, _)| p).collect();
+        let dups: Vec<&String> = records
+            .iter()
+            .filter(|(_, r)| r.has(flags::HARDLINK_DUP))
+            .map(|(p, _)| p)
+            .collect();
         assert_eq!(dups.len(), 1);
-        assert!(dups[0].ends_with("/b-link"), "first path in canonical order owns the allocation");
+        assert!(
+            dups[0].ends_with("/b-link"),
+            "first path in canonical order owns the allocation"
+        );
         assert_eq!(report.hardlink_duplicates, 1);
     }
 
@@ -1050,12 +1432,46 @@ mod tests {
         };
         opts.alias_paths.insert(t.path().join("alias"));
         let (records, report) = collect(t.path(), &opts);
-        let names: Vec<&str> = records.iter().map(|(p, _)| p.rsplit('/').next().unwrap()).collect();
+        let names: Vec<&str> = records
+            .iter()
+            .map(|(p, _)| p.rsplit('/').next().unwrap())
+            .collect();
         assert!(names.contains(&"keep") && names.contains(&"a"));
-        assert!(names.contains(&"node_modules"), "excluded dirs stay visible as markers");
+        assert!(
+            names.contains(&"node_modules"),
+            "excluded dirs stay visible as markers"
+        );
         assert!(!names.contains(&"y") && !names.contains(&"z"));
         assert!(!names.contains(&"alias") && !names.contains(&"q"));
         assert_eq!(report.excluded, 2);
+    }
+
+    #[test]
+    fn reparse_aliases_classified_as_symlinks_are_omitted() {
+        let mut l = FakeLister::new();
+        l.add("/root", Kind::Dir, 1, false, false);
+        l.add("/root/mounted-folder-alias", Kind::Symlink, 1, false, false);
+        let mut opts = WalkOptions::default();
+        opts.alias_paths
+            .insert(PathBuf::from("/root/mounted-folder-alias"));
+
+        let mut records = Vec::new();
+        walk(
+            Path::new("/root"),
+            &l,
+            &opts,
+            &mut |_: &Record, path: &Path| {
+                records.push((path.display().to_string(), Record::default()));
+                Ok(())
+            },
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+
+        assert!(!records.iter().any(|(path, _)| {
+            path == "/root/mounted-folder-alias" || path.starts_with("/root/mounted-folder-alias/")
+        }));
     }
 
     #[test]
@@ -1071,7 +1487,10 @@ mod tests {
         if unsafe_is_root() {
             return; // root can read anything; nothing to assert
         }
-        let rec = records.iter().find(|(p, _)| p.ends_with("/locked")).unwrap();
+        let rec = records
+            .iter()
+            .find(|(p, _)| p.ends_with("/locked"))
+            .unwrap();
         assert!(rec.1.has(flags::INACCESSIBLE));
         assert!(report.is_partial());
         assert_eq!(report.issues[0].kind, IssueKind::PermissionDenied);
@@ -1096,7 +1515,15 @@ mod tests {
             }
             Ok(())
         };
-        let report = walk(t.path(), &StdLister, &WalkOptions::default(), &mut sink, &cancel, None).unwrap();
+        let report = walk(
+            t.path(),
+            &StdLister,
+            &WalkOptions::default(),
+            &mut sink,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert!(report.cancelled);
         assert!(report.entries < 100);
     }
@@ -1107,7 +1534,15 @@ mod tests {
         t.file("a", 1);
         let cancel = AtomicBool::new(false);
         let mut sink = |_: &Record, _: &Path| Err(io::Error::other("disk full"));
-        let err = walk(t.path(), &StdLister, &WalkOptions::default(), &mut sink, &cancel, None).unwrap_err();
+        let err = walk(
+            t.path(),
+            &StdLister,
+            &WalkOptions::default(),
+            &mut sink,
+            &cancel,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, WalkError::Sink(_)));
     }
 
@@ -1118,16 +1553,32 @@ mod tests {
 
     impl FakeLister {
         fn new() -> Self {
-            FakeLister { entries: HashMap::new() }
+            FakeLister {
+                entries: HashMap::new(),
+            }
         }
         fn add(&mut self, path: &str, kind: Kind, dev: u64, mount: bool, trigger: bool) {
             let p = PathBuf::from(path);
-            let name = p.file_name().map(|n| n.as_bytes().to_vec()).unwrap_or_else(|| path.as_bytes().to_vec());
-            let e = RawEntry { name: NativeName::unix(name), kind, dev, size: 10, alloc: 4096, nlink: 1, is_mount_point: mount, is_trigger: trigger, ..Default::default() };
+            let name = p
+                .file_name()
+                .map(|n| n.as_bytes().to_vec())
+                .unwrap_or_else(|| path.as_bytes().to_vec());
+            let e = RawEntry {
+                name: NativeName::unix(name),
+                kind,
+                dev,
+                size: 10,
+                alloc: 4096,
+                nlink: 1,
+                is_mount_point: mount,
+                is_trigger: trigger,
+                ..Default::default()
+            };
             if let Some(parent) = p.parent()
-                && let Some(pe) = self.entries.get_mut(parent) {
-                    pe.1.push(p.file_name().unwrap().display().to_string());
-                }
+                && let Some(pe) = self.entries.get_mut(parent)
+            {
+                pe.1.push(p.file_name().unwrap().display().to_string());
+            }
             self.entries.insert(p, (e, Vec::new()));
         }
     }
@@ -1137,10 +1588,16 @@ mod tests {
             "fake"
         }
         fn stat(&self, path: &Path) -> io::Result<RawEntry> {
-            self.entries.get(path).map(|e| e.0.clone()).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            self.entries
+                .get(path)
+                .map(|e| e.0.clone())
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
         }
         fn list(&self, dir: &Path, out: &mut Vec<RawEntry>) -> io::Result<()> {
-            let (_, children) = self.entries.get(dir).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            let (_, children) = self
+                .entries
+                .get(dir)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             for c in children {
                 // A child listed but gone by the time it is examined: skipped silently.
                 if let Some(e) = self.entries.get(&dir.join(c)) {
@@ -1173,14 +1630,26 @@ mod tests {
             seen.push((p.display().to_string(), r.flags));
             Ok(())
         };
-        let opts = WalkOptions { same_filesystem_devs: vec![3], ..Default::default() };
+        let opts = WalkOptions {
+            same_filesystem_devs: vec![3],
+            ..Default::default()
+        };
         let cancel = AtomicBool::new(false);
         let report = walk(Path::new("/root"), &l, &opts, &mut sink, &cancel, None).unwrap();
         let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
         assert!(paths.contains(&"/root/local/f"));
-        assert!(paths.contains(&"/root/data/doc"), "volume-group device is entered");
-        assert!(!paths.contains(&"/root/usb/photo"), "other filesystem is not entered");
-        assert!(!paths.contains(&"/root/net/share"), "triggers are never entered");
+        assert!(
+            paths.contains(&"/root/data/doc"),
+            "volume-group device is entered"
+        );
+        assert!(
+            !paths.contains(&"/root/usb/photo"),
+            "other filesystem is not entered"
+        );
+        assert!(
+            !paths.contains(&"/root/net/share"),
+            "triggers are never entered"
+        );
         let usb = seen.iter().find(|(p, _)| p == "/root/usb").unwrap();
         assert!(usb.1 & flags::SKIPPED_MOUNT != 0);
         assert_eq!(report.skipped_mounts, 2);
@@ -1192,7 +1661,10 @@ mod tests {
             n += 1;
             Ok(())
         };
-        let all = WalkOptions { stay_on_filesystem: false, ..Default::default() };
+        let all = WalkOptions {
+            stay_on_filesystem: false,
+            ..Default::default()
+        };
         walk(Path::new("/root"), &l, &all, &mut count, &cancel, None).unwrap();
         assert_eq!(n, 9 - 1, "everything except the trigger's contents");
     }
@@ -1212,11 +1684,31 @@ mod tests {
             .union(crate::record::EntryFields::BIRTH_TIME)
             .union(crate::record::EntryFields::BIRTH_TIME_NANOS);
         let mut seen = Vec::new();
-        let mut sink = |r: &Record, _: &Path| { seen.push(r.clone()); Ok(()) };
-        walk(Path::new("/root"), &l, &WalkOptions::default(), &mut sink, &AtomicBool::new(false), None).unwrap();
-        let file = seen.iter().find(|r| r.name == NativeName::unix(b"file".to_vec())).unwrap();
-        assert_eq!((file.mtime, file.mtime_nanos, file.btime, file.btime_nanos), (12, 345, 11, 678));
-        assert!(file.available.contains(crate::record::EntryFields::BIRTH_TIME_NANOS));
+        let mut sink = |r: &Record, _: &Path| {
+            seen.push(r.clone());
+            Ok(())
+        };
+        walk(
+            Path::new("/root"),
+            &l,
+            &WalkOptions::default(),
+            &mut sink,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let file = seen
+            .iter()
+            .find(|r| r.name == NativeName::unix(b"file".to_vec()))
+            .unwrap();
+        assert_eq!(
+            (file.mtime, file.mtime_nanos, file.btime, file.btime_nanos),
+            (12, 345, 11, 678)
+        );
+        assert!(
+            file.available
+                .contains(crate::record::EntryFields::BIRTH_TIME_NANOS)
+        );
     }
 
     #[test]
@@ -1243,11 +1735,32 @@ mod tests {
             seen.push(r.clone());
             Ok(())
         };
-        let report = walk(Path::new("/root"), &l, &WalkOptions::default(), &mut sink, &AtomicBool::new(false), None).unwrap();
-        let bad = seen.iter().find(|r| r.name == NativeName::unix(b"bad".to_vec())).unwrap();
+        let report = walk(
+            Path::new("/root"),
+            &l,
+            &WalkOptions::default(),
+            &mut sink,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let bad = seen
+            .iter()
+            .find(|r| r.name == NativeName::unix(b"bad".to_vec()))
+            .unwrap();
         assert_eq!(report.logical_bytes, 0);
         assert_eq!(report.allocated_bytes, 0);
-        assert_eq!((bad.size, bad.alloc, bad.mtime, bad.file_id, bad.ino, bad.nlink), (0, 0, 0, FileId::ZERO, 0, 0));
+        assert_eq!(
+            (
+                bad.size,
+                bad.alloc,
+                bad.mtime,
+                bad.file_id,
+                bad.ino,
+                bad.nlink
+            ),
+            (0, 0, 0, FileId::ZERO, 0, 0)
+        );
         assert!(bad.available == crate::record::EntryFields::empty());
         let mut other = bad.clone();
         other.size = u64::MAX;
@@ -1259,20 +1772,113 @@ mod tests {
     }
 
     #[test]
+    fn stat_error_only_walks_have_unknown_allocated_quality() {
+        let mut l = FakeLister::new();
+        l.add("/root", Kind::Dir, 1, false, false);
+        l.add("/root/bad", Kind::File, 1, false, false);
+        l.entries.get_mut(Path::new("/root/bad")).unwrap().0.error = Some(5);
+        let mut sink = |_: &Record, _: &Path| Ok(());
+        let report = walk(
+            Path::new("/root"),
+            &l,
+            &WalkOptions::default(),
+            &mut sink,
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.measurement.as_ref().and_then(|m| m.quality),
+            Some(Quality::Unknown)
+        );
+    }
+
+    #[test]
+    fn live_progress_reports_unknown_and_lower_bound_allocation() {
+        let progress = Progress::default();
+        progress.entries.store(1, AtomicOrdering::Release);
+        assert_eq!(progress.allocated_measurement(), (None, Quality::Unknown));
+
+        progress.bytes_alloc.store(4096, AtomicOrdering::Relaxed);
+        progress.allocated_known.store(1, AtomicOrdering::Relaxed);
+        progress.allocated_unknown.store(1, AtomicOrdering::Relaxed);
+        progress.entries.store(2, AtomicOrdering::Release);
+        assert_eq!(
+            progress.allocated_measurement(),
+            (Some(4096), Quality::LowerBound)
+        );
+    }
+
+    #[test]
     fn vanished_children_are_skipped() {
         let mut l = FakeLister::new();
         l.add("/r", Kind::Dir, 1, false, false);
         l.add("/r/a", Kind::File, 1, false, false);
         l.add("/r/b", Kind::Dir, 1, false, false);
-        l.entries.get_mut(Path::new("/r")).unwrap().1.push("ghost".into()); // listed, never existed
+        l.entries
+            .get_mut(Path::new("/r"))
+            .unwrap()
+            .1
+            .push("ghost".into()); // listed, never existed
         let mut n = 0;
         let mut sink = |_: &Record, _: &Path| {
             n += 1;
             Ok(())
         };
         let cancel = AtomicBool::new(false);
-        let r = walk(Path::new("/r"), &l, &WalkOptions::default(), &mut sink, &cancel, None).unwrap();
+        let r = walk(
+            Path::new("/r"),
+            &l,
+            &WalkOptions::default(),
+            &mut sink,
+            &cancel,
+            None,
+        )
+        .unwrap();
         assert_eq!(n, 3);
         assert_eq!(r.issue_count, 0);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn aliases_match_trailing_separator_case_and_verbatim_prefixes() {
+        let aliases = HashSet::from([PathBuf::from(r"C:\Mount\Alias\")]);
+
+        assert!(alias_path_matches(&aliases, Path::new(r"c:/mount/alias")));
+        assert!(alias_path_matches(
+            &aliases,
+            Path::new(r"\\?\C:\Mount\Alias\")
+        ));
+        assert!(!alias_path_matches(
+            &aliases,
+            Path::new(r"C:\Mount\Alias-elsewhere")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn windows_alias_keys_normalize_path_forms() {
+        let drive = normalize_windows_path(&r"C:\Mount\Alias\".encode_utf16().collect::<Vec<_>>());
+        assert_eq!(
+            drive,
+            normalize_windows_path(&r"\\?\c:/mount/alias".encode_utf16().collect::<Vec<_>>())
+        );
+        assert_eq!(
+            normalize_windows_path(&r"\\Server\Share\Alias\".encode_utf16().collect::<Vec<_>>()),
+            normalize_windows_path(
+                &r"\\?\unc\server/share/alias"
+                    .encode_utf16()
+                    .collect::<Vec<_>>()
+            )
+        );
     }
 }
